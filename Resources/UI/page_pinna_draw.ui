@@ -28,6 +28,13 @@
     </widget>
    </item>
    <item>
+    <widget class="QPushButton" name="markCanalOpeningButton">
+     <property name="text">
+      <string>Mark Canal Opening</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QPushButton" name="isolateButton">
      <property name="text">
       <string>Isolate Patch</string>

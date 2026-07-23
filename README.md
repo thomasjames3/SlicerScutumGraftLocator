@@ -6,7 +6,7 @@ from a loaded CT scan through to a cartilage-graft-harvest-site heatmap:
 ```
 1. Setup              -- one-time dependency install
 2. Load DICOM         -- confirm which loaded scan to use
-3. Scutum landmarks   -- place 4 points defining the ear canal
+3. Scutum landmarks   -- place 2 points defining the ear canal axis
 4. Scutum review      -- run/adjust the bone-wall segmentation
 5. Scutum draw        -- trace the defect outline on the 3D mesh
 6. Pinna landmarks    -- place 1 point + pick left/right ear
@@ -53,38 +53,34 @@ both the `.ui` and its `.py` file together if you rename one).
 
 ## Current status -- what's real vs. what needs testing
 
-**Carried over from standalone testing, already validated:** everything
-under `EarReconstructionPlannerLib/core/` (segmentation, ROI cropping,
-mesh export, region isolation) -- this is the exact code tested earlier
-against synthetic scans outside of Slicer.
+**Confirmed working end-to-end in real Slicer:** Setup through DICOM load
+through both the scutum stage (landmarks -> bone-wall segmentation ->
+drawn-outline defect isolation) and the pinna stage (landmarks ->
+skin-surface segmentation -> drawn outline + seed point + canal-opening
+marker -> isolated pinna patch, cropped toward the canal and cleaned of
+disconnected islands). See `CLAUDE.md`'s "Current status" section and its
+"Bugs already found and fixed" list for the full history of what broke
+and how it was fixed along the way -- several were non-obvious Slicer API
+or coordinate-convention gotchas worth reading before touching
+`roi_crop.py`, `mesh_isolate.py`, or anything that pulls/pushes a
+volume/mesh to Slicer.
 
-**Written against Slicer's documented API, not yet run in real Slicer:**
-all of the wizard page controllers and the main module file. I can't run
-actual Slicer in this environment to click through the wizard myself, so
-treat the first real run as the actual test -- especially:
-- `SetAndObserveSurfaceConstraintNode` in `page_scutum_draw.py` /
-  `page_pinna_draw.py` (the API for snapping a drawn curve to a mesh
-  surface -- flagged in that file's docstring as worth double-checking
-  against your installed Slicer version).
-- Widget property names on `ctkSliderWidget` (`.value`, `.minimum`,
-  `.maximum`) -- correct for recent Slicer/CTK versions, but worth
-  confirming if you're on an older Slicer release.
+**Not yet tested:** the Verify page (page 8) and the Curvature page (page
+9) -- the wizard has never been walked all the way through to actually
+running Curvature Project v4 and loading a heatmap. The subprocess
+interface itself is no longer guesswork (`main.py` takes no CLI
+arguments; it reads `data/scutum.stl`/`data/pinna.stl` and writes
+`output/pinna_heatmap.ply`/`output/top_harvest_sites.csv`, relative to
+its working directory -- see `curvature_integration.py`), but
+`VENV_PYTHON_PATH`/`CURVATURE_PROJECT_MAIN_PATH` at the top of that file
+may still be placeholders -- confirm they point at your actual Curvature
+Project v4 install before expecting the final step to run.
 
-**Not yet connected:** the final Curvature Project v4 step
-(`EarReconstructionPlannerLib/curvature_integration.py`). This runs it as
-a separate subprocess in its own Python 3.12 venv (see that file's
-docstring for why -- Slicer's embedded Python is very likely a different,
-incompatible version for the compiled packages that project depends on).
-It currently has placeholder command-line arguments since I don't have
-that project's actual source yet. Once you're able to share it (a few key
-files at a time works fine, or describing `main.py`'s actual CLI
-arguments), I'll wire up the real command and output parsing.
+**Known open issue:** the "Reset All Points" button on the scutum
+landmarks page was reported broken early on and hasn't been debugged yet.
 
-## Suggested first test
+## Suggested next test
 
-Rather than clicking through all 10 pages at once the first time, load the
-module, get through Setup and DICOM load, then place the 4 scutum
-landmarks and try running the segmentation on page 4 -- that exercises the
-most code (Slicer volume <-> SimpleITK bridging, ROI building, thresholded
-segmentation, mesh export, model loading) in one step, and is the fastest
-way to surface any real-Slicer API surprises early.
+Since the scutum/pinna pipeline is now confirmed working, the natural
+next step is walking all the way through Verify and Curvature for the
+first time -- that's the last untested stretch of the wizard.

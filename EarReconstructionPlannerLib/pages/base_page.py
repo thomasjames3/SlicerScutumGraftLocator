@@ -45,7 +45,7 @@ class WizardPage:
         (bool, str)
             (True, "") to proceed to the next page, or
             (False, "some message") to stay on this page and show the
-            message to the surgeon (e.g. "Please place all 4 points
+            message to the surgeon (e.g. "Please place both points
             before continuing.").
         """
         return True, ""

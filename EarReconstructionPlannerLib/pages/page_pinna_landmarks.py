@@ -3,7 +3,7 @@ page_pinna_landmarks.py
 =========================
 Page 5: place the single ear-center point and specify left/right ear.
 
-Much simpler than the scutum's 4-point page since the pinna's Stage A only
+Simpler than the scutum's page since the pinna's Stage A only
 needs a search region, not an orientation (see core/pinna_landmarks.py for
 why). The side is picked from radio buttons rather than inferred, since a
 silent wrong guess here would be a bad failure mode.
@@ -29,6 +29,9 @@ class PinnaLandmarksPage(WizardPage):
         self._fiducial_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLMarkupsFiducialNode", "PinnaCenter"
         )
+        self._fiducial_node.CreateDefaultDisplayNodes()
+        self._fiducial_node.GetDisplayNode().SetVisibility(True)
+        self.state.pinna_landmarks_fiducial_node = self._fiducial_node
 
         self.ui.instructionLabel.setText(PINNA_LANDMARK_STEP["instruction"])
         self.ui.placePointButton.clicked.connect(self._on_place_point_clicked)

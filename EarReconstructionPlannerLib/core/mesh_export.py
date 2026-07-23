@@ -88,12 +88,50 @@ def label_map_to_mesh(label_image: sitk.Image) -> trimesh.Trimesh:
     return mesh
 
 
+def flip_ras_lps_points(points) -> np.ndarray:
+    """
+    Negates X and Y of a (N, 3) point array -- converts between Slicer's
+    RAS convention and plain LPS, same as io_utils.flip_ras_lps() but for
+    raw point arrays rather than a sitk.Image's geometry. Self-inverse.
+
+    Why this exists: STL (and most generic mesh formats) have no field to
+    record a coordinate system, so `slicer.util.loadModel()` /
+    `vtkMRMLModelStorageNode` always *assumes* a plain STL's vertex
+    numbers are in LPS and flips them to RAS when loading -- see
+    export_mesh()'s docstring for the full explanation.
+    """
+    points = np.asarray(points, dtype=float).copy()
+    points[:, 0] *= -1
+    points[:, 1] *= -1
+    return points
+
+
 def export_mesh(mesh: trimesh.Trimesh, output_path: str) -> str:
     """
     Saves the mesh to disk. Format is inferred from the file extension
     (.stl or .ply are both fine -- Curvature Project v4 reads STL for the
     scutum defect and pinna meshes, so .stl is the default expectation).
+
+    `mesh`'s vertices are expected to be in RAS (matching every other
+    physical-coordinate value in this pipeline). But STL has no field to
+    record a coordinate system, and `slicer.util.loadModel()` always
+    *assumes* a plain STL's raw numbers are LPS, flipping them to RAS on
+    load (confirmed by the "does not contain coordinate system
+    information. Using LPS." warning Slicer prints for exactly this kind
+    of file). So this function writes the vertices flipped to LPS --
+    matching what Slicer will assume -- so the reloaded model ends up
+    positioned correctly (in true RAS) once Slicer's own load-time flip
+    is applied. Any code that instead loads this file directly via
+    `trimesh.load()` (bypassing Slicer, e.g. to snap Markups curve points
+    onto it) must flip it back to RAS with `flip_ras_lps_points()`
+    immediately after loading -- see page_scutum_draw.py /
+    page_pinna_draw.py for the pattern.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    mesh.export(output_path)
+    lps_mesh = trimesh.Trimesh(
+        vertices=flip_ras_lps_points(mesh.vertices),
+        faces=mesh.faces,
+        process=False,
+    )
+    lps_mesh.export(output_path)
     return output_path

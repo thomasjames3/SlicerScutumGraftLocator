@@ -21,7 +21,7 @@ Expected widgets in page_pinna_review.ui:
 from __future__ import annotations
 import os
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
-from core import roi_crop, segment_pinna_threshold, postprocess, mesh_export
+from core import roi_crop, segment_pinna_threshold, postprocess, mesh_export, io_utils
 import config
 
 
@@ -47,7 +47,11 @@ class PinnaReviewPage(WizardPage):
         self.ui.statusLabel.setText("Segmenting skin surface near the ear...")
         slicer.app.processEvents()
 
-        sitk_image = sitkUtils.PullVolumeFromSlicer(self.state.volume_node)
+        # See page_scutum_review.py / io_utils.flip_ras_lps for why this
+        # conversion is required: PullVolumeFromSlicer() returns the image
+        # in plain ITK/LPS convention, but pinna_landmarks.ear_center was
+        # captured in Slicer's own RAS convention.
+        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(self.state.volume_node))
 
         # Same coarse pre-crop fix as the scutum review page -- see
         # roi_crop.crop_to_point_region's docstring for why this has to
@@ -78,9 +82,14 @@ class PinnaReviewPage(WizardPage):
         label_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLLabelMapVolumeNode", "PinnaRegion"
         )
-        sitkUtils.PushVolumeToSlicer(region_mask, label_node)
+        # region_mask is RAS-consistent; flip back to LPS since
+        # PushVolumeToSlicer expects plain ITK convention (see
+        # page_scutum_review.py for the matching comment).
+        sitkUtils.PushVolumeToSlicer(io_utils.flip_ras_lps(region_mask), label_node)
         self.state.pinna_region_label_node = label_node
 
+        # Uses the still-RAS-consistent `region_mask` so the exported
+        # mesh's vertices line up correctly when loaded back into Slicer.
         mesh = mesh_export.label_map_to_mesh(region_mask)
         mesh_path = os.path.join(
             self.state.working_dir or slicer.app.temporaryPath, "pinna_region.stl"
@@ -91,6 +100,20 @@ class PinnaReviewPage(WizardPage):
         if self.state.pinna_region_model_node is not None:
             slicer.mrmlScene.RemoveNode(self.state.pinna_region_model_node)
         self.state.pinna_region_model_node = slicer.util.loadModel(mesh_path)
+
+        # Hide the ear-center landmark now that the model exists -- same
+        # reasoning as page_scutum_review.py.
+        if self.state.pinna_landmarks_fiducial_node is not None:
+            self.state.pinna_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
+
+        # Recenter and reorient the 3D view on the new model -- same
+        # reasoning as page_scutum_review.py.
+        import ctk
+
+        threeDView = slicer.app.layoutManager().threeDWidget(0).threeDView()
+        threeDView.resetFocalPoint()
+        threeDView.resetCamera()
+        threeDView.lookFromAxis(ctk.ctkAxesWidget.Right)
 
         self.ui.openSegmentEditorButton.setEnabled(True)
         self.ui.statusLabel.setText(

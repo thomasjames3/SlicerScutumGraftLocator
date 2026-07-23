@@ -11,9 +11,44 @@ own volume objects with minimal glue code (see slicer_module/).
 
 from __future__ import annotations
 import os
+import numpy as np
 import SimpleITK as sitk
 
 from config import TARGET_VOXEL_SPACING_MM
+
+_RAS_LPS_FLIP = np.diag([-1.0, -1.0, 1.0])
+
+
+def flip_ras_lps(image: sitk.Image) -> sitk.Image:
+    """
+    Returns a copy of `image` with its origin/direction converted between
+    Slicer's native RAS convention and plain ITK/SimpleITK's LPS
+    convention (negating X and Y). This conversion is its own inverse, so
+    the same function converts in either direction.
+
+    Why this exists: `sitkUtils.PullVolumeFromSlicer()` converts a Slicer
+    volume node's geometry from RAS to LPS before building the sitk.Image
+    (and `PushVolumeToSlicer()` converts back), matching plain
+    ITK/DICOM convention. But every surgeon-placed landmark in this
+    project (canal_opening, near_eardrum, ear_center, ...) is captured
+    directly from Slicer's Markups nodes in RAS -- Slicer's own
+    convention. Every physical-coordinate calculation in core/
+    (roi_crop.py, segment_threshold.py, mesh_export.py, ...) is written
+    assuming landmarks and image geometry share the same convention. Call
+    this right after PullVolumeFromSlicer() (LPS -> RAS) before doing any
+    of that math, and again right before PushVolumeToSlicer() (RAS ->
+    LPS) -- see page_scutum_review.py / page_pinna_review.py for the
+    pattern. Skipping this silently offsets every ROI/axis calculation by
+    a mirror flip across the sagittal and coronal planes, since RAS and
+    LPS only differ in the sign of X (Right/Left) and Y (Anterior/
+    Posterior).
+    """
+    flipped = sitk.Image(image)
+    origin = _RAS_LPS_FLIP @ np.array(image.GetOrigin())
+    direction = _RAS_LPS_FLIP @ np.array(image.GetDirection()).reshape(3, 3)
+    flipped.SetOrigin(tuple(origin))
+    flipped.SetDirection(tuple(direction.flatten()))
+    return flipped
 
 
 def load_volume(path: str) -> sitk.Image:

@@ -1,17 +1,25 @@
 """
 roi_crop.py
 ===========
-Turns the 4 surgeon-placed landmarks into a small cropped sub-volume
-("region of interest", or ROI) that comfortably contains the ear canal and
-nothing else nearby. Everything downstream (thresholding, connected
-components, or the trained model in segment_dl.py) only ever looks inside
-this crop -- which makes segmentation both faster and much less likely to
-accidentally grab a nearby unrelated air pocket or bone structure.
+Turns the 2 surgeon-placed ear canal landmarks into a small cropped
+sub-volume ("region of interest", or ROI) that comfortably contains the
+ear canal and nothing else nearby. Everything downstream (thresholding,
+connected components, or the trained model in segment_dl.py) only ever
+looks inside this crop -- which makes segmentation both faster and much
+less likely to accidentally grab a nearby unrelated air pocket or bone
+structure.
 
-This is a direct adaptation of the truncated-cylinder VOI approach in
-Matin-Mann et al. (2025): two tilted planes (defined by the landmark pairs)
-bound the canal's length, and a cylinder of a starting diameter bounds its
-width, before any intensity-based segmentation happens.
+This is a simplified version of the truncated-cylinder VOI approach in
+Matin-Mann et al. (2025). The original design used 2 extra landmarks per
+end to let the bounding planes tilt to match true anatomy; that was
+dropped (see build_roi_mask()'s docstring) because it required the
+surgeon's click to land precisely on one side of a plane, contradicting
+the "doesn't need to be precise" instruction and repeatedly producing
+bad/empty ROIs from perfectly reasonable clicks. The two bounding planes
+are now always perpendicular to the canal_opening->near_eardrum axis,
+extended by a fixed margin -- since the ROI only needs to *comfortably
+contain* the canal (the real boundary comes from thresholding within it,
+not the ROI's shape), this loses nothing in practice.
 """
 
 from __future__ import annotations
@@ -19,7 +27,7 @@ import numpy as np
 import SimpleITK as sitk
 from typing import Tuple
 
-from config import INITIAL_ROI_DIAMETER_MM
+from config import INITIAL_ROI_DIAMETER_MM, ROI_AXIAL_MARGIN_MM
 from core.landmarks import EarCanalLandmarks
 
 
@@ -27,10 +35,18 @@ def build_roi_mask(
     reference_image: sitk.Image,
     landmarks: EarCanalLandmarks,
     diameter_mm: float = INITIAL_ROI_DIAMETER_MM,
+    axial_margin_mm: float = ROI_AXIAL_MARGIN_MM,
 ) -> sitk.Image:
     """
     Build a binary mask (same size/spacing as reference_image) marking the
-    truncated-cylinder region of interest defined by the 4 landmarks.
+    truncated-cylinder region of interest defined by the 2 landmarks.
+
+    Unlike the original 4-point design, the two bounding planes are not
+    surgeon-controlled -- they're derived automatically, perpendicular to
+    the canal_opening->near_eardrum axis, each extended outward by
+    `axial_margin_mm` past its landmark. This removes any "which side did
+    the surgeon click" ambiguity entirely: with only 2 points, there is no
+    other side to get wrong.
 
     Parameters
     ----------
@@ -42,6 +58,10 @@ def build_roi_mask(
         Starting cylinder diameter. Generous on purpose -- it's meant to
         comfortably contain the canal, not tightly bound it. The actual
         canal boundary is found later by thresholding within this ROI.
+    axial_margin_mm : float
+        How far past canal_opening/near_eardrum, along the axis, the two
+        bounding planes extend. See ROI_AXIAL_MARGIN_MM in config.py for
+        tuning guidance.
 
     Returns
     -------
@@ -53,20 +73,10 @@ def build_roi_mask(
 
     canal_axis_start = np.array(landmarks.canal_opening)
     canal_axis_end = np.array(landmarks.near_eardrum)
-    outer_normal_pt = np.array(landmarks.reference_outer)
-    inner_normal_pt = np.array(landmarks.reference_inner)
 
     axis_vec = canal_axis_end - canal_axis_start
     axis_length = np.linalg.norm(axis_vec)
     axis_unit = axis_vec / axis_length
-
-    # The two bounding planes are defined by a point (the landmark) and a
-    # normal direction (from the paired reference landmark toward it).
-    outer_plane_point = canal_axis_start
-    outer_plane_normal = _unit(canal_axis_start - outer_normal_pt)
-
-    inner_plane_point = canal_axis_end
-    inner_plane_normal = _unit(inner_normal_pt - canal_axis_end)
 
     size = reference_image.GetSize()
     spacing = reference_image.GetSpacing()
@@ -82,8 +92,9 @@ def build_roi_mask(
 
     radius = diameter_mm / 2.0
 
-    # Distance from the canal axis line (perpendicular distance), used for
-    # the cylinder wall.
+    # Signed distance along the axis, measured from canal_opening -- used
+    # both for the cylinder's perpendicular distance and to bound the two
+    # ends (0 = canal_opening, axis_length = near_eardrum).
     vec_from_start = physical_coords - canal_axis_start
     along_axis = vec_from_start @ axis_unit
     perp_vec = vec_from_start - np.outer(along_axis, axis_unit)
@@ -91,11 +102,21 @@ def build_roi_mask(
 
     inside_cylinder = perp_dist <= radius
 
-    # "Inside" the outer plane means on the same side as the canal
-    outer_side = (physical_coords - outer_plane_point) @ outer_plane_normal >= 0
-    inner_side = (physical_coords - inner_plane_point) @ inner_plane_normal >= 0
+    # Bounding planes, perpendicular to the axis, each extended
+    # axial_margin_mm past its landmark -- no surgeon-supplied direction
+    # involved, so there's no "wrong side" possible.
+    outer_side = along_axis >= -axial_margin_mm
+    inner_side = along_axis <= axis_length + axial_margin_mm
 
     inside_roi = inside_cylinder & outer_side & inner_side
+
+    if not inside_roi.any():
+        raise ValueError(
+            "No voxels found in the region defined by these landmarks -- "
+            "the ROI is empty. Double-check that 'canal opening' and 'near "
+            "eardrum' were placed on the actual scan (not outside the "
+            "volume) and aren't identical points."
+        )
 
     mask_array = inside_roi.reshape(size[::-1]).astype(np.uint8)
     mask_image = sitk.GetImageFromArray(mask_array)
@@ -193,23 +214,17 @@ def crop_to_landmark_region(
     image: sitk.Image, landmarks: EarCanalLandmarks, margin_mm: float = 15.0
 ) -> sitk.Image:
     """
-    Coarse pre-crop for the ear canal: a rectangular box around all 4
+    Coarse pre-crop for the ear canal: a rectangular box around the 2
     landmark points, expanded generously by `margin_mm` on every side.
     Call this BEFORE build_roi_mask() -- see crop_to_physical_bounds()'s
     docstring for why. The generous default margin is intentional: this
     step only needs to comfortably contain the cylinder ROI that
-    build_roi_mask() will compute next, not precisely bound it, so erring
-    larger here costs a little extra (still-cheap) computation rather than
-    risking clipping off part of the real ROI.
+    build_roi_mask() will compute next (including its radius and
+    ROI_AXIAL_MARGIN_MM extension past each landmark), not precisely
+    bound it, so erring larger here costs a little extra (still-cheap)
+    computation rather than risking clipping off part of the real ROI.
     """
-    points = np.array(
-        [
-            landmarks.canal_opening,
-            landmarks.near_eardrum,
-            landmarks.reference_outer,
-            landmarks.reference_inner,
-        ]
-    )
+    points = np.array([landmarks.canal_opening, landmarks.near_eardrum])
     min_point = points.min(axis=0) - margin_mm
     max_point = points.max(axis=0) + margin_mm
     return crop_to_physical_bounds(image, min_point, max_point)
@@ -229,16 +244,6 @@ def crop_to_point_region(
     min_point = center - total_radius
     max_point = center + total_radius
     return crop_to_physical_bounds(image, min_point, max_point)
-
-
-def _unit(v: np.ndarray) -> np.ndarray:
-    norm = np.linalg.norm(v)
-    if norm < 1e-8:
-        raise ValueError(
-            "Two landmarks that should define a direction are identical or "
-            "nearly identical. Please re-place these points further apart."
-        )
-    return v / norm
 
 
 def build_spherical_roi_mask(

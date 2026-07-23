@@ -28,24 +28,30 @@ class WizardState:
 
     # --- Pages 2-4: Scutum (ear canal bone wall + defect outline) ---
     scutum_landmarks: EarCanalLandmarks = field(default_factory=EarCanalLandmarks)
+    scutum_landmarks_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, hidden once drawing starts
     scutum_bone_wall_label_node = None  # vtkMRMLLabelMapVolumeNode
     scutum_bone_wall_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
     scutum_bone_wall_mesh_path: Optional[str] = None
     scutum_defect_mesh_path: Optional[str] = None  # after the drawn-outline isolation step
+    scutum_defect_model_node = None  # vtkMRMLModelNode for the isolated defect patch
 
     # --- Pages 5-7: Pinna ---
     pinna_landmarks: PinnaLandmarks = field(default_factory=PinnaLandmarks)
+    pinna_landmarks_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, hidden once drawing starts
     pinna_region_label_node = None  # vtkMRMLLabelMapVolumeNode
     pinna_region_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
     pinna_region_mesh_path: Optional[str] = None
     pinna_isolated_mesh_path: Optional[str] = None  # after the drawn-outline isolation step
+    pinna_isolated_model_node = None  # vtkMRMLModelNode for the isolated pinna patch
 
     # --- Page 8: Verify ---
     surgeon_approved_scutum: bool = False
     surgeon_approved_pinna: bool = False
 
     # --- Page 9: Curvature comparison ---
-    heatmap_output_path: Optional[str] = None
+    heatmap_output_path: Optional[str] = None  # pinna_heatmap.ply
+    heatmap_model_node = None  # vtkMRMLModelNode, removed+reloaded on re-run
+    ranked_sites_csv_path: Optional[str] = None  # top_harvest_sites.csv
 
     # --- Misc ---
     working_dir: Optional[str] = None  # scratch folder for intermediate files, set on Setup page

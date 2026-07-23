@@ -40,7 +40,15 @@ class DicomLoadPage(WizardPage):
         import slicer
         self.ui.volumeSelector.setMRMLScene(slicer.mrmlScene)
         self.ui.resampleButton.clicked.connect(self._on_use_scan_clicked)
-        self.ui.statusLabel.setText("")
+
+        if not slicer.mrmlScene.GetNodesByClass("vtkMRMLScalarVolumeNode").GetNumberOfItems():
+            self.ui.statusLabel.setText(
+                "No volumes loaded yet. Use Slicer's DICOM module (or File > "
+                "Add Data) to load a scan first, then come back to this page "
+                "and select it below."
+            )
+        else:
+            self.ui.statusLabel.setText("")
 
     def _on_use_scan_clicked(self):
         volume_node = self.ui.volumeSelector.currentNode()

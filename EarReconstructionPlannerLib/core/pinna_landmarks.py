@@ -4,10 +4,10 @@ pinna_landmarks.py
 Landmark input needed to locate the pinna region, kept separate from
 core/landmarks.py (which is ear-canal-specific) since the pinna needs a
 much simpler input: a single reference point plus which ear, rather than
-the 4-point axis system the canal needs.
+the 2-point axis system the canal needs.
 
-Why just one point instead of four: the ear canal's landmarks define an
-axis and orientation because thresholding needs to know "which direction is
+Why just one point instead of two: the ear canal's landmarks define an
+axis because thresholding needs to know "which direction is
 the canal" to pick the right connected component. The pinna's Stage A step
 doesn't need an axis at all -- it just needs to know roughly where to
 center a search region; the surgeon's drawn outline (added in a later

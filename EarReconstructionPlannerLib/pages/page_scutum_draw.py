@@ -11,12 +11,14 @@ space. Once the loop is closed, one more click marks a point inside the
 loop (to tell core/mesh_isolate.py which side to keep), and "Isolate
 Patch" runs the extraction.
 
-NOTE: `SetAndObserveSurfaceConstraintNode` below is the Slicer Markups API
-for constraining a curve to a model surface. This is correct for recent
-Slicer versions (5.x) but is exactly the kind of call worth confirming
-against your installed Slicer version the first time you run this page --
-if the method name has moved, Slicer's Python console will show a clear
-AttributeError pointing at this line.
+NOTE: `SetCurveTypeToShortestDistanceOnSurface(modelNode)` below is the
+Slicer Markups API for constraining a curve to a model surface --
+confirmed via Slicer's own vtkMRMLMarkupsCurveNode header/API docs.
+Calling `SetAndObserveSurfaceConstraintNode()` alone (an earlier version
+of this code did that) registers the model but does nothing on its own --
+the curve type has to actually be set to ShortestDistanceOnSurface for
+points to be constrained to the surface; that convenience method sets
+both in one call.
 
 Expected widgets in page_scutum_draw.ui:
   - instructionLabel    (QLabel)
@@ -29,7 +31,7 @@ Expected widgets in page_scutum_draw.ui:
 from __future__ import annotations
 import os
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
-from core import mesh_isolate
+from core import mesh_isolate, mesh_export
 
 
 class ScutumDrawPage(WizardPage):
@@ -58,7 +60,7 @@ class ScutumDrawPage(WizardPage):
             "vtkMRMLMarkupsClosedCurveNode", "ScutumDefectOutline"
         )
         if self.state.scutum_bone_wall_model_node is not None:
-            self._curve_node.SetAndObserveSurfaceConstraintNode(
+            self._curve_node.SetCurveTypeToShortestDistanceOnSurface(
                 self.state.scutum_bone_wall_model_node
             )
 
@@ -115,14 +117,28 @@ class ScutumDrawPage(WizardPage):
         self.ui.statusLabel.setText("Isolating defect patch...")
         slicer.app.processEvents()
 
+        # Use the curve's dense, interpolated surface path (not just the
+        # sparse raw control points) as the loop to isolate against.
+        # Consecutive clicks are typically several mesh edges apart, and
+        # mesh_isolate.py bridges any gaps with mesh-graph shortest paths --
+        # but on a surface with real contours, the shortest path between two
+        # distant control points can cut a different route than what was
+        # actually drawn. GetCurvePointsWorld() returns the same densely
+        # sampled, surface-hugging path already visible in the 3D view (this
+        # curve's CurveType is ShortestDistanceOnSurface), so snapping those
+        # points instead makes the isolated patch's boundary track the drawn
+        # shape much more closely.
         curve_points = []
-        n = self._curve_node.GetNumberOfControlPoints()
-        for i in range(n):
-            ras = [0.0, 0.0, 0.0]
-            self._curve_node.GetNthControlPointPositionWorld(i, ras)
-            curve_points.append(tuple(ras))
+        curve_points_world = self._curve_node.GetCurvePointsWorld()
+        for i in range(curve_points_world.GetNumberOfPoints()):
+            curve_points.append(tuple(curve_points_world.GetPoint(i)))
 
         mesh = trimesh.load(self.state.scutum_bone_wall_mesh_path)
+        # The STL file on disk is LPS-numbered (see mesh_export.export_mesh's
+        # docstring for why) -- flip back to RAS so mesh.vertices matches
+        # curve_points/self._seed_point, which are always RAS from Slicer's
+        # Markups nodes.
+        mesh.vertices = mesh_export.flip_ras_lps_points(mesh.vertices)
 
         try:
             loop_indices = mesh_isolate.snap_points_to_vertices(mesh, curve_points)
@@ -134,10 +150,30 @@ class ScutumDrawPage(WizardPage):
         output_path = os.path.join(
             self.state.working_dir or slicer.app.temporaryPath, "scutum_defect.stl"
         )
-        patch.export(output_path)
+        # Use mesh_export.export_mesh (not patch.export directly) so the
+        # RAS->LPS flip is applied consistently -- otherwise this file
+        # would display mirrored when reloaded via slicer.util.loadModel.
+        mesh_export.export_mesh(patch, output_path)
         self.state.scutum_defect_mesh_path = output_path
 
-        slicer.util.loadModel(output_path)
+        if self.state.scutum_defect_model_node is not None:
+            slicer.mrmlScene.RemoveNode(self.state.scutum_defect_model_node)
+        self.state.scutum_defect_model_node = slicer.util.loadModel(output_path)
+
+        # Hide the original (pre-isolation) bone-wall model now that the
+        # isolated defect patch exists, so they don't overlap/clutter the
+        # 3D view.
+        if self.state.scutum_bone_wall_model_node is not None:
+            self.state.scutum_bone_wall_model_node.GetDisplayNode().SetVisibility(False)
+
+        # Hide the drawn outline curve and seed point marker now that the
+        # patch has been extracted -- they've served their purpose and just
+        # clutter the 3D view on top of the isolated result otherwise.
+        if self._curve_node is not None:
+            self._curve_node.GetDisplayNode().SetVisibility(False)
+        if self._seed_fiducial_node is not None:
+            self._seed_fiducial_node.GetDisplayNode().SetVisibility(False)
+
         self.ui.statusLabel.setText(
             f"Defect patch isolated ({len(patch.vertices)} vertices). "
             "Check it in the 3D view, then click Next."

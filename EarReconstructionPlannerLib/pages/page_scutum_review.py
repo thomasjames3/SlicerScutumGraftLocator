@@ -22,7 +22,7 @@ Expected widgets in page_scutum_review.ui:
 from __future__ import annotations
 import os
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
-from core import roi_crop, segment_dl, postprocess, mesh_export
+from core import roi_crop, segment_dl, postprocess, mesh_export, io_utils
 import config
 
 
@@ -52,7 +52,14 @@ class ScutumReviewPage(WizardPage):
         self.ui.statusLabel.setText("Segmenting bone wall...")
         slicer.app.processEvents()
 
-        sitk_image = sitkUtils.PullVolumeFromSlicer(self.state.volume_node)
+        # PullVolumeFromSlicer() returns the image in plain ITK/LPS
+        # convention, but scutum_landmarks were captured in Slicer's own
+        # RAS convention -- flip so every physical-coordinate calculation
+        # below (ROI cropping, axis math) operates in the same space the
+        # landmarks are in. See io_utils.flip_ras_lps's docstring for why
+        # this matters: without it, the ROI ends up mirrored across the
+        # sagittal/coronal planes from where the surgeon actually clicked.
+        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(self.state.volume_node))
 
         # Cheap rectangular pre-crop around the landmarks BEFORE building
         # the precise cylinder ROI mask -- build_roi_mask() evaluates every
@@ -64,7 +71,11 @@ class ScutumReviewPage(WizardPage):
             sitk_image, self.state.scutum_landmarks
         )
 
-        roi_mask = roi_crop.build_roi_mask(coarse_cropped, self.state.scutum_landmarks)
+        try:
+            roi_mask = roi_crop.build_roi_mask(coarse_cropped, self.state.scutum_landmarks)
+        except ValueError as exc:
+            self.ui.statusLabel.setText(str(exc))
+            return
         cropped_image = roi_crop.crop_to_roi_bounding_box(coarse_cropped, roi_mask)
         cropped_roi_mask = roi_crop.crop_to_roi_bounding_box(roi_mask, roi_mask)
 
@@ -82,12 +93,18 @@ class ScutumReviewPage(WizardPage):
         label_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLLabelMapVolumeNode", "ScutumBoneWall"
         )
-        sitkUtils.PushVolumeToSlicer(bone_wall, label_node)
+        # bone_wall is RAS-consistent (inherited from the flipped
+        # sitk_image above); flip back to LPS since PushVolumeToSlicer
+        # expects plain ITK convention and converts LPS->RAS itself.
+        sitkUtils.PushVolumeToSlicer(io_utils.flip_ras_lps(bone_wall), label_node)
         self.state.scutum_bone_wall_label_node = label_node
 
         # Also export a mesh now -- the draw page (next-but-one) needs an
         # actual surface to draw on, and re-running mesh export there would
-        # duplicate this work.
+        # duplicate this work. Uses the still-RAS-consistent `bone_wall`
+        # (not the flipped copy just pushed above) so the exported mesh's
+        # vertices are in RAS and line up correctly when loaded back into
+        # Slicer alongside the volume.
         try:
             mesh = mesh_export.label_map_to_mesh(bone_wall)
         except mesh_export.EmptySegmentationError:
@@ -109,6 +126,31 @@ class ScutumReviewPage(WizardPage):
         if self.state.scutum_bone_wall_model_node is not None:
             slicer.mrmlScene.RemoveNode(self.state.scutum_bone_wall_model_node)
         self.state.scutum_bone_wall_model_node = slicer.util.loadModel(mesh_path)
+
+        # Hide the landmark points now that the model exists -- they've
+        # served their purpose, and otherwise sit right on top of the mesh
+        # and get in the way of clicking to draw the outline on the next
+        # page.
+        if self.state.scutum_landmarks_fiducial_node is not None:
+            self.state.scutum_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
+
+        # Recenter the 3D view on the new model -- equivalent to clicking
+        # the "center 3D view" button -- so the surgeon sees it right away
+        # instead of having to manually pan/zoom to find it. Also orient it
+        # as if the "R" (Right) face of the 3D view's axes widget had been
+        # clicked, so the model is consistently shown from the same side
+        # every time rather than whatever angle it happened to load at.
+        # NOTE: lookFromAxis()/ctkAxesWidget.Right mirror the same API the
+        # axes widget's own buttons use -- confirmed via Slicer/CTK source,
+        # but like the surface-constraint and heatmap-coloring APIs
+        # elsewhere in this project, NOT YET CONFIRMED against a real
+        # Slicer install.
+        import ctk
+
+        threeDView = slicer.app.layoutManager().threeDWidget(0).threeDView()
+        threeDView.resetFocalPoint()
+        threeDView.resetCamera()
+        threeDView.lookFromAxis(ctk.ctkAxesWidget.Right)
 
         self.ui.openSegmentEditorButton.setEnabled(True)
         self.ui.statusLabel.setText(

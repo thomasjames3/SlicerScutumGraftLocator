@@ -64,6 +64,7 @@ class EarReconstructionPlannerWidget(ScriptedLoadableModuleWidget):
         top_level_widget = slicer.util.loadUI(
             os.path.join(ui_dir, "EarReconstructionPlanner.ui")
         )
+        top_level_widget.setMRMLScene(slicer.mrmlScene)
         self.layout.addWidget(top_level_widget)
         self.ui = slicer.util.childWidgetVariables(top_level_widget)
 

@@ -37,6 +37,71 @@ instructions) serves that constraint.
 
 ---
 
+## Current status (read this first)
+
+As of the end of the last session, Thomas confirmed the **entire scutum
+and pinna pipelines work end-to-end in real Slicer**, from landmark
+placement through segmentation through drawing/isolating the final
+meshes ("everything is looking awesome"). This is a real milestone --
+most of this document's "Bugs already found and fixed" and "Dead ends"
+entries exist because of the debugging that got here. Concretely tested
+and working:
+- Setup -> DICOM load -> scutum landmarks (2-point) -> scutum review
+  (bone-wall threshold segmentation) -> scutum draw (outline + isolate
+  defect patch).
+- Pinna landmarks (1-point + side) -> pinna review (skin-surface
+  threshold segmentation) -> pinna draw (outline + seed point + canal
+  marker + isolate pinna patch, cropped toward the ear canal and cleaned
+  of disconnected islands).
+
+**Not yet exercised in this project's testing:**
+- The **Verify page** (page 8) and the **Curvature page** (page 9)'s Qt
+  widgets specifically -- nothing in this conversation history has walked
+  the actual Slicer wizard past isolating the pinna patch, so
+  `page_curvature.py`'s button wiring, table population, and the
+  scalar-visibility fix for the heatmap's vertex colors are all
+  unconfirmed against a real Slicer install (same "flagged, not yet
+  runtime-tested" status as several earlier pieces in this doc).
+- **The Curvature Project v4 subprocess integration itself, however, IS
+  now confirmed working** -- Curvature Project v4 was added into this repo
+  (`Curvature Project v4/` at the repo root, own working `.venv`) and
+  `curvature_integration.py` was rewritten to auto-locate it (no more
+  hardcoded placeholder paths), stream live progress, and avoid a
+  stale-output false-success bug. Ran `main.py` directly through the new
+  integration module (outside Slicer, via its own venv's `python.exe`)
+  against its own test meshes and confirmed a full real run: 300
+  candidates scored, top 15 ICP-refined, heatmap + ranked CSV produced,
+  in ~19s. See "Curvature Project v4 integration" below for details. What's
+  still unconfirmed is only the Slicer-side plumbing around that (loading
+  the model, showing its colors, the results table), not the subprocess
+  bridge itself.
+
+**Known still-open issue:** the "Reset All Points" button on the scutum
+landmarks page was reported broken early on and was **never actually
+debugged** -- see Known Issues #1 below. This is the most likely place to
+start if Thomas reports a new problem without more specific context, or
+if he mentions "reset" not working.
+
+**Likely resolved but never explicitly reconfirmed:** the "Slicer crashes
+opening the module before a DICOM volume is loaded" report (Known Issues
+#6) -- two speculative fixes were applied without a confirmed root cause,
+and Thomas hasn't mentioned this crash again despite many subsequent
+sessions of heavy module use (which all require opening the module first).
+Treat as probably fixed, but if it resurfaces, that's a strong signal one
+of the two speculative fixes wasn't the actual cause and a real crash
+log/traceback is needed.
+
+If picking this project back up cold: skim "Bugs already found and
+fixed" and "Dead ends deliberately avoided" below before touching
+`roi_crop.py`, `mesh_isolate.py`, or anything that pulls/pushes a volume
+or mesh to/from Slicer -- there is a lot of hard-won, non-obvious context
+there (especially the RAS/LPS coordinate-convention gotchas, bugs #8 and
+#12, which are general Slicer API properties that will bite any new code
+touching `sitkUtils` or `slicer.util.loadModel` the same way if not
+handled).
+
+---
+
 ## High-level architecture
 
 A single Slicer extension, `EarReconstructionPlanner/`, implemented as a
@@ -46,7 +111,7 @@ development -- see "Installing for testing" below). It's a 10-page wizard:
 ```
 0. Setup              -- one-time Python dependency install
 1. DICOM load         -- confirm which already-loaded scan to use
-2. Scutum landmarks   -- place 4 points defining the ear canal axis
+2. Scutum landmarks   -- place 2 points defining the ear canal axis
 3. Scutum review      -- run/adjust bone-wall threshold segmentation
 4. Scutum draw        -- surgeon draws the defect outline on the 3D mesh
 5. Pinna landmarks    -- place 1 point + pick left/right ear
@@ -91,8 +156,8 @@ EarReconstructionPlanner/
 │   ├── wizard_state.py                   # WizardState dataclass + PAGE_ORDER list
 │   ├── curvature_integration.py          # subprocess bridge to Curvature Project v4
 │   ├── core/                             # segmentation logic, Slicer-independent, unit-testable
-│   │   ├── io_utils.py                   # DICOM/volume loading, isotropic resampling
-│   │   ├── landmarks.py                  # EarCanalLandmarks (4-point), .fcsv/.json loaders
+│   │   ├── io_utils.py                   # DICOM/volume loading (resample_to_isotropic() kept but unused live -- see below)
+│   │   ├── landmarks.py                  # EarCanalLandmarks (2-point axis), .fcsv/.json loaders
 │   │   ├── pinna_landmarks.py            # PinnaLandmarks (1-point + side)
 │   │   ├── roi_crop.py                   # ROI mask building + cropping (see gotchas below)
 │   │   ├── segment_threshold.py          # Stage A: bone wall segmentation (ear canal)
@@ -136,17 +201,22 @@ for pinna), ROI sizes, wall thickness, smoothing amounts, min-cases-to-
 train. If tuning behavior, this is the first place to look.
 
 ### Ear canal / scutum pipeline
-- **`landmarks.py`**: `EarCanalLandmarks` dataclass, 4 points
-  (`canal_opening`, `near_eardrum`, `reference_outer`, `reference_inner`).
-  `validate()` does forgiving sanity checks (plausible canal length,
-  points not coincident). `from_slicer_fcsv()` / `from_json()` were built
-  for CLI testing before the Slicer wizard existed -- may not be needed
-  going forward but harmless to keep.
-- **`roi_crop.py`**: builds a truncated-cylinder ROI mask from the 4
-  landmarks (`build_roi_mask`), matching the approach in Matin-Mann et al.
-  (2025)'s external-ear-canal-implant segmentation paper (mean Dice 0.909
-  using landmarks + threshold + connected-component cleanup, no ML
-  needed). **Critical gotcha, already fixed once**: `build_roi_mask()`
+- **`landmarks.py`**: `EarCanalLandmarks` dataclass, 2 points
+  (`canal_opening`, `near_eardrum`). Originally 4 points
+  (`reference_outer`/`reference_inner` fixed the bounding-plane tilt) --
+  **reduced to 2, see the "4-point tilted-plane ROI" dead end below for
+  why.** `validate()` does forgiving sanity checks (plausible canal
+  length, points not coincident). `from_slicer_fcsv()` / `from_json()`
+  were built for CLI testing before the Slicer wizard existed -- may not
+  be needed going forward but harmless to keep.
+- **`roi_crop.py`**: builds a truncated-cylinder ROI mask from the 2
+  landmarks (`build_roi_mask`), loosely adapted from the approach in
+  Matin-Mann et al. (2025)'s external-ear-canal-implant segmentation paper
+  (mean Dice 0.909 using landmarks + threshold + connected-component
+  cleanup, no ML needed) -- their version tilts the bounding planes using
+  2 extra landmarks per end; this one keeps the planes perpendicular to
+  the canal axis instead (see the dead-ends section for why). **Critical
+  gotcha, already fixed once**: `build_roi_mask()`
   evaluates every voxel in whatever image it's given -- calling it
   directly on a full-resolution real CT causes a multi-GB memory error
   (hit this for real during testing: 850x850x700 voxel scan -> tried to
@@ -178,7 +248,7 @@ train. If tuning behavior, this is the first place to look.
 ### Pinna pipeline
 - **`pinna_landmarks.py`**: `PinnaLandmarks` -- just `ear_center` (1 point)
   + `side` ("left"/"right", picked via radio buttons, never inferred).
-  Much simpler than the ear canal's 4 points because Stage A here doesn't
+  Much simpler than the ear canal's 2 points because Stage A here doesn't
   need an axis, just a search region.
 - **`segment_pinna_threshold.py`**: Stage A. **Important**: this does
   NOT attempt to isolate cartilage by intensity -- cartilage-vs-skin
@@ -192,9 +262,19 @@ train. If tuning behavior, this is the first place to look.
 
 ### Shared logic
 - **`mesh_export.py`**: label map -> trimesh via marching cubes + light
-  Laplacian smoothing, in physical (RAS mm) coordinates matching Slicer's
-  own convention. Meshes do **not** need to be watertight (confirmed by
-  Thomas -- the scutum/pinna outputs are open surface patches, not solids).
+  Laplacian smoothing. `label_map_to_mesh()`'s returned in-memory mesh is
+  in RAS mm (matching every other in-memory value in this pipeline), but
+  `export_mesh()` **writes files with vertices flipped to LPS** -- see
+  bug #12 below for why this is necessary (STL has no coordinate-system
+  field, and `slicer.util.loadModel()` always assumes LPS for such
+  files). `flip_ras_lps_points()` (self-inverse, negates X/Y) is the
+  point-array equivalent of `io_utils.flip_ras_lps()` for this purpose.
+  **Any code loading one of these files back via `trimesh.load()`
+  (bypassing Slicer) for coordinate math against Slicer-native RAS points
+  must flip it back to RAS first** -- see `page_scutum_draw.py`/
+  `page_pinna_draw.py` for the pattern. Meshes do **not** need to be
+  watertight (confirmed by Thomas -- the scutum/pinna outputs are open
+  surface patches, not solids).
 - **`mesh_isolate.py`**: the surgeon-drawn-outline -> isolated-patch logic,
   shared between the pinna and scutum draw stages (and originally
   motivated by the scutum "draw on the ceiling to mark the defect" idea).
@@ -202,16 +282,33 @@ train. If tuning behavior, this is the first place to look.
   dependency/mental model Curvature Project v4 already uses for its own
   geodesic patch extraction), flood-fill from a surgeon-provided seed
   point with the drawn loop's vertices acting as a barrier, include the
-  loop vertices in the output for a clean boundary. Has safety checks:
-  raises a clear error if the loop has <3 points, if the seed point lands
-  on the loop itself, or if the fill reaches >90% of the mesh (usually
-  means the loop has a gap and isn't actually closed). Tested successfully
-  against a synthetic "head with ear bump" mesh.
+  loop vertices in the output for a clean boundary. The seed vertex is
+  found by nearest-neighbor search *excluding the loop's own vertices*
+  (see bug #9 below for why that matters), not a plain nearest-vertex
+  lookup across the whole mesh. Has safety checks: raises a clear error
+  if the loop has <3 distinct points (reporting how many were actually
+  found, to help distinguish "too few drawn" from "curve didn't snap to
+  the surface"), if the loop encloses no non-boundary vertices at all, or
+  if the fill reaches >90% of the mesh (usually means the loop has a gap
+  and isn't actually closed). Tested successfully against a synthetic
+  "head with ear bump" mesh. Also has `crop_toward_canal()`, pinna-only:
+  after isolation, removes any part of the patch on the interior side of
+  a plane through a surgeon-placed marker (see "Mark Canal Opening" in
+  `page_pinna_draw.py`), oriented using the *ear canal's*
+  `canal_opening`->`near_eardrum` direction (position and direction are
+  deliberately separate arguments -- see bug/feature list below for why),
+  extended outward by `PINNA_CANAL_CROP_MARGIN_MM`. Paired with
+  `keep_connected_component_containing()`, which discards whatever's left
+  disconnected from the surgeon's seed point after that crop -- a single
+  plane cut doesn't always sever the head-interior material cleanly in
+  one piece.
 - **`postprocess.py`**: speck removal (min volume threshold), hole
   filling, light morphological smoothing. Engine-agnostic (works on output
   from either Stage A or a future Stage B).
 - **`io_utils.py`**: DICOM/volume loading (folder of .dcm or single
-  NRRD/NIfTI/etc. file via SimpleITK), resampling to isotropic spacing.
+  NRRD/NIfTI/etc. file via SimpleITK). `resample_to_isotropic()` still
+  exists but is **no longer called anywhere in the live pipeline** --
+  removed deliberately (see "Isotropic resampling removed" below).
 
 ---
 
@@ -338,16 +435,73 @@ required), run `[VENV_PYTHON_PATH, CURVATURE_PROJECT_MAIN_PATH]` with
 `scratch_folder/output/pinna_heatmap.ply` (and the CSV). **No changes to
 Curvature Project v4 itself needed.**
 
-### What's still a placeholder
-Two path constants at the top of `curvature_integration.py`:
-```python
-VENV_PYTHON_PATH = r"C:\Users\Thomas James\Documents\Curvature Project v4\.venv\Scripts\python.exe"
-CURVATURE_PROJECT_MAIN_PATH = r"C:\Users\Thomas James\Documents\Curvature Project v4\main.py"
-```
-`is_configured()` checks both exist; until they point to real files,
-`page_curvature.py` shows "not connected yet" and disables the Run
-button rather than erroring. **These need to be set to Thomas's actual
-paths** -- worth checking first whether this has already been done.
+### Status: wired up and confirmed working end-to-end (no longer a placeholder)
+Curvature Project v4 now lives *inside this same repo*, as
+`Curvature Project v4/` at the repo root (a sibling of
+`EarReconstructionPlannerLib/`), with its own `.venv` (Python 3.12.10, all
+dependencies installed and confirmed importable). The original
+`VENV_PYTHON_PATH`/`CURVATURE_PROJECT_MAIN_PATH` constants were a hardcoded
+absolute path into a `Documents` folder that never actually existed on
+Thomas's machine -- replaced with paths derived at import time from
+`curvature_integration.py`'s own file location
+(`Path(__file__).resolve().parent.parent / "Curvature Project v4"`), so the
+integration keeps working regardless of whose checkout this is, as long as
+the two projects stay side by side. `describe_configuration_problem()`
+reports exactly which piece is missing (the directory, the venv, or
+`main.py`) if any of them ever move; `is_configured()` is just
+`describe_configuration_problem() == ""`.
+
+Ran `main.py` directly against its own `data/scutum.stl`/`data/pinna.stl`
+test meshes to confirm the venv still works (~19s end-to-end: 300
+candidates scored, top 15 refined via ICP, heatmap + CSV written) --
+**this is genuinely confirmed working now**, not just reasoned about from
+reading the source.
+
+Two real things were fixed/added while wiring this up for real:
+- **Latent bug, never actually triggered but a real risk**: the original
+  `run_curvature_comparison()` only checked "does `output/pinna_heatmap.ply`
+  exist" to decide success. If a *second* run crashed partway through
+  main.py (after a *first* run had already succeeded once in the same
+  scratch folder), the stale file from the first run would still be
+  there, and the function would report success for a run that actually
+  failed. Fixed by having `run_curvature_comparison()` delete the whole
+  scratch `output_dir` (if it exists) before copying in fresh input meshes,
+  so a failed run can't hide behind an old success.
+- **Blocking UI for a run that can take minutes.** `main.py` prints
+  progress as it goes (candidate scoring in batches of 50, ICP refinement
+  per-candidate), but the original integration used `subprocess.run()`,
+  which blocks until the whole process exits and only shows output
+  afterward -- for a real dense pinna mesh, that could mean Slicer
+  appearing frozen for a long stretch. Replaced with `subprocess.Popen`
+  plus a background reader thread feeding a queue, so
+  `run_curvature_comparison()` can accept a `progress_callback` invoked
+  with each output line as it's printed (`python -u` forces the child's
+  stdout unbuffered so lines arrive promptly, not in bursts), and with an
+  empty-string heartbeat roughly every 0.2s during silent stretches so a
+  Qt-based caller has something to call `slicer.app.processEvents()` from
+  even when main.py hasn't printed anything new. `curvature_integration.py`
+  itself still has zero Slicer/Qt dependency -- the callback is just a
+  plain function; `page_curvature.py` is the only place that knows about
+  Qt.
+
+`page_curvature.py`/`page_curvature.ui` were rewritten to match: a
+`progressTextEdit` streams the live subprocess output, a
+`resultsTableWidget` shows the ranked harvest-site candidates from
+`top_harvest_sites.csv` (rank, coarse score, Chamfer/Hausdorff distance,
+XYZ) after a successful run, and `openOutputFolderButton` opens the
+scratch `output/` folder in Explorer. The loaded heatmap model now also
+gets `SetScalarVisibility(True)` + `SetActiveScalarName(...)` explicitly
+set on its display node so the baked-in per-vertex red/yellow/green
+colors actually render -- **flagged as NOT YET CONFIRMED against a real
+Slicer install** (no Slicer available in the dev environment used to
+build this), same caveat pattern as the earlier surface-constrained-curve
+issue; if the heatmap loads as flat gray instead of colored, this is the
+first thing to check. `on_leave_next()` now blocks "Finish" until a run
+has actually completed at least once. A `self._running` reentrancy guard
+on `CurvaturePage` stops a duplicate-connected Run button (every page's
+`on_enter()` reconnects its signals on every visit -- see existing
+convention below) from ever launching two concurrent subprocesses against
+the same scratch folder.
 
 ### What Curvature Project v4's `main.py` actually does (for context)
 Loads scutum defect + pinna meshes -> computes curvature descriptors
@@ -362,11 +516,14 @@ distance) -> builds a full per-vertex heatmap, highlighting the top 3
 sites with the defect's actual projected footprint shape (not a circle)
 -> exports `pinna_heatmap.ply` (colored mesh, red-yellow-green, green =
 best) and `top_harvest_sites.csv` (ranked list). Depends on `pymeshlab`,
-`potpourri3d`, `open3d`, `numpy`, `scipy`. Only `main.py` itself has been
-shared so far -- `src/mesh_io.py`, `src/descriptors.py`, `src/geodesics.py`,
+`potpourri3d`, `open3d`, `numpy`, `scipy`. The full source
+(`src/mesh_io.py`, `src/descriptors.py`, `src/geodesics.py`,
 `src/signature.py`, `src/candidates.py`, `src/scoring.py`,
-`src/registration.py`, `src/footprint.py`, `src/heatmap.py` exist in the
-real project but haven't been reviewed in this chat.
+`src/registration.py`, `src/footprint.py`, `src/heatmap.py`) now lives
+in-repo at `Curvature Project v4/src/` and can be read directly if needed
+-- per `CLAUDE-curvature.md`'s own instructions (and Thomas's), this
+project's own copy of Curvature Project v4 is reference-only and should
+not be edited from here.
 
 ---
 
@@ -381,27 +538,75 @@ real project but haven't been reviewed in this chat.
    with a fresh `EarCanalLandmarks()`, then calls `_update_step_display()`.
    Everything up to (and including) the threshold/segmentation stage was
    confirmed working, so the bug is localized to this one button/method.
-2. **`SetAndObserveSurfaceConstraintNode`** (in `page_scutum_draw.py` and
-   `page_pinna_draw.py`) -- correct Slicer 5.x Markups API per
-   documentation, never runtime-tested yet (drawing pages haven't been
-   reached in testing). First thing to check if curve drawing doesn't
-   snap to the mesh surface correctly.
+2. **RESOLVED: `SetAndObserveSurfaceConstraintNode` alone doesn't
+   constrain anything.** First real-Slicer test of the draw pages: the
+   surgeon drew a ~30-point outline and placed a seed point, but "Isolate
+   Patch" failed with `mesh_isolate.isolate_surface_patch`'s "needs at
+   least 3 distinct points" error, despite ~30 points having been placed.
+   Verified against Slicer's own `vtkMRMLMarkupsCurveNode` API docs:
+   `SetAndObserveSurfaceConstraintNode(modelNode)` only *registers* the
+   model node -- it has no effect on point placement unless the curve's
+   `CurveType` is also set to `ShortestDistanceOnSurface`. The convenience
+   method `SetCurveTypeToShortestDistanceOnSurface(modelNode)` sets both
+   in one call and is the correct API; the old code was calling the
+   lower-level method without ever setting the curve type, so the curve
+   was never actually surface-constrained. Fixed in both
+   `page_scutum_draw.py` and `page_pinna_draw.py`. Also improved
+   `mesh_isolate.isolate_surface_patch`'s error message to report how
+   many distinct vertices were actually found vs. how many points were
+   drawn, so a future failure (e.g. genuinely too few points, or points
+   clicked very close together) is easier to diagnose than the old
+   generic message.
 3. **`ctkSliderWidget` property names** (`.value`, `.minimum`, `.maximum`)
    -- used in both review pages, confirmed working in practice (Thomas
    got past the scutum review/segmentation stage with default -300/300
    threshold values).
-4. **Curvature integration untested end-to-end** -- the subprocess
-   mechanism has never actually been run against real Curvature Project
-   v4 code (only reasoned about from reading `main.py`). First real run
-   may surface issues (e.g. `main.py`'s other dependencies like
-   `src/mesh_io.py`, `src/descriptors.py` etc. weren't reviewed -- only
-   `main.py` itself was shared).
+4. **Curvature subprocess integration itself is now confirmed working**
+   (see "Curvature Project v4 integration" above) -- run directly against
+   real Curvature Project v4 code via its own venv, end-to-end, multiple
+   times. What's still unconfirmed is only the Slicer-side UI plumbing
+   around it: `page_curvature.py`'s live progress streaming into
+   `progressTextEdit`, the vertex-color display fix on the loaded heatmap
+   model, and the ranked-candidates table population have not been
+   runtime-tested in real Slicer (no Slicer install in the dev
+   environment this was built in). If the heatmap loads but renders flat
+   gray instead of colored, or the progress log / results table don't
+   populate, start there.
 5. **No `CMakeLists.txt`/`.s4ext`** -- this is a scripted module for
    development/testing only, loaded via Application Settings > Modules >
    Additional module paths, NOT via Extension Wizard (Thomas tried
    Extension Wizard first; it's the wrong tool for a scripted module
    without build files -- this was clarified but no packaging scaffold
    has been built, since it's not needed for solo testing).
+6. **Slicer reportedly crashes opening the module before any DICOM volume
+   is loaded** -- reported by Thomas, not yet reproduced/confirmed with an
+   actual crash log (no Slicer install in the dev environment). Reviewed
+   every code path reachable before/at the Setup and DICOM-load pages
+   (`EarReconstructionPlanner.py`'s `setup()`/`_build_pages()`,
+   `page_setup.py`, `page_dicom_load.py`, `dependencies.py`, and all 10
+   `.ui` files) and found no Python-level code that touches
+   `state.volume_node` or assumes a volume exists that early -- the only
+   scene-bound custom widget anywhere is `volumeSelector`
+   (`qMRMLNodeComboBox` in `page_dicom_load.ui`), and it isn't given a
+   scene until its own page's `on_enter()` runs (lazy). Two speculative
+   fixes applied without a confirmed root cause: (1) the top-level
+   `qMRMLWidget` loaded in `EarReconstructionPlannerWidget.setup()` was
+   never explicitly given `slicer.mrmlScene` -- a known gotcha for
+   `.ui`-based scripted modules -- now fixed with
+   `top_level_widget.setMRMLScene(slicer.mrmlScene)`. (2)
+   `page_dicom_load.py`'s `on_enter()` now checks
+   `slicer.mrmlScene.GetNodesByClass("vtkMRMLScalarVolumeNode")` and shows
+   a plain-language "No volumes loaded yet" warning in `statusLabel`
+   instead of a blank page when the scene has none. **If the crash
+   persists after these two changes, the next step is getting an actual
+   crash log/traceback from Thomas's machine** (Slicer's error log under
+   Help > Report a bug, or the app log file) -- this is a case where
+   guessing further without real output risks chasing the wrong thing.
+   **Update:** not mentioned again despite many subsequent sessions of
+   heavy module use (which all necessarily open the module first) --
+   probably fixed, but never explicitly reconfirmed by Thomas. If it
+   resurfaces, that's a signal the speculative fixes weren't the actual
+   cause.
 
 ---
 
@@ -434,11 +639,339 @@ real project but haven't been reviewed in this chat.
    Margin tuned to 15mm default after confirming correctness first (30mm
    worked but took ~12s per run; 15mm brought it under 1s on an equivalent
    synthetic test).
+4. **Isotropic resampling removed from the live pipeline.**
+   `page_dicom_load.py` no longer calls `io_utils.resample_to_isotropic()`
+   on the full scan. Reasoning (recorded in that file's module docstring):
+   every downstream step already reads physical spacing/origin/direction
+   off the image and works correctly on anisotropic voxels, so forcing
+   the whole scan to a fine isotropic spacing (e.g. 0.3mm) up front was
+   pure interpolation with no new information, and was making bone edges
+   look blurred/less defined in the 3D view. `resample_to_isotropic()`
+   itself is kept in `io_utils.py` (unused) in case it's ever useful for
+   normalizing banked training cases. Nothing else needed to change --
+   `roi_crop.py`/`segment_threshold.py`/etc. were already written in
+   terms of physical mm, not voxel counts.
+5. **`build_roi_mask()`'s inner clipping plane had an inverted normal.**
+   In `roi_crop.py`, the truncated-cylinder ROI is bounded by two planes,
+   one at `canal_opening` (the "outer" plane) and one at `near_eardrum`
+   (the "inner" plane). The outer plane was built as
+   `_unit(canal_axis_start - outer_normal_pt)` (own point minus its
+   reference point, per the function's own documented rule: "normal
+   direction from the paired reference landmark toward it"), but the
+   inner plane had the operands swapped:
+   `_unit(inner_normal_pt - canal_axis_end)` (reference minus own point --
+   backwards). Net effect: instead of keeping the region between
+   `canal_opening` and `near_eardrum`, the two planes' intersection kept
+   only the region *past* `near_eardrum` (deeper than the eardrum
+   landmark) and excluded the actual ear canal entirely. Symptom: Stage A
+   segmentation reports "No bone wall found with these settings"
+   regardless of threshold slider values, because the air-lumen scaffold
+   step never sees the real canal lumen -- not a landmark-placement
+   mistake on the surgeon's part. Fixed by flipping the inner plane to
+   match the outer plane's convention:
+   `_unit(canal_axis_end - inner_normal_pt)`.
+6. **`build_roi_mask()` crashed with a raw `IndexError` when the ROI came
+   out empty.** Surfaced immediately after fixing bug #5 above: with the
+   plane sign corrected, a landmark set where `reference_outer` and
+   `reference_inner` are placed on the wrong side (e.g. accidentally
+   swapped) now makes the two clipping planes contradict each other,
+   producing a completely empty ROI mask -- `crop_to_roi_bounding_box()`
+   then called `LabelStatisticsImageFilter.GetBoundingBox(1)` for a label
+   that doesn't exist, returning an empty tuple and crashing on
+   `bbox[0]`. Fixed two ways: (1) `build_roi_mask()` now explicitly
+   checks `inside_roi.any()` and raises a clear `ValueError` naming the
+   likely cause (reference points on the wrong side) instead of letting
+   the empty mask propagate into a cryptic downstream crash; (2)
+   `EarCanalLandmarks.validate()` now proactively checks that
+   `reference_outer` projects to the *outward* side of `canal_opening`
+   along the canal axis, and `reference_inner` projects to the *inward*
+   side of `near_eardrum`, so a wrong-side/swapped placement is caught
+   right after landmark placement with a plain-language message, before
+   the surgeon ever reaches Run Segmentation. `page_scutum_review.py`
+   also now catches this `ValueError` from `build_roi_mask()` and shows
+   it on `statusLabel` rather than crashing, as a second line of defense.
+7. **Bugs #5 and #6 above were symptoms of a design problem, not just
+   code bugs -- the whole 4-point tilted-plane ROI was replaced.** Even
+   after fixing the sign error, real-world testing showed the
+   wrong-side/swapped-reference-point warning from bug #6's `validate()`
+   fix kept firing on placements that were, by the surgeon's own
+   judgement, correct (`reference_outer` closer to `canal_opening`,
+   `reference_inner` closer to `near_eardrum`). Root cause: the reference
+   points only needed to be "roughly in line, doesn't need to be
+   precise," but the plane math required them to land precisely on one
+   side of a perpendicular-ish plane -- any small, perfectly reasonable
+   imprecision could flip the sign. Rather than keep patching validation
+   tolerances, the whole 4-point design was replaced with a simpler
+   2-point one -- see "4-point tilted-plane ear canal ROI" in "Dead ends
+   deliberately avoided" below for the design and why it's better. This
+   removed `reference_outer`/`reference_inner` from `EarCanalLandmarks`
+   entirely (`landmarks.py`, `roi_crop.py`), added
+   `ROI_AXIAL_MARGIN_MM` to `config.py`, and dropped the scutum landmarks
+   wizard step from 4 clicks to 2.
+8. **The real root cause of "No bone wall found" (even after fixing bugs
+   #5-#7): `sitkUtils.PullVolumeFromSlicer()` silently returns the volume
+   in a different coordinate convention than the landmarks.** Confirmed
+   from Slicer's own `Base/Python/sitkUtils.py` source:
+   `PullVolumeFromSlicer()` converts the volume node's geometry from
+   Slicer's native RAS convention to plain ITK/DICOM LPS convention
+   (`ijkToLPS = rasToLps * ijkToRAS`, i.e. negating X and Y) before
+   building the `sitk.Image`; `PushVolumeToSlicer()` converts back. But
+   every landmark in this project (`canal_opening`, `near_eardrum`,
+   `ear_center`) is captured directly from Slicer's Markups nodes
+   (`GetNthControlPointPositionWorld`) in RAS, and nothing anywhere
+   compensated for the mismatch -- `roi_crop.py`'s cropping and cylinder
+   math, and `segment_threshold.py`'s axis-distance component selection,
+   were all silently combining RAS landmark coordinates with an
+   LPS-oriented image. Net effect: every ROI was built mirrored across
+   the sagittal AND coronal planes from where the surgeon actually
+   clicked -- so even with a correct 2-point ROI (bug #7's fix) and a
+   correct threshold, the cylinder simply wasn't looking at the ear canal
+   at all, which is why sweeping the entire air/bone threshold range
+   never found anything. This explains the persistent failure much more
+   fundamentally than bugs #5-#7 -- those were real bugs, but this one
+   would have caused segmentation to fail (or succeed only by
+   coincidence, e.g. on a near-symmetric crop) regardless.
+
+   Fixed with a new `io_utils.flip_ras_lps()` helper (self-inverse:
+   negates X/Y on origin and direction) called in both
+   `page_scutum_review.py` and `page_pinna_review.py`: immediately after
+   `PullVolumeFromSlicer()` (LPS -> RAS, so all core/ math matches the
+   RAS landmarks) and again on a copy right before `PushVolumeToSlicer()`
+   (RAS -> LPS, since that function expects plain ITK convention and
+   converts to RAS itself). Mesh export (`mesh_export.label_map_to_mesh`)
+   uses the *unflipped*, RAS-consistent label map so exported mesh
+   vertices are in RAS and align correctly when loaded back into Slicer
+   via `slicer.util.loadModel()`. **Any future code that pulls a volume
+   via `sitkUtils.PullVolumeFromSlicer()` and combines it with
+   Slicer-native (RAS) points/landmarks must apply this same flip** --
+   this is not specific to the scutum/pinna review pages, it's a general
+   property of that Slicer API.
+
+   Thomas's suggestion to consider using Segment Editor's built-in
+   threshold effect (instead of/alongside the hand-rolled SimpleITK
+   thresholding) was a reasonable simplification idea, but wouldn't have
+   fixed this specific bug either way -- the problem was never which
+   thresholding implementation was used, it was that the ROI was being
+   built in the wrong physical location before any thresholding even
+   happened. "Open Segment Editor" already exists on both review pages
+   for manual touch-ups after Stage A runs; fully replacing Stage A's
+   engine with Segment Editor's scripted effects would trade away
+   `core/`'s "testable without launching Slicer" property (see the
+   "Testing approach" section) for less custom code -- worth considering
+   later, but a separate decision from this bug fix.
+9. **`SetAndObserveSurfaceConstraintNode` alone doesn't constrain a curve
+   to a surface.** First real-Slicer test of the draw pages: surgeon drew
+   a ~30-point outline and placed a seed point, but "Isolate Patch" failed
+   with `mesh_isolate.isolate_surface_patch`'s "needs at least 3 distinct
+   points" error. Verified against Slicer's own `vtkMRMLMarkupsCurveNode`
+   API docs: `SetAndObserveSurfaceConstraintNode(modelNode)` only
+   registers the model node -- it has no effect on point placement unless
+   the curve's `CurveType` is also set to `ShortestDistanceOnSurface`. The
+   old code in `page_scutum_draw.py`/`page_pinna_draw.py` never set the
+   curve type, so the curve was never actually surface-constrained and
+   most of the drawn points weren't landing near real mesh vertices.
+   Fixed by switching to the convenience method
+   `SetCurveTypeToShortestDistanceOnSurface(modelNode)`, which sets both
+   the curve type and the constraint node in one call. Also improved the
+   "<3 distinct points" error to report the actual distinct-vs-drawn
+   count, so a future occurrence of this message is easier to diagnose.
+10. **Seed point rejected as "on the drawn outline" even when clicked
+    dead center.** After fixing bug #9, drawing worked better, but
+    `isolate_surface_patch`'s seed-vertex lookup searched for the nearest
+    vertex across the *entire* mesh, including the loop's own vertices --
+    on a coarse mesh where a small drawn loop encloses only a few
+    interior vertices, the boundary vertices are often closer to any
+    interior click than the true interior vertices are to each other, so
+    a perfectly centered click could still resolve to a loop vertex and
+    get rejected. Fixed by restricting the nearest-neighbor search to
+    non-loop vertices only (`roi_crop.py` unaffected; change is in
+    `core/mesh_isolate.py`) -- a genuinely-inside seed point can no longer
+    be rejected for this reason. Left in place: a clear error if the loop
+    encloses *zero* non-boundary vertices at all (too small for the
+    mesh's resolution), and the existing >90%-of-mesh "gap in the loop"
+    check.
+11. **Scutum/pinna landmark points were still visible (and clickable) on
+    top of the model while drawing.** Since the landmark fiducial nodes
+    were only ever referenced by local variables inside their own page
+    controllers, no other page could reach them to hide them. Added
+    `scutum_landmarks_fiducial_node`/`pinna_landmarks_fiducial_node` to
+    `WizardState` (set when each landmarks page creates its fiducial
+    node), and hide that node's display (`GetDisplayNode().SetVisibility
+    (False)`) right after the corresponding review page successfully
+    generates its model -- landmarks reappear automatically if the
+    surgeon navigates back to re-place them (each landmarks page's
+    `on_enter()` re-asserts visibility).
+12. **A second, independent RAS/LPS bug -- this time on the mesh file
+    side, not the volume side.** After bugs #9-#10 were fixed, drawing
+    still failed intermittently (points collapsing to too few distinct
+    vertices, or a correctly-centered seed point getting rejected) even
+    with a well-drawn, well-spread-out outline. The giveaway was a VTK
+    console warning, easy to dismiss as noise: `vtkMRMLModelStorageNode
+    ... does not contain coordinate system information. Using LPS.` This
+    is Slicer telling you exactly what it's doing: STL (and most generic
+    mesh formats) have no field to record a coordinate system, so
+    `slicer.util.loadModel()` **always assumes a plain STL's raw vertex
+    numbers are in LPS** and flips them to RAS internally on load. But
+    `mesh_export.export_mesh()` was writing files with vertices already
+    in RAS (from `label_map_to_mesh()`, matching bug #8's fix) -- so
+    Slicer's automatic LPS->RAS flip on load double-flipped them, meaning
+    the model the surgeon actually sees and draws on in the 3D view was
+    silently mirrored (X/Y negated) from the true anatomy. Meanwhile,
+    `page_scutum_draw.py`/`page_pinna_draw.py`'s `_on_isolate_clicked`
+    loaded the *same file* directly via `trimesh.load()` (bypassing
+    Slicer's flip entirely), getting the true, unmirrored RAS vertices.
+    So `curve_points`/`seed_point` (matching the mirrored, displayed
+    model the surgeon clicked on) and `mesh.vertices` (matching the
+    unmirrored raw file) were two different coordinate frames being
+    compared directly -- explaining both the "<3 distinct points" and
+    "seed landed on outline" symptoms independently of bugs #9/#10's
+    causes, and independently of how carefully the surgeon drew.
+
+    Fixed with a new `mesh_export.flip_ras_lps_points()` (self-inverse,
+    negates X/Y of a point array -- the point-array equivalent of
+    `io_utils.flip_ras_lps()`): `export_mesh()` now flips every mesh's
+    vertices to LPS before writing, so `slicer.util.loadModel()`'s own
+    flip lands the model correctly, in true RAS. Both draw pages now flip
+    their `trimesh.load()`-ed mesh back to RAS immediately after loading
+    (before any snapping/isolation math against RAS `curve_points`/
+    `seed_point`), and now export the isolated patch via
+    `mesh_export.export_mesh()` (which applies the same RAS->LPS flip)
+    instead of calling `patch.export()` directly, which used to bypass
+    the flip entirely. **This warning is otherwise harmless and expected
+    for every STL Slicer loads** -- STL simply cannot embed coordinate
+    system metadata, so Slicer will always print it; the bug was never
+    the warning itself, only that nothing in this codebase was writing
+    files consistent with what the warning describes Slicer doing.
+    **General lesson for this project** (also true of bug #8): don't
+    dismiss VTK/Slicer console warnings that describe an assumption being
+    made about missing information -- Slicer is telling you exactly what
+    convention it used, and it's only "noise" if every producer/consumer
+    of that data actually agrees with that convention.
+13. **`mesh_isolate.isolate_surface_patch()`'s flood-fill barrier had gaps
+    even when the drawn curve was genuinely closed.** After bug #12 was
+    fixed, the surgeon reported "the isolated region covers almost the
+    entire mesh" despite being confident the loop was closed (it's a
+    `vtkMRMLMarkupsClosedCurveNode`, after all). Root cause: the code
+    only ever used the drawn curve's *control points* (~30 raw clicks,
+    each snapped to its nearest mesh vertex) as the flood-fill barrier --
+    but consecutive clicks are almost always several mesh edges apart
+    (mesh vertex spacing is far finer than click spacing), so the barrier
+    built from just those sparse points has real gaps in the mesh's
+    vertex-adjacency graph for the fill to leak through, even though the
+    *curve itself* looks fully closed on screen (Slicer's
+    `ShortestDistanceOnSurface` curve type interpolates the actual path
+    between clicks -- this code was never using that interpolated path,
+    only the raw control points). Verified the mechanism with a synthetic
+    20x20 grid-graph test: 4 sparse corner points as the barrier let a
+    flood fill leak to 396/400 nodes; bridging consecutive points via
+    shortest-path first correctly contained it to the 64 true interior
+    nodes.
+
+    Fixed by bridging every consecutive pair of drawn/snapped points --
+    including the last point back to the first, closing the loop -- with
+    the shortest path along the mesh's own vertex-adjacency graph
+    (`nx.shortest_path`) before using them as the barrier. The "<3
+    distinct points" check still runs first, against the raw (unbridged)
+    snapped points, since a 2-point "loop" isn't fixable by bridging --
+    there's no enclosed area between only 2 points regardless of the
+    path between them. A new `ValueError` covers the (rare) case where
+    two consecutive points aren't connected on the mesh surface at all
+    (disconnected mesh components).
+
+## Features added after the pipeline started working end-to-end
+
+1. **Original models hidden once their isolated/cropped successor
+   exists.** Same reasoning as the earlier landmark-visibility change:
+   once `page_scutum_draw.py`/`page_pinna_draw.py` successfully isolate
+   a patch, the *original* pre-isolation model
+   (`scutum_bone_wall_model_node`/`pinna_region_model_node`) is now
+   hidden (`GetDisplayNode().SetVisibility(False)`) so it doesn't overlap
+   the newly isolated patch in the 3D view. Also added
+   `scutum_defect_model_node`/`pinna_isolated_model_node` to
+   `WizardState` and now remove-then-reload the isolated model node on
+   repeat "Isolate Patch" clicks, instead of accumulating a new orphaned
+   model node in the scene on every click (a latent bug this incidentally
+   fixed -- `slicer.util.loadModel()` doesn't replace by path, it always
+   creates a new node).
+2. **Pinna patch auto-cropped toward the ear canal -- revised after the
+   first version wasn't precise enough.** The first version of this
+   feature (see the entry as originally written, superseded here) used
+   `state.scutum_landmarks.canal_opening` directly as both the cut
+   plane's *position* and *direction* source. In practice that position
+   wasn't reliable: it was placed earlier, on a different mesh/context
+   (the ear canal ROI, not this specific pinna geometry), and Thomas
+   found it consistently wasn't far enough outward, leaving head-interior
+   material attached. Fixed by decoupling position from direction:
+   - `page_pinna_draw.py` now has a third marking step, **"Mark Canal
+     Opening"**, alongside "Mark Inside Point" -- the surgeon places a
+     fresh point directly on *this* pinna mesh, at the ear canal opening.
+     `isolateButton` only enables once both the seed point and this new
+     canal marker are placed (mirroring how the seed point alone used to
+     gate it).
+   - `mesh_isolate.crop_toward_canal(mesh, plane_point, axis_direction,
+     margin_mm)` now takes the cut plane's position (`plane_point` --
+     the new marker) and its direction (`axis_direction`) as separate
+     arguments. `page_pinna_draw.py` passes the new marker as
+     `plane_point`, but still derives `axis_direction` from
+     `near_eardrum - canal_opening` (the ear canal's own landmarks) --
+     that direction ("which way is into the head") is a stable
+     anatomical fact independent of exactly where the plane needs to
+     sit, so it didn't need replacing, only the position did.
+   - New `mesh_isolate.keep_connected_component_containing(mesh,
+     reference_point)`: Thomas's own suggestion -- a single plane cut
+     doesn't always cleanly sever the head-interior material in one
+     piece; it commonly leaves it as one or more islands disconnected
+     from the main pinna body (since that material was only ever
+     attached near the canal opening to begin with). This splits the
+     mesh into connected components (`trimesh`'s own `.split()`) and
+     keeps only the one containing/nearest to a known-good reference
+     point -- the surgeon's own seed point, guaranteed to be on the
+     pinna. Verified against a synthetic two-blob mesh (a small piece
+     near the reference point + a larger, disconnected piece far away)
+     that it picks the correct piece regardless of which one is bigger.
+   - Order matters: `crop_toward_canal()` runs first (severs most of the
+     interior material at the plane), then
+     `keep_connected_component_containing()` cleans up whatever's left
+     disconnected. Both are skipped gracefully (not an error) if the ear
+     canal landmarks are missing -- unlikely given `PAGE_ORDER`, but
+     fails safe.
+   - `PINNA_CANAL_CROP_MARGIN_MM` (2.0mm default, `config.py`) is
+     unchanged from the first version -- still shifts the cut plane
+     outward from the marker so an imprecise click doesn't clip the
+     pinna's own base tissue.
+3. **3D view auto-recenters after segmentation.** Both review pages now
+   call the same sequence a click on Slicer's own "center 3D view" button
+   does (confirmed via Slicer's script repository docs):
+   `slicer.app.layoutManager().threeDWidget(0).threeDView().resetFocalPoint()`
+   followed by `.resetCamera()`. Runs right after the new model loads, so
+   the surgeon sees it immediately instead of needing to manually
+   pan/zoom to find it (this only re-frames the camera; it doesn't change
+   any data).
 
 ---
 
 ## Dead ends deliberately avoided (context so they aren't re-suggested)
 
+- **4-point tilted-plane ear canal ROI (`reference_outer`/
+  `reference_inner`)**: the original design, directly adapted from
+  Matin-Mann et al. (2025), used 2 extra landmarks (beyond
+  `canal_opening`/`near_eardrum`) purely to let the ROI's two bounding
+  planes tilt to match true anatomy instead of always being perpendicular
+  to the canal axis. **Rejected/replaced** after it caused two real bugs
+  in a row (an inverted plane normal, then a validation check that kept
+  firing on reasonable placements) -- the root problem wasn't the specific
+  bugs, it was that the design required a surgeon's "doesn't need to be
+  precise" click to land precisely on one side of a plane. Since the ROI
+  only ever needs to *comfortably contain* the canal (the real boundary
+  comes from thresholding within it, not the ROI's shape), the tilt
+  capability wasn't worth that fragility. Replaced with a 2-point design:
+  planes perpendicular to the `canal_opening`->`near_eardrum` axis,
+  extended by `ROI_AXIAL_MARGIN_MM`, with no surgeon-supplied direction to
+  get wrong. **Don't reintroduce tilted/surgeon-oriented bounding planes
+  for this ROI** unless there's concrete evidence the perpendicular
+  approximation is clipping real anatomy -- prefer a bigger
+  `ROI_AXIAL_MARGIN_MM` or `INITIAL_ROI_DIAMETER_MM` over adding more
+  precision-dependent landmarks.
 - **MedSAM2 for ear canal segmentation**: seriously considered (has an
   official Slicer plugin, zero-shot promptable segmentation, no training
   data needed), but **rejected** because Thomas's dev machine has a GTX

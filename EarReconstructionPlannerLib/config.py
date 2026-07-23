@@ -29,9 +29,17 @@ GAUSSIAN_SMOOTHING_SIGMA_MM = TARGET_VOXEL_SPACING_MM
 # ---------------------------------------------------------------------------
 
 # Starting diameter (in mm) of the truncated-cylinder volume of interest
-# built from the 4 landmark points. This just needs to comfortably contain
+# built from the 2 landmark points. This just needs to comfortably contain
 # the ear canal; the segmentation step below refines the actual boundary.
 INITIAL_ROI_DIAMETER_MM = 20.0
+
+# How far (in mm) the ROI cylinder's two end-planes extend past
+# canal_opening/near_eardrum, along the canal axis. Both planes are always
+# perpendicular to that axis (see roi_crop.build_roi_mask() for why this
+# replaced the original 4-landmark tilted-plane design) -- generous on
+# purpose so a slightly short canal_opening/near_eardrum placement still
+# comfortably contains the true wall, without needing any extra clicks.
+ROI_AXIAL_MARGIN_MM = 5.0
 
 # ---------------------------------------------------------------------------
 # Stage A: threshold-based segmentation (no training data required)
@@ -141,3 +149,28 @@ PINNA_ROI_RADIUS_MM = 45.0
 # used only as a sanity check if both ear-center points are ever provided
 # in the same session (e.g. planning bilateral reconstruction).
 MIN_INTERAURAL_DISTANCE_MM = 100.0
+
+# After the surgeon draws and isolates the pinna outline, any remaining
+# part of the mesh toward the interior of the head (past the ear canal
+# opening) is cropped away automatically -- the drawn outline marks the
+# pinna's outer boundary, but the isolated patch can still include a bit
+# of the head-side attachment near the canal. The cut plane sits at the
+# ear canal opening (core/landmarks.py's canal_opening landmark),
+# perpendicular to the canal axis, extended outward by this margin so the
+# pinna's own tissue right at its base isn't clipped by an imprecisely
+# placed landmark.
+PINNA_CANAL_CROP_MARGIN_MM = 2.0
+
+# ---------------------------------------------------------------------------
+# Curvature Project v4 integration
+# ---------------------------------------------------------------------------
+#
+# Curvature Project v4 runs as a separate subprocess (see
+# curvature_integration.py for why) -- this is a safety valve, not a
+# performance tuning knob. If the subprocess hasn't finished within this
+# many seconds, it's killed and reported as a timeout rather than freezing
+# Slicer indefinitely. Generous on purpose: scoring ~300 candidate sites
+# plus ICP refinement on a dense real pinna mesh can legitimately take a
+# few minutes, and this should only ever fire if something has actually
+# hung.
+CURVATURE_SUBPROCESS_TIMEOUT_SEC = 30 * 60
