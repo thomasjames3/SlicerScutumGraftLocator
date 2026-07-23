@@ -1,0 +1,154 @@
+"""
+EarReconstructionPlanner.py
+==============================
+The Slicer scripted module entry point. This file is what Slicer discovers
+and loads as a module (its name must match the containing extension, per
+Slicer's convention).
+
+Structurally, this file is intentionally thin: it builds a QStackedWidget
+from Resources/UI/*.ui files and the page controller classes in
+EarReconstructionPlannerLib/pages/, in the order given by
+EarReconstructionPlannerLib.wizard_state.PAGE_ORDER. It does not contain
+any segmentation, meshing, or drawing logic itself -- all of that lives in
+core/ and the individual page controllers, which were written and tested
+independently of Slicer (see the project's earlier standalone testing).
+
+If you want to reorder, add, or remove a wizard page, the one-line change
+is in wizard_state.PAGE_ORDER -- this file will pick it up automatically
+without needing to be edited.
+"""
+
+import os
+import importlib
+
+import qt
+import slicer
+from slicer.ScriptedLoadableModule import (
+    ScriptedLoadableModule,
+    ScriptedLoadableModuleWidget,
+    ScriptedLoadableModuleLogic,
+)
+
+from EarReconstructionPlannerLib.wizard_state import WizardState, PAGE_ORDER
+
+
+class EarReconstructionPlanner(ScriptedLoadableModule):
+    def __init__(self, parent):
+        ScriptedLoadableModule.__init__(self, parent)
+        self.parent.title = "Ear Reconstruction Planner"
+        self.parent.categories = ["Surgical Planning"]
+        self.parent.dependencies = []
+        self.parent.contributors = ["Thomas James"]
+        self.parent.helpText = (
+            "A step-by-step wizard for segmenting the scutum defect and "
+            "pinna from a CT scan, and generating a cartilage graft "
+            "harvest-site heatmap via Curvature Project v4."
+        )
+        self.parent.acknowledgementText = ""
+
+
+class EarReconstructionPlannerLogic(ScriptedLoadableModuleLogic):
+    """Deliberately minimal -- almost all actual logic lives in core/ and
+    the page controllers, which don't depend on Slicer's Logic base class
+    at all. This class exists mainly to satisfy Slicer's expected module
+    structure."""
+    pass
+
+
+class EarReconstructionPlannerWidget(ScriptedLoadableModuleWidget):
+    def setup(self):
+        ScriptedLoadableModuleWidget.setup(self)
+
+        ui_dir = os.path.join(os.path.dirname(__file__), "Resources", "UI")
+
+        top_level_widget = slicer.util.loadUI(
+            os.path.join(ui_dir, "EarReconstructionPlanner.ui")
+        )
+        self.layout.addWidget(top_level_widget)
+        self.ui = slicer.util.childWidgetVariables(top_level_widget)
+
+        self.state = WizardState()
+        self.state.working_dir = os.path.join(slicer.app.temporaryPath, "EarReconstructionPlanner")
+        os.makedirs(self.state.working_dir, exist_ok=True)
+
+        self._page_meta = []
+        self._controllers = {}
+        self._current_index = 0
+
+        self._build_pages(ui_dir)
+
+        self.ui.backButton.clicked.connect(self._on_back_clicked)
+        self.ui.nextButton.clicked.connect(self._on_next_clicked)
+
+        self._show_page(0)
+
+    def _build_pages(self, ui_dir):
+        # NOTE: page controller modules (and therefore their imports of
+        # core/, trimesh, SimpleITK, etc.) are intentionally NOT imported
+        # here. Only the .ui files are loaded now -- that's just Qt widget
+        # construction and doesn't touch any Python dependency. Each page's
+        # actual controller module is imported lazily, the first time that
+        # page is shown (see _get_or_create_controller below). This is what
+        # lets the Setup page install missing packages *before* any later
+        # page's imports are attempted -- importing everything upfront here
+        # would defeat the whole point of the Setup page.
+        self._page_meta = []  # (page_id, controller_class_name, page_widgets)
+        self._controllers = {}  # page_id -> instantiated controller, filled in lazily
+
+        for page_id, ui_filename, controller_class_name in PAGE_ORDER:
+            page_ui_widget = slicer.util.loadUI(os.path.join(ui_dir, ui_filename))
+            self.ui.stackedWidget.addWidget(page_ui_widget)
+            page_widgets = slicer.util.childWidgetVariables(page_ui_widget)
+            self._page_meta.append((page_id, controller_class_name, page_widgets))
+
+        # Remove the placeholder page defined in the top-level .ui file
+        # (index 0), now that real pages have been added after it.
+        placeholder = self.ui.stackedWidget.widget(0)
+        self.ui.stackedWidget.removeWidget(placeholder)
+
+    def _get_or_create_controller(self, index):
+        page_id, controller_class_name, page_widgets = self._page_meta[index]
+
+        if page_id not in self._controllers:
+            page_module = importlib.import_module(
+                f"EarReconstructionPlannerLib.pages.page_{page_id}"
+            )
+            controller_class = getattr(page_module, controller_class_name)
+            self._controllers[page_id] = controller_class(page_widgets, self.state)
+
+        return self._controllers[page_id]
+
+    def _show_page(self, index):
+        self._current_index = index
+        controller = self._get_or_create_controller(index)
+
+        self.ui.stackedWidget.setCurrentIndex(index)
+        self.ui.pageIndicatorLabel.setText(f"Step {index + 1} of {len(self._page_meta)}")
+        self.ui.backButton.setEnabled(index > 0)
+        self.ui.nextButton.setText("Finish" if controller.is_final_page() else "Next >")
+        self.ui.wizardStatusLabel.setText("")
+
+        controller.on_enter()
+
+    def _on_back_clicked(self):
+        if self._current_index == 0:
+            return
+        controller = self._get_or_create_controller(self._current_index)
+        controller.on_leave_back()
+        self._show_page(self._current_index - 1)
+
+    def _on_next_clicked(self):
+        controller = self._get_or_create_controller(self._current_index)
+        ok, message = controller.on_leave_next()
+        if not ok:
+            self.ui.wizardStatusLabel.setText(message)
+            return
+
+        if self._current_index + 1 < len(self._page_meta):
+            self._show_page(self._current_index + 1)
+        # else: this was the final page ("Finish") -- nothing further to do,
+        # the curvature page's own button already handled running the
+        # comparison and loading the result.
+
+    def cleanup(self):
+        pass
