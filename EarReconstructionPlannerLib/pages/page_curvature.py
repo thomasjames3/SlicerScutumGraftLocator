@@ -1,14 +1,14 @@
 """
 page_curvature.py
 ====================
-Page 9 (final): run Curvature Project v4 against the two approved meshes,
-load the resulting heatmap mesh into the 3D view, and let the surgeon
-download whichever result files they want.
+Page 9 (final): run the curvature comparison against the two approved
+meshes, load the resulting heatmap mesh into the 3D view, and let the
+surgeon download whichever result files they want.
 
-See curvature_integration.py for how this actually talks to Curvature
-Project v4 (a separate subprocess in its own venv, communicating only via
-files on disk -- no Slicer/Qt dependency in that module at all). This page
-is the Qt-facing half: it streams the subprocess's console output into
+See curvature_integration.py for how this actually runs the comparison
+(in-process, via core/curvature/pipeline.py -- no separate Python install,
+venv, or subprocess; no Slicer/Qt dependency in that module at all). This
+page is the Qt-facing half: it streams the comparison's progress into
 progressTextEdit as it runs (so a run that takes a couple of minutes on a
 dense mesh doesn't look like Slicer has frozen), then loads the heatmap
 model and shows the ranked harvest-site candidates in a table once it's
@@ -24,7 +24,7 @@ section below, which is this page's actual completion action.
 Expected widgets in page_curvature.ui:
   - runButton                    (QPushButton)
   - statusLabel                  (QLabel)
-  - progressTextEdit             (QPlainTextEdit, read-only) -- live subprocess output
+  - progressTextEdit             (QPlainTextEdit, read-only) -- live comparison progress
   - resultsTableWidget           (QTableWidget) -- ranked harvest site candidates
   - openOutputFolderButton       (QPushButton) -- opens the scratch output/ folder
   - downloadHeatmapCheckBox      (QCheckBox)
@@ -56,9 +56,9 @@ class CurvaturePage(WizardPage):
         # would otherwise fire _on_run_clicked multiple times for one
         # click. That's harmless on the threshold/review pages (their work
         # is synchronous and idempotent-ish), but here it would launch
-        # multiple concurrent Curvature Project v4 subprocesses sharing
-        # the same scratch output folder and stomping on each other. This
-        # flag makes every call after the first a no-op while a run is in
+        # multiple concurrent comparison runs sharing the same scratch
+        # output folder and stomping on each other's files. This flag
+        # makes every call after the first a no-op while a run is in
         # progress, regardless of how many times the signal is connected.
         self._running = False
         self._download_destination_dir = None

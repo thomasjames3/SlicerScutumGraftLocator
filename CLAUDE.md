@@ -19,9 +19,11 @@ extension:
 1. **Curvature Project v4** -- an existing, separately-developed Python
    tool (its own `.venv`, Python 3.12.10) that compares a scutum defect
    mesh against a pinna mesh and generates a heatmap of the best cartilage
-   graft harvest sites. This already works and is NOT part of this
-   migration -- it stays as-is; see "Curvature Project v4 integration"
-   below for how the extension calls it.
+   graft harvest sites. This already works and its own project folder
+   stays as a reference-only, unedited copy -- but its actual algorithm
+   has since been *ported* into the extension itself (`core/curvature/`)
+   so the extension doesn't need to run it as a separate process; see
+   "Curvature Project v4 integration" below for the full story.
 
 2. **Ear Reconstruction Planner** (this project) -- a 3D Slicer extension
    that automates producing the two input meshes Curvature Project v4
@@ -76,6 +78,15 @@ and working:
   the model, showing its colors, the results table), not the subprocess
   bridge itself.
 
+  **Update:** the subprocess/venv bridge described just above was since
+  deliberately replaced with an in-process port (`core/curvature/`) that
+  needs no separate Python/venv at all -- see "Curvature Project v4
+  integration" below for the current architecture and "Dead ends
+  deliberately avoided" for why the subprocess approach, while genuinely
+  working, was still worth replacing. The Slicer-side UI plumbing this
+  paragraph flags as unconfirmed is *still* unconfirmed -- the port
+  changed what runs underneath it, not that layer itself.
+
 **Known still-open issue:** the "Reset All Points" button on the scutum
 landmarks page was reported broken early on and was **never actually
 debugged** -- see Known Issues #1 below. This is the most likely place to
@@ -118,7 +129,7 @@ development -- see "Installing for testing" below). It's a 10-page wizard:
 6. Pinna review       -- run/adjust skin-surface threshold segmentation
 7. Pinna draw         -- surgeon draws the pinna outline on the 3D mesh
 8. Verify             -- surgeon checkboxes confirming both meshes are correct
-9. Curvature          -- runs Curvature Project v4 as a subprocess, loads heatmap
+9. Curvature          -- runs the curvature comparison in-process, loads heatmap
 ```
 
 ### Why a wizard instead of a normal Slicer module UI
@@ -154,7 +165,7 @@ EarReconstructionPlanner/
 │   ├── config.py                         # ALL tunable constants -- see below
 │   ├── dependencies.py                   # pip_install wrapper for Setup page
 │   ├── wizard_state.py                   # WizardState dataclass + PAGE_ORDER list
-│   ├── curvature_integration.py          # subprocess bridge to Curvature Project v4
+│   ├── curvature_integration.py          # in-process bridge to core/curvature/ (no subprocess/venv -- see below)
 │   ├── core/                             # segmentation logic, Slicer-independent, unit-testable
 │   │   ├── io_utils.py                   # DICOM/volume loading (resample_to_isotropic() kept but unused live -- see below)
 │   │   ├── landmarks.py                  # EarCanalLandmarks (2-point axis), .fcsv/.json loaders
@@ -165,7 +176,14 @@ EarReconstructionPlanner/
 │   │   ├── segment_dl.py                 # Stage B hook: trained model, falls back to Stage A
 │   │   ├── postprocess.py                # speck removal, hole filling, smoothing
 │   │   ├── mesh_export.py                # label map -> trimesh via marching cubes
-│   │   └── mesh_isolate.py               # drawn-loop -> isolated mesh patch (shared logic)
+│   │   ├── mesh_isolate.py               # drawn-loop -> isolated mesh patch (shared logic)
+│   │   └── curvature/                    # in-process port of Curvature Project v4 (see below)
+│   │       ├── mesh_io.py, signature.py, scoring.py, candidates.py, footprint.py  # ported verbatim
+│   │       ├── descriptors.py            # shape index/curvedness via trimesh.curvature (replaces pymeshlab)
+│   │       ├── geodesics.py              # geodesic distance via scipy dijkstra (replaces potpourri3d)
+│   │       ├── registration.py           # ICP via trimesh.registration (replaces open3d)
+│   │       ├── heatmap.py                # hand-rolled colormap (replaces matplotlib)
+│   │       └── pipeline.py               # orchestration (ported from Curvature Project v4's main.py)
 │   └── pages/
 │       ├── base_page.py                  # WizardPage interface: on_enter/on_leave_next/on_leave_back
 │       ├── page_setup.py
@@ -310,6 +328,20 @@ train. If tuning behavior, this is the first place to look.
   exists but is **no longer called anywhere in the live pipeline** --
   removed deliberately (see "Isotropic resampling removed" below).
 
+### Curvature comparison (`core/curvature/`)
+In-process port of the standalone Curvature Project v4 (the final wizard
+step's scutum-defect-vs-pinna comparison). File-for-file mirror of that
+project's own `src/` layout, so the two stay easy to cross-reference:
+`mesh_io.py`, `signature.py`, `scoring.py`, `candidates.py`, `footprint.py`
+are ported verbatim (they never touched a compiled-extension dependency).
+`descriptors.py`, `geodesics.py`, `registration.py`, and `heatmap.py` are
+rewritten to drop pymeshlab/potpourri3d/open3d/matplotlib in favor of
+trimesh/scipy equivalents already required elsewhere in this project --
+see "Curvature Project v4 integration" below for the full story on why
+this exists and each module's own docstring for exactly what it replaced
+and why. `pipeline.py` is the orchestration entry point (ported from
+Curvature Project v4's `main.py`), called by `curvature_integration.py`.
+
 ---
 
 ## Wizard/Slicer-specific files
@@ -397,133 +429,132 @@ step before the final comparison runs, not just a formality.
 
 ## Curvature Project v4 integration (`curvature_integration.py`)
 
-**This is the most recently completed, most concrete part of the
-integration** -- Thomas shared the real `main.py` from Curvature Project
-v4, so this is no longer guesswork.
+**Now runs entirely in-process inside Slicer's own Python -- no
+subprocess, no separate venv, no separate Python install needed.** This
+replaced an earlier, previously-working subprocess architecture (see
+"Dead ends deliberately avoided" below for that architecture and exactly
+why it was replaced, not just patched) once it became clear the three
+dependencies forcing it (`pymeshlab`, `potpourri3d`, `open3d`) could each
+be swapped for equivalents built on packages this extension already
+requires (`numpy`, `scipy`, `trimesh`) for its own segmentation pipeline.
+That's a real constraint win: a surgeon installing this extension no
+longer needs Python installed system-wide at all, just Slicer itself plus
+this extension's one-time Setup-page install (`dependencies.py`) --
+exactly the "zero Python experience required" bar this whole project is
+held to.
 
-### The environment problem (important, already solved architecturally)
-Curvature Project v4 runs in its own **Python 3.12.10 venv** with compiled
-extensions (`pymeshlab`, `potpourri3d`, `open3d`). Slicer bundles its own
-embedded Python (confirmed different: Thomas's error logs show Slicer
-5.10.0's own bundled Python at
-`C:\Users\Thomas James\AppData\Local\slicer.org\3D Slicer 5.10.0\lib\Python\...`).
-Compiled-extension wheels are version-specific, so there's a real risk
-those packages simply can't be installed into Slicer's Python at all.
-**Decision: do not attempt to import Curvature Project v4 into Slicer's
-Python process.** Instead, run it as a **separate subprocess** using its
-own existing venv's `python.exe`, communicating only via files on disk.
-This is the same pattern used by real Slicer plugins that depend on
-incompatible environments (e.g. Docker-based/remote-server inference
-backends, as seen in the ABL Temporal Bone Segmentation Slicer extension
-researched earlier in this project).
+### Where the actual algorithm lives
+`core/curvature/` (see the `core/` module reference above) is a
+file-for-file port of the standalone Curvature Project v4's `main.py` +
+`src/*.py`. It mirrors that project's own module boundaries deliberately,
+so the two stay easy to cross-reference if Curvature Project v4 itself is
+ever updated:
 
-### The actual interface (confirmed from real `main.py`, not guessed)
-Critically, **`main.py` takes NO command-line arguments**. It reads:
-- `Path("data") / "scutum.stl"` and `Path("data") / "pinna.stl"`,
-  relative to wherever the *process* is run from (its working directory)
-- writes `Path("output") / "pinna_heatmap.ply"` and
-  `Path("output") / "top_harvest_sites.csv"`, same way
-- its own internal imports (`from src.mesh_io import ...`) resolve based
-  on `main.py`'s own file location (Python adds that to `sys.path`
-  automatically), unaffected by working directory
+| Original (`Curvature Project v4/src/`) | Port (`core/curvature/`) | What changed |
+|---|---|---|
+| `mesh_io.py` | `mesh_io.py` | nothing -- pure trimesh load/cleanup |
+| `signature.py`, `scoring.py`, `candidates.py`, `footprint.py` | same names | nothing -- pure numpy/scipy/trimesh already |
+| `descriptors.py` | `descriptors.py` | pymeshlab's curvature filter -> `trimesh.curvature`'s discrete Gaussian/mean curvature measures, normalized by ball area, same shape-index/curvedness formulas (Koenderink & van Doorn) |
+| `geodesics.py` | `geodesics.py` | potpourri3d's heat-method solver -> `scipy.sparse.csgraph.dijkstra` over the mesh's own edge graph (graph-shortest-path approximation to geodesic distance) |
+| `registration.py` | `registration.py` | open3d's point-to-plane ICP -> `trimesh.registration.icp` (point-to-point, `reflection=False, scale=False` to stay a rigid transform); Chamfer/Hausdorff already used plain `cKDTree` even in the original |
+| `heatmap.py` | `heatmap.py` | matplotlib's RdYlGn colormap -> a hand-rolled 3-stop lerp using the same ColorBrewer RGB stops matplotlib's RdYlGn is built from |
+| `main.py` | `pipeline.py` | turned into a callable `run(scutum_path, pinna_path, output_dir, progress_callback)` instead of a script reading fixed `data/`/`output/` paths; its tunables (candidate count, histogram bins, score weights, etc.) moved into `config.py` |
 
-So the integration is: create a per-case scratch folder, copy
-`scutum_defect_mesh_path` -> `scratch/data/scutum.stl` and
-`pinna_isolated_mesh_path` -> `scratch/data/pinna.stl` (exact filenames
-required), run `[VENV_PYTHON_PATH, CURVATURE_PROJECT_MAIN_PATH]` with
-`cwd=scratch_folder`, then read back
-`scratch_folder/output/pinna_heatmap.ply` (and the CSV). **No changes to
-Curvature Project v4 itself needed.**
+Two real, deliberate accuracy trade-offs from this port, worth knowing
+about if a surgeon ever asks "why did it suggest that site":
+- **Geodesic distances are graph-shortest-path, not true continuous
+  geodesics.** They read systematically a little *longer* than the real
+  distance (travel is constrained to existing mesh edges), but this
+  applies identically to the defect and every candidate, so the relative
+  comparison the scoring depends on should still be meaningful.
+- **ICP refinement is point-to-point, not point-to-plane.** Point-to-plane
+  (the original's open3d choice) typically converges a bit faster/more
+  robustly on smooth surfaces; point-to-point is still a completely
+  standard alternative, and this stage was already designed to be "good
+  enough given the coarse filter already found plausible candidates," not
+  a from-scratch global registration pipeline.
 
-### Status: wired up and confirmed working end-to-end (no longer a placeholder)
-Curvature Project v4 now lives *inside this same repo*, as
-`Curvature Project v4/` at the repo root (a sibling of
-`EarReconstructionPlannerLib/`), with its own `.venv` (Python 3.12.10, all
-dependencies installed and confirmed importable). The original
-`VENV_PYTHON_PATH`/`CURVATURE_PROJECT_MAIN_PATH` constants were a hardcoded
-absolute path into a `Documents` folder that never actually existed on
-Thomas's machine -- replaced with paths derived at import time from
-`curvature_integration.py`'s own file location
-(`Path(__file__).resolve().parent.parent / "Curvature Project v4"`), so the
-integration keeps working regardless of whose checkout this is, as long as
-the two projects stay side by side. `describe_configuration_problem()`
-reports exactly which piece is missing (the directory, the venv, or
-`main.py`) if any of them ever move; `is_configured()` is just
-`describe_configuration_problem() == ""`.
+One dependency wrinkle found (and fixed) while porting `descriptors.py`:
+trimesh's own `discrete_mean_curvature_measure()` internally needs the
+optional `rtree` package (an R-tree spatial index), which isn't in
+`dependencies.py`'s required-package list and would have been a genuinely
+new install -- the one place this port could have quietly broken its own
+"zero new dependencies" goal. Fixed by reimplementing that one function's
+edge-lookup step (`_mean_curvature_measure()` in `descriptors.py`) using a
+`scipy.spatial.cKDTree` over edge midpoints instead of trimesh's R-tree,
+reusing trimesh's own public `line_ball_intersection()` helper for the
+actual geometry -- keeps the port to a strict zero-new-dependency change.
+**If a future trimesh upgrade changes this internal behavior, that's the
+first place to check.**
 
-Ran `main.py` directly against its own `data/scutum.stl`/`data/pinna.stl`
-test meshes to confirm the venv still works (~19s end-to-end: 300
-candidates scored, top 15 refined via ICP, heatmap + CSV written) --
-**this is genuinely confirmed working now**, not just reasoned about from
-reading the source.
+### Verification done so far (synthetic, no Slicer needed -- see "Testing approach")
+Following this project's usual pattern of validating `core/` logic with
+synthetic meshes before trusting it on real anatomy:
+1. **Sphere curvature sanity check**: an icosphere has known analytic
+   curvature (K = 1/r², H = 1/r everywhere) -- `descriptors.py`'s
+   normalization was confirmed to recover this closely (mean shape_index
+   ≈ 0.96 vs expected 1.0, mean curvedness ≈ 0.102 vs expected 0.100).
+2. **Scoring discrimination check**: given *consistently constructed*
+   patches (same extraction radius, same isolated single-bump context),
+   `coarse_score` correctly scores a same-shape bump near zero and
+   differently-shaped bumps clearly worse, ordered sensibly by how
+   different they actually are.
+3. **End-to-end pipeline smoke test**: a synthetic multi-bump "pinna" +
+   disc-shaped synthetic "defect" run through `pipeline.run()` completes
+   without error and produces valid `pinna_heatmap.ply` +
+   `top_harvest_sites.csv`.
 
-Two real things were fixed/added while wiring this up for real:
-- **Latent bug, never actually triggered but a real risk**: the original
-  `run_curvature_comparison()` only checked "does `output/pinna_heatmap.ply`
-  exist" to decide success. If a *second* run crashed partway through
-  main.py (after a *first* run had already succeeded once in the same
-  scratch folder), the stale file from the first run would still be
-  there, and the function would report success for a run that actually
-  failed. Fixed by having `run_curvature_comparison()` delete the whole
-  scratch `output_dir` (if it exists) before copying in fresh input meshes,
-  so a failed run can't hide behind an old success.
-- **Blocking UI for a run that can take minutes.** `main.py` prints
-  progress as it goes (candidate scoring in batches of 50, ICP refinement
-  per-candidate), but the original integration used `subprocess.run()`,
-  which blocks until the whole process exits and only shows output
-  afterward -- for a real dense pinna mesh, that could mean Slicer
-  appearing frozen for a long stretch. Replaced with `subprocess.Popen`
-  plus a background reader thread feeding a queue, so
-  `run_curvature_comparison()` can accept a `progress_callback` invoked
-  with each output line as it's printed (`python -u` forces the child's
-  stdout unbuffered so lines arrive promptly, not in bursts), and with an
-  empty-string heartbeat roughly every 0.2s during silent stretches so a
-  Qt-based caller has something to call `slicer.app.processEvents()` from
-  even when main.py hasn't printed anything new. `curvature_integration.py`
-  itself still has zero Slicer/Qt dependency -- the callback is just a
-  plain function; `page_curvature.py` is the only place that knows about
-  Qt.
+**What this did NOT end up validating**: an early version of check 3 also
+asserted that, of three differently-scaled bumps scattered across the
+synthetic pinna, the one matching the defect's shape always comes out
+ranked #1 by the full 300-candidate pipeline. That assertion turned out to
+be unreliable in this specific synthetic scene, for two identified,
+explainable reasons that are properties of the *original* algorithm's
+design (present before this port too, not introduced by it):
+`CURVATURE_PATCH_RADIUS_MARGIN` (1.15) deliberately makes every candidate
+patch ~15% larger than the defect's own measured radius, which creates a
+real radial-distance-histogram mismatch against a defect whose boundary is
+a sharp, clean disc cutoff (real, textured anatomy is much less likely to
+expose this as sharply); and the shared curvedness histogram range is set
+from the whole pinna's own 95th-percentile curvedness, which swings a lot
+on a tiny synthetic pinna with only a few, very differently-scaled bumps.
+Check 2 above isolates the thing that actually mattered for this port
+(does `coarse_score` prefer a genuinely matching shape when compared
+consistently) and passes cleanly -- but "does the full pipeline always
+rank the single best real-anatomy site #1" is still, as it always was, an
+open question that only real surgical cases can really answer.
 
-`page_curvature.py`/`page_curvature.ui` were rewritten to match: a
-`progressTextEdit` streams the live subprocess output, a
-`resultsTableWidget` shows the ranked harvest-site candidates from
-`top_harvest_sites.csv` (rank, coarse score, Chamfer/Hausdorff distance,
-XYZ) after a successful run, and `openOutputFolderButton` opens the
-scratch `output/` folder in Explorer. The loaded heatmap model now also
-gets `SetScalarVisibility(True)` + `SetActiveScalarName(...)` explicitly
-set on its display node so the baked-in per-vertex red/yellow/green
-colors actually render -- **flagged as NOT YET CONFIRMED against a real
-Slicer install** (no Slicer available in the dev environment used to
-build this), same caveat pattern as the earlier surface-constrained-curve
-issue; if the heatmap loads as flat gray instead of colored, this is the
-first thing to check. `on_leave_next()` now blocks "Finish" until a run
-has actually completed at least once. A `self._running` reentrancy guard
-on `CurvaturePage` stops a duplicate-connected Run button (every page's
-`on_enter()` reconnects its signals on every visit -- see existing
-convention below) from ever launching two concurrent subprocesses against
-the same scratch folder.
+### Still true from before (unconfirmed Slicer-side UI, not re-verified by this port)
+`page_curvature.py`/`page_curvature.ui`'s live progress streaming into
+`progressTextEdit`, `resultsTableWidget`'s population from
+`top_harvest_sites.csv`, and the loaded heatmap model's
+`SetScalarVisibility(True)` + `SetActiveScalarName(...)` display-node fix
+(so the baked-in per-vertex red/yellow/green colors actually render
+instead of flat gray) are all still **flagged as NOT YET CONFIRMED against
+a real Slicer install** -- this port changes what runs underneath
+`curvature_integration.run_curvature_comparison()` but doesn't touch, and
+doesn't newly confirm, that Qt-facing layer. If the heatmap loads as flat
+gray, or the progress log / results table don't populate, start there,
+same as before. A `self._running` reentrancy guard on `CurvaturePage`
+still stops a duplicate-connected Run button from launching two
+concurrent comparison runs against the same scratch output folder (now
+academic in practice, since a synchronous in-process call can't actually
+overlap with itself the way two subprocesses could -- kept anyway as
+cheap defense-in-depth).
 
-### What Curvature Project v4's `main.py` actually does (for context)
+### What the comparison actually does (for context, unchanged by the port)
 Loads scutum defect + pinna meshes -> computes curvature descriptors
-(shape index, curvedness via pymeshlab) on both -> builds the defect's
-"signature" (curvature histograms + an intrinsic geodesic
-radial-distance-from-center histogram, weighted 1.5x vs 1.0x for
-extrinsic terms, motivated by "cartilage bends freely but resists
-stretching") -> generates ~300 candidate harvest sites spread across the
-pinna -> coarse-scores every candidate patch against the defect signature
--> refines the top 15 with local ICP alignment (Chamfer/Hausdorff
-distance) -> builds a full per-vertex heatmap, highlighting the top 3
-sites with the defect's actual projected footprint shape (not a circle)
--> exports `pinna_heatmap.ply` (colored mesh, red-yellow-green, green =
-best) and `top_harvest_sites.csv` (ranked list). Depends on `pymeshlab`,
-`potpourri3d`, `open3d`, `numpy`, `scipy`. The full source
-(`src/mesh_io.py`, `src/descriptors.py`, `src/geodesics.py`,
-`src/signature.py`, `src/candidates.py`, `src/scoring.py`,
-`src/registration.py`, `src/footprint.py`, `src/heatmap.py`) now lives
-in-repo at `Curvature Project v4/src/` and can be read directly if needed
--- per `CLAUDE-curvature.md`'s own instructions (and Thomas's), this
-project's own copy of Curvature Project v4 is reference-only and should
-not be edited from here.
+(shape index, curvedness) on both -> builds the defect's "signature"
+(curvature histograms + an intrinsic geodesic radial-distance-from-center
+histogram, weighted 1.5x vs 1.0x for extrinsic terms, motivated by
+"cartilage bends freely but resists stretching") -> generates ~300
+candidate harvest sites spread across the pinna -> coarse-scores every
+candidate patch against the defect signature -> refines the top 15 with
+local ICP alignment (Chamfer/Hausdorff distance) -> builds a full
+per-vertex heatmap, highlighting the top 3 sites with the defect's actual
+projected footprint shape (not a circle) -> exports `pinna_heatmap.ply`
+(colored mesh, red-yellow-green, green = best) and
+`top_harvest_sites.csv` (ranked list).
 
 ---
 
@@ -561,11 +592,13 @@ not be edited from here.
    -- used in both review pages, confirmed working in practice (Thomas
    got past the scutum review/segmentation stage with default -300/300
    threshold values).
-4. **Curvature subprocess integration itself is now confirmed working**
-   (see "Curvature Project v4 integration" above) -- run directly against
-   real Curvature Project v4 code via its own venv, end-to-end, multiple
-   times. What's still unconfirmed is only the Slicer-side UI plumbing
-   around it: `page_curvature.py`'s live progress streaming into
+4. **The curvature comparison now runs in-process** (`core/curvature/`,
+   see "Curvature Project v4 integration" above) instead of as a
+   subprocess against the standalone project's venv -- verified with
+   synthetic meshes (sphere curvature check, scoring discrimination
+   check, end-to-end smoke test), not yet against real anatomy. What's
+   still unconfirmed is the same Slicer-side UI plumbing as before the
+   port: `page_curvature.py`'s live progress streaming into
    `progressTextEdit`, the vertex-color display fix on the loaded heatmap
    model, and the ranked-candidates table population have not been
    runtime-tested in real Slicer (no Slicer install in the dev
@@ -990,10 +1023,32 @@ not be edited from here.
   cartilage segmentation work is MRI-based). This is why the pinna's Stage
   A segments skin surface, not cartilage, and relies on the surgeon's
   drawn outline to do the real anatomical isolation.
-- **Reproducing Curvature Project v4 inside Slicer's Python**: considered
-  and rejected due to the Python 3.12 venv / compiled-extension
-  incompatibility risk (see above). Don't suggest pip-installing
-  `pymeshlab`/`potpourri3d`/`open3d` into Slicer's own Python as a fix.
+- **Reproducing Curvature Project v4 inside Slicer's Python by installing
+  its exact dependencies**: considered and rejected early on, due to the
+  Python 3.12 venv / compiled-extension incompatibility risk. Don't
+  suggest pip-installing `pymeshlab`/`potpourri3d`/`open3d` into Slicer's
+  own Python as a fix -- **this is different from what was actually done
+  later** (see the next entry): the comparison does now run inside
+  Slicer's Python, just via a rewritten `core/curvature/` that never needs
+  those three packages in the first place.
+- **The subprocess/separate-venv architecture for Curvature Project v4
+  itself**: this was the real, working, previously-documented design
+  (`curvature_integration.py` shelling out to Curvature Project v4's own
+  `.venv` `python.exe`, confirmed end-to-end multiple times) -- it wasn't
+  a mistake, it was the correct call *at the time*, given the assumption
+  that `pymeshlab`/`potpourri3d`/`open3d` were load-bearing and
+  irreplaceable. It was deliberately replaced once it became clear each of
+  those three could be swapped for a numpy/scipy/trimesh equivalent (see
+  "Curvature Project v4 integration" above for the replacement table and
+  why), because the subprocess/venv requirement was a direct violation of
+  this project's "zero Python experience required" constraint -- a
+  surgeon installing this extension shouldn't also need a separate Python
+  install and a second project folder checked out next to it just to run
+  the last wizard step. **Don't reintroduce the subprocess/venv bridge**
+  thinking it's still necessary -- the standalone Curvature Project v4
+  project (`C:\Users\Thomas James\Documents\Curvature Project v4\` on
+  Thomas's machine) is now reference-only for this repo, same status as
+  before, just no longer executed directly.
 
 ---
 

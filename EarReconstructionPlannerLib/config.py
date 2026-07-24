@@ -162,15 +162,51 @@ MIN_INTERAURAL_DISTANCE_MM = 100.0
 PINNA_CANAL_CROP_MARGIN_MM = 2.0
 
 # ---------------------------------------------------------------------------
-# Curvature Project v4 integration
+# Curvature comparison (core/curvature/ -- ported from the standalone
+# Curvature Project v4, now running in-process, no subprocess/venv needed)
 # ---------------------------------------------------------------------------
 #
-# Curvature Project v4 runs as a separate subprocess (see
-# curvature_integration.py for why) -- this is a safety valve, not a
-# performance tuning knob. If the subprocess hasn't finished within this
-# many seconds, it's killed and reported as a timeout rather than freezing
-# Slicer indefinitely. Generous on purpose: scoring ~300 candidate sites
-# plus ICP refinement on a dense real pinna mesh can legitimately take a
-# few minutes, and this should only ever fire if something has actually
-# hung.
-CURVATURE_SUBPROCESS_TIMEOUT_SEC = 30 * 60
+# How many candidate harvest sites to spread across the pinna and coarse-score
+# against the defect. Higher = more thorough screening but slower.
+CURVATURE_NUM_CANDIDATES = 300
+
+# How many of the best coarse-scoring candidates get refined with local ICP
+# alignment (the expensive step). Only the top of these ever get shown to the
+# surgeon, so this doesn't need to be large.
+CURVATURE_TOP_N_REFINE = 15
+
+# Histogram resolution used when comparing shape-index / curvedness / radial-
+# distance distributions between the defect and a candidate patch.
+CURVATURE_HIST_BINS = 16
+
+# Extra margin applied to the candidate patch radius vs. the defect's own
+# geodesic radius, so a candidate patch is generated slightly larger than the
+# defect rather than risking being clipped short.
+CURVATURE_PATCH_RADIUS_MARGIN = 1.15
+
+# Percentile of the pinna's own curvedness distribution used to set a shared
+# curvedness histogram range, so the defect and every candidate are compared
+# on the same scale rather than an assumed fixed range.
+CURVATURE_CURVEDNESS_PERCENTILE = 95
+
+# Radius (as a multiple of the mesh's own mean edge length) of the ball used
+# to estimate per-vertex curvature via trimesh's discrete curvature measures
+# (see core/curvature/descriptors.py). Expressed relative to edge length
+# rather than a fixed mm value so this adapts automatically to meshes of
+# different density/resolution. Validated against a synthetic sphere (known
+# analytic curvature) before trusting it on real anatomy -- see that module's
+# docstring for details.
+CURVATURE_MEASURE_RADIUS_EDGE_MULTIPLIER = 3.0
+
+# Weights combining the individual shape-signature distances into a single
+# coarse score (see core/curvature/scoring.py) -- lower score = better match.
+# radial_distance is weighted at least as heavily as the curvature terms
+# because it's intrinsic/bending-invariant (cartilage bends readily but
+# resists stretching), so a candidate with different curvature but a similar
+# intrinsic (geodesic) shape may still be a good match.
+CURVATURE_WEIGHT_SHAPE_INDEX = 1.0
+CURVATURE_WEIGHT_CURVEDNESS = 1.0
+CURVATURE_WEIGHT_RADIAL_DISTANCE = 1.5
+CURVATURE_WEIGHT_COMPACTNESS = 0.5
+CURVATURE_WEIGHT_ASPECT_RATIO = 0.5
+CURVATURE_WEIGHT_AREA = 0.25
