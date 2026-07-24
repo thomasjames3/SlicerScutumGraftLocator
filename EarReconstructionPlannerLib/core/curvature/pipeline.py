@@ -55,7 +55,7 @@ from config import (
 )
 
 from .mesh_io import load_mesh
-from .descriptors import compute_descriptors, Descriptors
+from .descriptors import compute_descriptors, boundary_unreliable_mask, Descriptors
 from .geodesics import GeodesicPatchExtractor
 from .signature import compute_signature
 from .candidates import generate_candidate_vertices
@@ -123,9 +123,16 @@ def run(scutum_path, pinna_path, output_dir,
     )
     curvedness_range = (0.0, max(curvedness_max, 1e-6))
 
+    # Restricted to reliable vertices (see descriptors.boundary_unreliable_mask)
+    # -- otherwise the shared range gets stretched out to the full [-1, 1]
+    # by boundary-cut artifacts, wasting most of the histogram's resolution
+    # on a range real, reliable curvature values rarely reach.
+    reliable_pinna_si = pinna_descriptors.shape_index[pinna_descriptors.reliable]
+    if len(reliable_pinna_si) == 0:
+        reliable_pinna_si = pinna_descriptors.shape_index
     shape_index_range = (
-        float(pinna_descriptors.shape_index.min()),
-        float(pinna_descriptors.shape_index.max()),
+        float(reliable_pinna_si.min()),
+        float(reliable_pinna_si.max()),
     )
 
     # --- Defect signature + geodesic center/diameter -----------------
@@ -183,10 +190,20 @@ def run(scutum_path, pinna_path, output_dir,
             continue  # patch too small/degenerate near mesh edges -- skip
 
         # Build descriptors for just this patch by indexing into the
-        # already-computed whole-pinna descriptor arrays.
+        # already-computed whole-pinna descriptor arrays. The reliability
+        # mask can't just be sliced the same way, though: this patch has its
+        # own freshly-cut geodesic boundary that the whole-pinna mask knows
+        # nothing about (it only reflects the *pinna's* own outer edge), so
+        # it's recomputed fresh against patch_mesh -- cheap, since it's just
+        # a boundary-edge lookup, not a curvature recompute -- and combined
+        # with the sliced whole-pinna mask to also exclude vertices near the
+        # pinna's real boundary.
+        patch_unreliable = boundary_unreliable_mask(patch_mesh, pinna_descriptors.curvature_radius)
         patch_descriptors = Descriptors(
             shape_index=pinna_descriptors.shape_index[patch_vertex_ids],
             curvedness=pinna_descriptors.curvedness[patch_vertex_ids],
+            reliable=(~patch_unreliable) & pinna_descriptors.reliable[patch_vertex_ids],
+            curvature_radius=pinna_descriptors.curvature_radius,
         )
 
         patch_signature = compute_signature(

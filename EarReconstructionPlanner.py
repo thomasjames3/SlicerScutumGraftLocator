@@ -29,7 +29,7 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleLogic,
 )
 
-from EarReconstructionPlannerLib.wizard_state import WizardState, PAGE_ORDER
+from EarReconstructionPlannerLib.wizard_state import WizardState, PAGE_ORDER, should_skip_page
 
 
 class EarReconstructionPlanner(ScriptedLoadableModule):
@@ -119,12 +119,37 @@ class EarReconstructionPlannerWidget(ScriptedLoadableModuleWidget):
 
         return self._controllers[page_id]
 
-    def _show_page(self, index):
+    def _show_page(self, index, direction=1):
+        # Some pages (currently just the tutorial-only welcome page) are
+        # skipped entirely depending on wizard state -- checked via a plain
+        # page_id -> state predicate (wizard_state.should_skip_page)
+        # rather than instantiating the controller, so skip-checking never
+        # forces an early import of a page module before Setup's install
+        # step runs (see _get_or_create_controller's docstring). `direction`
+        # says which way to keep looking if this page turns out to be
+        # skipped, so Back/Next both skip over it correctly.
+        page_id = self._page_meta[index][0]
+        if should_skip_page(self.state, page_id):
+            next_index = index + direction
+            if 0 <= next_index < len(self._page_meta):
+                self._show_page(next_index, direction)
+                return
+            # Can't skip further without running off the end of the wizard
+            # -- show it anyway as a fallback (shouldn't happen in practice
+            # since the first/last pages are never skipped).
+
         self._current_index = index
         controller = self._get_or_create_controller(index)
 
         self.ui.stackedWidget.setCurrentIndex(index)
-        self.ui.pageIndicatorLabel.setText(f"Step {index + 1} of {len(self._page_meta)}")
+        visible_total = sum(
+            1 for pid, _, _ in self._page_meta if not should_skip_page(self.state, pid)
+        )
+        visible_position = sum(
+            1 for pid, _, _ in self._page_meta[: index + 1]
+            if not should_skip_page(self.state, pid)
+        )
+        self.ui.pageIndicatorLabel.setText(f"Step {visible_position} of {visible_total}")
         self.ui.backButton.setEnabled(index > 0)
         self.ui.nextButton.setText("Finish" if controller.is_final_page() else "Next >")
         self.ui.wizardStatusLabel.setText("")
@@ -136,7 +161,7 @@ class EarReconstructionPlannerWidget(ScriptedLoadableModuleWidget):
             return
         controller = self._get_or_create_controller(self._current_index)
         controller.on_leave_back()
-        self._show_page(self._current_index - 1)
+        self._show_page(self._current_index - 1, direction=-1)
 
     def _on_next_clicked(self):
         controller = self._get_or_create_controller(self._current_index)
@@ -146,7 +171,7 @@ class EarReconstructionPlannerWidget(ScriptedLoadableModuleWidget):
             return
 
         if self._current_index + 1 < len(self._page_meta):
-            self._show_page(self._current_index + 1)
+            self._show_page(self._current_index + 1, direction=1)
         # else: this was the final page ("Finish") -- nothing further to do,
         # the curvature page's own button already handled running the
         # comparison and loading the result.

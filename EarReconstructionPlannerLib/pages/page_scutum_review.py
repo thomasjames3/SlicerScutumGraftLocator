@@ -12,22 +12,56 @@ result to Slicer's own, surgeon-familiar Segment Editor for manual
 touch-ups (painting/erasing), rather than reinventing that tool.
 
 Expected widgets in page_scutum_review.ui:
+  - tutorialLabel        (QLabel) -- extra guidance, shown only in tutorial mode
   - airThresholdSlider   (QSlider or ctkSliderWidget)
   - boneThresholdSlider  (QSlider or ctkSliderWidget)
   - runButton            (QPushButton)
   - openSegmentEditorButton (QPushButton)
+  - resetPageButton      (QPushButton) -- clear this page's own segmentation
+  - revertToHereButton   (QPushButton) -- clear every later step, keep this segmentation
   - statusLabel          (QLabel)
 """
 
 from __future__ import annotations
 import os
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
+from EarReconstructionPlannerLib import wizard_state
 from core import roi_crop, segment_dl, postprocess, mesh_export, io_utils
 import config
 
 
 class ScutumReviewPage(WizardPage):
     def on_enter(self):
+        self.set_tutorial_text(
+            "This step automatically finds the bone wall of the ear canal "
+            "near the 2 points you placed. The two sliders control how "
+            "sensitive that search is:\n"
+            "- Air threshold: how dark a voxel must be to count as air (the "
+            "hollow part of the canal).\n"
+            "- Bone threshold: how bright a voxel must be to count as bone.\n"
+            "You usually don't need to change these -- click 'Run "
+            "Segmentation' first with the defaults and see what comes out.\n\n"
+            "After running, look at the result in the 3D view (left-drag to "
+            "rotate, middle-drag to pan, scroll or right-drag to zoom). The "
+            "3D view has its own small toolbar in the top-left corner: the "
+            "recenter button (a crosshair/target icon) reframes the camera "
+            "around whatever's currently visible, handy if you've rotated/"
+            "zoomed somewhere confusing. The small R/L/A/P/S/I axis-letter "
+            "widget in the corner of the 3D view lets you click a letter to "
+            "snap the camera to look from exactly that direction, which is "
+            "useful for judging the shape consistently.\n\n"
+            "If it looks wrong (missing wall, too much extra material, or "
+            "the status message says nothing was found), drag a slider to "
+            "adjust and click 'Run Segmentation' again -- you can do this "
+            "as many times as you like.\n\n"
+            "If the result is close but has small gaps or stray bits even "
+            "after adjusting the sliders, click 'Open Segment Editor for "
+            "Manual Touch-Up'. That opens Slicer's own painting tool: pick "
+            "the 'Paint' or 'Erase' effect on the left, adjust the brush "
+            "size, then click or drag over the volume in a slice view to add "
+            "or remove material by hand. Come back to this module (the "
+            "modules dropdown at the top) when you're done."
+        )
         self.ui.airThresholdSlider.minimum = config.AIR_THRESHOLD_ADJUST_RANGE[0]
         self.ui.airThresholdSlider.maximum = config.AIR_THRESHOLD_ADJUST_RANGE[1]
         self.ui.airThresholdSlider.value = config.DEFAULT_AIR_THRESHOLD
@@ -38,7 +72,9 @@ class ScutumReviewPage(WizardPage):
 
         self.ui.runButton.clicked.connect(self._on_run_clicked)
         self.ui.openSegmentEditorButton.clicked.connect(self._on_open_segment_editor_clicked)
-        self.ui.openSegmentEditorButton.setEnabled(False)
+        self.ui.resetPageButton.clicked.connect(self._on_reset_page_clicked)
+        self.ui.revertToHereButton.clicked.connect(self._on_revert_to_here_clicked)
+        self.ui.openSegmentEditorButton.setEnabled(self.state.scutum_bone_wall_mesh_path is not None)
         self.ui.statusLabel.setText("Adjust the sliders if needed, then click Run.")
 
     def _on_run_clicked(self):
@@ -48,6 +84,13 @@ class ScutumReviewPage(WizardPage):
         if self.state.volume_node is None:
             self.ui.statusLabel.setText("No scan loaded -- go back and select one first.")
             return
+
+        # Re-running this segmentation invalidates anything built on top of
+        # the old one (a defect outline drawn on the old bone-wall mesh,
+        # the verify approval, the heatmap) -- clear it up front so a
+        # surgeon adjusting thresholds and re-running can never end up
+        # silently carrying forward a now-mismatched downstream result.
+        wizard_state.clear_downstream_state(self.state, "scutum_review")
 
         self.ui.statusLabel.setText("Segmenting bone wall...")
         slicer.app.processEvents()
@@ -134,23 +177,11 @@ class ScutumReviewPage(WizardPage):
         if self.state.scutum_landmarks_fiducial_node is not None:
             self.state.scutum_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
 
-        # Recenter the 3D view on the new model -- equivalent to clicking
-        # the "center 3D view" button -- so the surgeon sees it right away
-        # instead of having to manually pan/zoom to find it. Also orient it
-        # as if the "R" (Right) face of the 3D view's axes widget had been
-        # clicked, so the model is consistently shown from the same side
-        # every time rather than whatever angle it happened to load at.
-        # NOTE: lookFromAxis()/ctkAxesWidget.Right mirror the same API the
-        # axes widget's own buttons use -- confirmed via Slicer/CTK source,
-        # but like the surface-constraint and heatmap-coloring APIs
-        # elsewhere in this project, NOT YET CONFIRMED against a real
-        # Slicer install.
-        import ctk
-
-        threeDView = slicer.app.layoutManager().threeDWidget(0).threeDView()
-        threeDView.resetFocalPoint()
-        threeDView.resetCamera()
-        threeDView.lookFromAxis(ctk.ctkAxesWidget.Right)
+        # Recenter the 3D view on the new model and orient the camera to
+        # look from the correct side for this ear (self.state.ear_side) --
+        # see base_page.WizardPage.recenter_3d_view() for why this can't
+        # just always look from the Right.
+        self.recenter_3d_view()
 
         self.ui.openSegmentEditorButton.setEnabled(True)
         self.ui.statusLabel.setText(
@@ -161,6 +192,28 @@ class ScutumReviewPage(WizardPage):
     def _on_open_segment_editor_clicked(self):
         import slicer
         slicer.util.selectModule("SegmentEditor")
+
+    def _on_reset_page_clicked(self):
+        wizard_state.clear_page_state(self.state, "scutum_review")
+        self.ui.airThresholdSlider.value = config.DEFAULT_AIR_THRESHOLD
+        self.ui.boneThresholdSlider.value = config.DEFAULT_BONE_THRESHOLD
+        self.ui.openSegmentEditorButton.setEnabled(False)
+        self.ui.statusLabel.setText("Segmentation cleared. Adjust the sliders if needed, then click Run.")
+
+    def _on_revert_to_here_clicked(self):
+        import slicer
+
+        if wizard_state.has_downstream_state(self.state, "scutum_review"):
+            if not slicer.util.confirmYesNoDisplay(
+                "This will clear every step after this one (the drawn "
+                "defect outline, verification, and the heatmap result). "
+                "This segmentation is kept. Continue?"
+            ):
+                return
+            wizard_state.clear_downstream_state(self.state, "scutum_review")
+        self.ui.statusLabel.setText(
+            "Later steps cleared. Go to Next when ready to redo them."
+        )
 
     def on_leave_next(self):
         if self.state.scutum_bone_wall_mesh_path is None:

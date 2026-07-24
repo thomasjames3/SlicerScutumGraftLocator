@@ -22,6 +22,7 @@ in EarReconstructionPlanner.py's _show_page()) in favor of the download
 section below, which is this page's actual completion action.
 
 Expected widgets in page_curvature.ui:
+  - tutorialLabel                (QLabel) -- extra guidance, shown only in tutorial mode
   - runButton                    (QPushButton)
   - statusLabel                  (QLabel)
   - progressTextEdit             (QPlainTextEdit, read-only) -- live comparison progress
@@ -64,6 +65,27 @@ class CurvaturePage(WizardPage):
         self._download_destination_dir = None
 
     def on_enter(self):
+        self.set_tutorial_text(
+            "This final step compares the two meshes you approved and "
+            "scores every spot on the pinna as a possible cartilage graft "
+            "harvest site. Click 'Run Curvature Comparison' -- it can take "
+            "anywhere from a few seconds to a couple of minutes, and the "
+            "log box below will keep updating so you know it's still "
+            "working.\n\n"
+            "When it finishes, the pinna re-loads in the 3D view colored "
+            "like a heatmap: green means a better match to the defect's "
+            "shape, red means a worse one (use left-drag/scroll/middle-drag "
+            "as usual to rotate/zoom/pan and inspect it from different "
+            "angles). The blue-highlighted patches are the 3 best harvest "
+            "sites, shaped to match the actual defect's footprint (not just "
+            "a circle) -- these are worth looking at first. The table above "
+            "lists the top-ranked candidate sites with their scores and 3D "
+            "coordinates, best first.\n\n"
+            "Use the 'Download results' section at the bottom to save the "
+            "heatmap and/or the scutum defect mesh file to a folder of your "
+            "choice -- tick the files you want, click 'Browse...' to pick a "
+            "destination, then 'Download Selected Files'."
+        )
         self.ui.runButton.clicked.connect(self._on_run_clicked)
         self.ui.openOutputFolderButton.clicked.connect(self._on_open_output_folder_clicked)
         self.ui.browseDestinationButton.clicked.connect(self._on_browse_destination_clicked)
@@ -132,9 +154,10 @@ class CurvaturePage(WizardPage):
         self.state.heatmap_model_node = slicer.util.loadModel(heatmap_path)
         self._enable_vertex_color_display(self.state.heatmap_model_node)
 
-        threeDView = slicer.app.layoutManager().threeDWidget(0).threeDView()
-        threeDView.resetFocalPoint()
-        threeDView.resetCamera()
+        # Recenter the 3D view on the new heatmap and orient the camera to
+        # look from the correct side for this ear -- same as the scutum/
+        # pinna review pages (see base_page.WizardPage.recenter_3d_view()).
+        self.recenter_3d_view()
 
         csv_path = curvature_integration.get_ranked_candidates_csv_path(output_dir)
         self.state.ranked_sites_csv_path = csv_path

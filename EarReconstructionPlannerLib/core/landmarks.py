@@ -35,7 +35,7 @@ class EarCanalLandmarks:
     interest.
 
     canal_opening:
-        Outer edge of the canal, at skin level -- "where the canal starts."
+        The opening of the bony ear canal -- "where the canal starts."
 
     near_eardrum:
         Just lateral to the eardrum, inside the canal -- "where the canal
@@ -197,7 +197,7 @@ class EarCanalLandmarks:
 LANDMARK_STEPS = [
     {
         "field": "canal_opening",
-        "instruction": "Click the opening of the ear canal, where it meets the outer ear.",
+        "instruction": "Click at the opening of the bony ear canal.",
         "reference_image": "step1_canal_opening.png",
     },
     {

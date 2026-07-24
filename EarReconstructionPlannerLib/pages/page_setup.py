@@ -8,10 +8,16 @@ given Slicer installation -- on every later launch, this page confirms
 everything's ready and the surgeon can click Next immediately.
 
 Expected widgets in page_setup.ui (see Resources/UI/page_setup.ui):
+  - normalModeRadioButton    (QRadioButton) -- default checked
+  - tutorialModeRadioButton  (QRadioButton)
   - instructionLabel   (QLabel)
   - installButton      (QPushButton)
   - progressBar         (QProgressBar)
   - statusLabel         (QLabel)
+
+Mode choice (state.tutorial_mode) is made here, once, before anything else
+in the wizard -- every later page reads that single flag (via
+base_page.WizardPage.set_tutorial_text()) rather than asking again.
 """
 
 from __future__ import annotations
@@ -24,6 +30,17 @@ class SetupPage(WizardPage):
         self.ui.progressBar.setVisible(False)
         self._refresh_status()
         self.ui.installButton.clicked.connect(self._on_install_clicked)
+
+        # Restore from state so re-entering this page (there's no earlier
+        # page to come back from, but on_enter can still re-run) doesn't
+        # lose a previously made choice.
+        self.ui.tutorialModeRadioButton.setChecked(self.state.tutorial_mode)
+        self.ui.normalModeRadioButton.setChecked(not self.state.tutorial_mode)
+        self.ui.normalModeRadioButton.toggled.connect(self._on_mode_toggled)
+        self.ui.tutorialModeRadioButton.toggled.connect(self._on_mode_toggled)
+
+    def _on_mode_toggled(self, _checked):
+        self.state.tutorial_mode = self.ui.tutorialModeRadioButton.isChecked()
 
     def _refresh_status(self):
         missing = dependencies.check_missing_packages()

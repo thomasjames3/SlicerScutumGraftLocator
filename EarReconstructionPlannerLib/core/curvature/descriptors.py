@@ -58,6 +58,58 @@ from scipy.spatial import cKDTree
 class Descriptors:
     shape_index: np.ndarray   # roughly in [-1, 1], type of curvature
     curvedness: np.ndarray    # >= 0, magnitude of curvature
+    reliable: np.ndarray      # bool; False where the curvature ball extended
+                               # past an open mesh boundary (see
+                               # boundary_unreliable_mask) -- shape_index/
+                               # curvedness at these vertices are numerical
+                               # artifacts of the missing surface, not real
+                               # shape, and should be excluded from any
+                               # histogram/matching that assumes the value
+                               # reflects true local geometry.
+    curvature_radius: float   # the ball radius these were estimated with --
+                               # exposed so callers building per-patch
+                               # Descriptors from a slice of a larger mesh's
+                               # arrays (see pipeline.py) can compute a
+                               # patch-local `reliable` mask with the same
+                               # radius the underlying values were estimated
+                               # with.
+
+
+def boundary_unreliable_mask(mesh: trimesh.Trimesh, radius: float) -> np.ndarray:
+    """
+    True for every vertex within `radius` of an open mesh boundary edge.
+
+    The ball-based curvature measures used in compute_descriptors() assume
+    the ball around each point is filled with real mesh surface; near an
+    open boundary (any edge used by only one face) part of that ball
+    extends past where the mesh actually ends. There's no real geometry
+    missing there -- the patch was just cut short -- but the angle-deficit
+    math can't tell the difference, so it reads the missing surface as a
+    sharp, large curvature. This was confirmed directly against a real
+    isolated defect patch: ~80% of its vertices had a numerically invalid
+    (negative) H^2-K discriminant with Gaussian curvature estimates several
+    times larger than anywhere else on the mesh, all within one ball radius
+    of the patch's own drawn-outline boundary -- exactly this effect, not
+    true anatomy. compute_signature() uses this mask to exclude those
+    vertices from shape_index/curvedness histograms so patch-vs-patch
+    comparisons aren't dominated by cut-edge noise. Every patch used in
+    this comparison (the defect, and every candidate cut from the pinna
+    with GeodesicPatchExtractor) has this same kind of boundary, so this
+    matters for all of them, not just unusually small/rough meshes.
+    """
+    from trimesh.grouping import group_rows
+
+    boundary_edge_rows = group_rows(mesh.edges_sorted, require_count=1)
+    if len(boundary_edge_rows) == 0:
+        return np.zeros(len(mesh.vertices), dtype=bool)
+
+    boundary_edges = mesh.edges_sorted[boundary_edge_rows]
+    boundary_vertex_ids = np.unique(boundary_edges)
+    boundary_points = mesh.vertices[boundary_vertex_ids]
+
+    tree = cKDTree(boundary_points)
+    dist, _ = tree.query(mesh.vertices)
+    return dist <= radius
 
 
 def _mean_curvature_measure(mesh: trimesh.Trimesh, points: np.ndarray,
@@ -171,4 +223,7 @@ def compute_descriptors(mesh: trimesh.Trimesh,
             "the input mesh -- this shouldn't happen."
         )
 
-    return Descriptors(shape_index=shape_index, curvedness=curvedness)
+    reliable = ~boundary_unreliable_mask(mesh, radius)
+
+    return Descriptors(shape_index=shape_index, curvedness=curvedness,
+                        reliable=reliable, curvature_radius=radius)

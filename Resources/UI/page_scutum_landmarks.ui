@@ -21,16 +21,27 @@
     </widget>
    </item>
    <item>
-    <widget class="QPushButton" name="placePointButton">
+    <widget class="QLabel" name="tutorialLabel">
      <property name="text">
-      <string>Place Point</string>
+      <string></string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+     <property name="visible">
+      <bool>false</bool>
+     </property>
+     <property name="font">
+      <font>
+       <italic>true</italic>
+      </font>
      </property>
     </widget>
    </item>
    <item>
-    <widget class="QPushButton" name="resetButton">
+    <widget class="QPushButton" name="placePointButton">
      <property name="text">
-      <string>Reset All Points</string>
+      <string>Place Point</string>
      </property>
     </widget>
    </item>
@@ -50,6 +61,39 @@
       <enum>Qt::Vertical</enum>
      </property>
     </spacer>
+   </item>
+   <item>
+    <widget class="Line" name="undoOptionsLine">
+     <property name="orientation">
+      <enum>Qt::Horizontal</enum>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="undoOptionsLabel">
+     <property name="text">
+      <string>Undo Options</string>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="resetButton">
+     <property name="text">
+      <string>Reset All Points</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="revertToHereButton">
+     <property name="text">
+      <string>Revert to Here (clear all later steps)</string>
+     </property>
+    </widget>
    </item>
   </layout>
  </widget>

@@ -29,10 +29,13 @@ component still connected to the surgeon's own seed point.
 
 Expected widgets in page_pinna_draw.ui:
   - instructionLabel        (QLabel)
+  - tutorialLabel           (QLabel) -- extra guidance, shown only in tutorial mode
   - startCurveButton        (QPushButton)
   - markSeedButton          (QPushButton)
   - markCanalOpeningButton  (QPushButton)
   - isolateButton           (QPushButton)
+  - resetPageButton         (QPushButton) -- clear this page's outline/patch
+  - revertToHereButton      (QPushButton) -- clear every later step, keep this patch
   - statusLabel             (QLabel)
 """
 
@@ -40,7 +43,34 @@ from __future__ import annotations
 import os
 import numpy as np
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
+from EarReconstructionPlannerLib import wizard_state
 from core import mesh_isolate, mesh_export
+
+# Reused in on_enter() and _on_reset_page_clicked() so the tutorial text
+# always goes back to this step-1 guidance when the outline is cleared,
+# instead of staying stuck on whatever later step it last showed.
+_STEP1_TUTORIAL_TEXT = (
+    "Step 1 of 4 -- draw the outline. Important: once you click 'Start "
+    "Outline', left-click is used only for adding points, so you can't "
+    "rotate the 3D view anymore until you finish the loop -- get the "
+    "camera angle you want *before* clicking 'Start Outline', so you can "
+    "clearly see where the pinna meets the rest of the head. While "
+    "drawing, you can still zoom (scroll) and pan (middle-drag) without "
+    "adding extra points; only left-clicking adds one, and right-clicking "
+    "finishes the loop (see below), so don't use it to zoom while drawing.\n\n"
+    "Usually you want to isolate just the outer (lateral) face of the "
+    "pinna -- trace along the helix (the curled outer rim) so the outline "
+    "follows the visible outer edge of the ear, rather than wrapping "
+    "around to the back of the head. If you only want to test a smaller "
+    "region (e.g. one part of the pinna, not the whole thing), just draw "
+    "around that smaller area instead -- the tool works the same either way.\n\n"
+    "When you're done, right-click once to finish (you don't need to "
+    "click back near your starting point -- this is a closed loop, so "
+    "it's already connected end-to-end).\n\n"
+    "After finishing, you can still adjust the outline before moving on: "
+    "click and drag any point to move it, or right-click a point and "
+    "choose 'Delete Control Point' to remove it."
+)
 
 
 class PinnaDrawPage(WizardPage):
@@ -55,19 +85,36 @@ class PinnaDrawPage(WizardPage):
         self.ui.markSeedButton.clicked.connect(self._on_mark_seed_clicked)
         self.ui.markCanalOpeningButton.clicked.connect(self._on_mark_canal_clicked)
         self.ui.isolateButton.clicked.connect(self._on_isolate_clicked)
+        self.ui.resetPageButton.clicked.connect(self._on_reset_page_clicked)
+        self.ui.revertToHereButton.clicked.connect(self._on_revert_to_here_clicked)
         self.ui.markSeedButton.setEnabled(False)
         self.ui.markCanalOpeningButton.setEnabled(False)
         self.ui.isolateButton.setEnabled(False)
         self.ui.statusLabel.setText(
-            "Click 'Start Outline', then trace around the pinna on the skin "
-            "surface in the 3D view. Click near your starting point to close it."
+            "Click 'Start Outline', then trace around the pinna (usually "
+            "just the outer face, along the helix) on the skin surface in "
+            "the 3D view. Right-click to finish the loop."
         )
+        self.set_tutorial_text(_STEP1_TUTORIAL_TEXT)
 
     def _on_start_curve_clicked(self):
         import slicer
 
         if self._curve_node is not None:
             slicer.mrmlScene.RemoveNode(self._curve_node)
+
+        # Starting a new outline invalidates the old seed/canal markers --
+        # see the matching comment in page_scutum_draw._on_start_curve_clicked
+        # for why leaving them live is a real bug, not just tidiness.
+        if self._seed_fiducial_node is not None:
+            slicer.mrmlScene.RemoveNode(self._seed_fiducial_node)
+        if self._canal_fiducial_node is not None:
+            slicer.mrmlScene.RemoveNode(self._canal_fiducial_node)
+        self._seed_fiducial_node = None
+        self._seed_point = None
+        self._canal_fiducial_node = None
+        self._canal_point = None
+        self.ui.isolateButton.setEnabled(False)
 
         self._curve_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLMarkupsClosedCurveNode", "PinnaOutline"
@@ -86,8 +133,16 @@ class PinnaDrawPage(WizardPage):
         self.ui.markSeedButton.setEnabled(True)
         self.ui.markCanalOpeningButton.setEnabled(True)
         self.ui.statusLabel.setText(
-            "Trace around the pinna by clicking points on the surface. When "
-            "you're done, click 'Mark Inside Point' and 'Mark Canal Opening'."
+            "Trace around the pinna by clicking points on the surface, then "
+            "right-click to finish. When you're done, click 'Mark Inside "
+            "Point' and 'Mark Canal Opening'."
+        )
+        self.set_tutorial_text(
+            "Step 2 of 4 -- mark a point inside the loop, once it's closed "
+            "(right-click to finish it, if you haven't yet). Click 'Mark "
+            "Inside Point', then left-click once, anywhere on the surface "
+            "inside the outline you just drew. This tells the tool which "
+            "side of the boundary is the pinna to keep."
         )
 
     def _on_mark_seed_clicked(self):
@@ -119,6 +174,13 @@ class PinnaDrawPage(WizardPage):
         self._seed_point = tuple(ras)
         self._update_isolate_enabled()
         self.ui.statusLabel.setText("Seed point marked. Click 'Isolate Patch' when ready.")
+        self.set_tutorial_text(
+            "Step 3 of 4 -- mark the ear canal opening. Click 'Mark Canal "
+            "Opening', then left-click once on this same pinna model, right "
+            "where the canal opens (where the pinna meets the skull near "
+            "the ear canal). This helps the tool trim away any bit of head "
+            "skin still attached to the isolated pinna near that spot."
+        )
 
     def _on_mark_canal_clicked(self):
         import slicer
@@ -151,6 +213,13 @@ class PinnaDrawPage(WizardPage):
         self._canal_point = tuple(ras)
         self._update_isolate_enabled()
         self.ui.statusLabel.setText("Canal opening marked. Click 'Isolate Patch' when ready.")
+        self.set_tutorial_text(
+            "Step 4 of 4 -- click 'Isolate Patch' to extract the pinna as "
+            "its own mesh. If this fails with a message about too few "
+            "points, the outline likely didn't fully close or the clicks "
+            "landed too close together -- click 'Reset This Page' and "
+            "redraw it, spacing your clicks out a bit more."
+        )
 
     def _update_isolate_enabled(self):
         self.ui.isolateButton.setEnabled(
@@ -248,6 +317,50 @@ class PinnaDrawPage(WizardPage):
         self.ui.statusLabel.setText(
             f"Pinna isolated ({len(patch.vertices)} vertices). "
             "Check it in the 3D view, then click Next."
+        )
+
+    def _on_reset_page_clicked(self):
+        import slicer
+
+        if self._curve_node is not None:
+            slicer.mrmlScene.RemoveNode(self._curve_node)
+        if self._seed_fiducial_node is not None:
+            slicer.mrmlScene.RemoveNode(self._seed_fiducial_node)
+        if self._canal_fiducial_node is not None:
+            slicer.mrmlScene.RemoveNode(self._canal_fiducial_node)
+        self._curve_node = None
+        self._seed_fiducial_node = None
+        self._seed_point = None
+        self._canal_fiducial_node = None
+        self._canal_point = None
+
+        wizard_state.clear_page_state(self.state, "pinna_draw")
+
+        if self.state.pinna_region_model_node is not None:
+            self.state.pinna_region_model_node.GetDisplayNode().SetVisibility(True)
+
+        self.ui.markSeedButton.setEnabled(False)
+        self.ui.markCanalOpeningButton.setEnabled(False)
+        self.ui.isolateButton.setEnabled(False)
+        self.ui.statusLabel.setText(
+            "Outline cleared. Click 'Start Outline', then trace around the "
+            "pinna on the skin surface in the 3D view."
+        )
+        self.set_tutorial_text(_STEP1_TUTORIAL_TEXT)
+
+    def _on_revert_to_here_clicked(self):
+        import slicer
+
+        if wizard_state.has_downstream_state(self.state, "pinna_draw"):
+            if not slicer.util.confirmYesNoDisplay(
+                "This will clear every step after this one (verification "
+                "and the heatmap result). This isolated patch is kept. "
+                "Continue?"
+            ):
+                return
+            wizard_state.clear_downstream_state(self.state, "pinna_draw")
+        self.ui.statusLabel.setText(
+            "Later steps cleared. Go to Next when ready to redo them."
         )
 
     def on_leave_next(self):

@@ -12,28 +12,50 @@ not a bone wall -- the actual "isolate just the pinna" step happens on the
 next page (page_pinna_draw.py), same two-step split as the scutum stage.
 
 Expected widgets in page_pinna_review.ui:
+  - tutorialLabel             (QLabel) -- extra guidance, shown only in tutorial mode
   - skinThresholdSlider       (QSlider or ctkSliderWidget)
   - runButton                 (QPushButton)
   - openSegmentEditorButton  (QPushButton)
+  - resetPageButton           (QPushButton) -- clear this page's own segmentation
+  - revertToHereButton        (QPushButton) -- clear every later step, keep this segmentation
   - statusLabel               (QLabel)
 """
 
 from __future__ import annotations
 import os
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
+from EarReconstructionPlannerLib import wizard_state
 from core import roi_crop, segment_pinna_threshold, postprocess, mesh_export, io_utils
 import config
 
 
 class PinnaReviewPage(WizardPage):
     def on_enter(self):
+        self.set_tutorial_text(
+            "This step finds the outer skin surface around the ear you "
+            "marked (not the cartilage itself -- that gets isolated by "
+            "hand-drawing on the next page). The 'Skin threshold' slider "
+            "controls how bright a voxel must be to count as skin/tissue "
+            "versus air.\n\n"
+            "Click 'Run Segmentation' with the default first, then check "
+            "the result in the 3D view (left-drag rotates, scroll or "
+            "right-drag zooms, middle-drag pans). If it looks wrong -- too "
+            "much missing, or too much extra material included -- drag the "
+            "slider and click Run again; you can repeat this as many times "
+            "as needed. For small manual fixes, 'Open Segment Editor for "
+            "Manual Touch-Up' opens Slicer's own paint/erase tool (pick "
+            "'Paint' or 'Erase' on the left, adjust brush size, then click "
+            "or drag in a slice view) -- return to this module afterwards."
+        )
         self.ui.skinThresholdSlider.minimum = config.SKIN_THRESHOLD_ADJUST_RANGE[0]
         self.ui.skinThresholdSlider.maximum = config.SKIN_THRESHOLD_ADJUST_RANGE[1]
         self.ui.skinThresholdSlider.value = config.SKIN_AIR_THRESHOLD
 
         self.ui.runButton.clicked.connect(self._on_run_clicked)
         self.ui.openSegmentEditorButton.clicked.connect(self._on_open_segment_editor_clicked)
-        self.ui.openSegmentEditorButton.setEnabled(False)
+        self.ui.resetPageButton.clicked.connect(self._on_reset_page_clicked)
+        self.ui.revertToHereButton.clicked.connect(self._on_revert_to_here_clicked)
+        self.ui.openSegmentEditorButton.setEnabled(self.state.pinna_region_mesh_path is not None)
         self.ui.statusLabel.setText("Adjust the slider if needed, then click Run.")
 
     def _on_run_clicked(self):
@@ -43,6 +65,13 @@ class PinnaReviewPage(WizardPage):
         if self.state.volume_node is None:
             self.ui.statusLabel.setText("No scan loaded -- go back and select one first.")
             return
+
+        # Re-running invalidates anything built on top of the old
+        # segmentation (the pinna outline drawn on it, the verify
+        # approval, the heatmap) -- see the matching comment in
+        # page_scutum_review._on_run_clicked for why this has to happen
+        # unconditionally, before the new segmentation is built.
+        wizard_state.clear_downstream_state(self.state, "pinna_review")
 
         self.ui.statusLabel.setText("Segmenting skin surface near the ear...")
         slicer.app.processEvents()
@@ -108,12 +137,7 @@ class PinnaReviewPage(WizardPage):
 
         # Recenter and reorient the 3D view on the new model -- same
         # reasoning as page_scutum_review.py.
-        import ctk
-
-        threeDView = slicer.app.layoutManager().threeDWidget(0).threeDView()
-        threeDView.resetFocalPoint()
-        threeDView.resetCamera()
-        threeDView.lookFromAxis(ctk.ctkAxesWidget.Right)
+        self.recenter_3d_view()
 
         self.ui.openSegmentEditorButton.setEnabled(True)
         self.ui.statusLabel.setText(
@@ -124,6 +148,27 @@ class PinnaReviewPage(WizardPage):
     def _on_open_segment_editor_clicked(self):
         import slicer
         slicer.util.selectModule("SegmentEditor")
+
+    def _on_reset_page_clicked(self):
+        wizard_state.clear_page_state(self.state, "pinna_review")
+        self.ui.skinThresholdSlider.value = config.SKIN_AIR_THRESHOLD
+        self.ui.openSegmentEditorButton.setEnabled(False)
+        self.ui.statusLabel.setText("Segmentation cleared. Adjust the slider if needed, then click Run.")
+
+    def _on_revert_to_here_clicked(self):
+        import slicer
+
+        if wizard_state.has_downstream_state(self.state, "pinna_review"):
+            if not slicer.util.confirmYesNoDisplay(
+                "This will clear every step after this one (the drawn "
+                "pinna outline, verification, and the heatmap result). "
+                "This segmentation is kept. Continue?"
+            ):
+                return
+            wizard_state.clear_downstream_state(self.state, "pinna_review")
+        self.ui.statusLabel.setText(
+            "Later steps cleared. Go to Next when ready to redo them."
+        )
 
     def on_leave_next(self):
         if self.state.pinna_region_mesh_path is None:

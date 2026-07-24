@@ -4,6 +4,42 @@
  <widget class="QWidget" name="page_setup">
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
+    <widget class="QLabel" name="modeGroupLabel">
+     <property name="text">
+      <string>How would you like to use this wizard?</string>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QRadioButton" name="normalModeRadioButton">
+     <property name="text">
+      <string>Normal mode (recommended once you're familiar with the workflow)</string>
+     </property>
+     <property name="checked">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QRadioButton" name="tutorialModeRadioButton">
+     <property name="text">
+      <string>Tutorial mode -- adds detailed, step-by-step guidance to every page, including how to use Slicer's 3D view and drawing tools (recommended for first-time use)</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="Line" name="modeSeparatorLine">
+     <property name="orientation">
+      <enum>Qt::Horizontal</enum>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="instructionLabel">
      <property name="text">
       <string>Before starting, this extension needs to install a few Python packages it depends on. This is a one-time setup -- you won't need to do this again on future uses.</string>

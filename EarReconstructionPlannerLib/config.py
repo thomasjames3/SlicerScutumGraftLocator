@@ -64,11 +64,16 @@ AIR_THRESHOLD_ADJUST_RANGE = (-600, 0)
 
 # Hounsfield-Unit-like threshold separating bone (high intensity) from
 # soft tissue (lower intensity). This is the value that actually determines
-# the exported bone wall boundary.
-DEFAULT_BONE_THRESHOLD = 300
+# the exported bone wall boundary. Lowered to 100 (from 300) after Thomas's
+# own threshold experimentation found the segmentation runs best with bone
+# at its lowest tested value, 100.
+DEFAULT_BONE_THRESHOLD = 100
 
 # Range the review-step slider is allowed to move the bone threshold within.
-BONE_THRESHOLD_ADJUST_RANGE = (100, 700)
+# Widened below the new 100 default (previously the range bottomed out
+# exactly at 100, leaving no room to try lower values) so a surgeon can
+# still explore lower thresholds if 100 isn't optimal for a given scan.
+BONE_THRESHOLD_ADJUST_RANGE = (-200, 700)
 
 # Expected thickness (in mm) of the bony ear canal wall. This defines how
 # far outward from the air-lumen scaffold we look for bone. Generous on
@@ -137,7 +142,14 @@ EXPORT_DIR = "exports"                  # where final STL files land
 SKIN_AIR_THRESHOLD = -300
 
 # Range the review-step slider is allowed to move the skin threshold within.
-SKIN_THRESHOLD_ADJUST_RANGE = (-600, 0)
+# Widened below the old -600 floor (same reasoning as BONE_THRESHOLD_ADJUST_RANGE
+# above): Thomas's own bone-threshold experimentation found this scan's
+# intensity values needed a much lower threshold than the standard-HU
+# defaults assumed, which suggests this scan's values may be shifted from
+# conventional Hounsfield units -- if so, the skin/air boundary may need a
+# lower threshold too. Widened so that can be tried via the slider without
+# editing this file by hand.
+SKIN_THRESHOLD_ADJUST_RANGE = (-900, 0)
 
 # Radius (in mm) of the spherical region of interest built around the
 # surgeon's single ear-center landmark. Generous on purpose -- it just

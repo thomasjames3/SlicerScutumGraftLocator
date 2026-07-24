@@ -56,6 +56,14 @@ and working:
   marker + isolate pinna patch, cropped toward the ear canal and cleaned
   of disconnected islands).
 
+**Update, since regressed:** pinna review's segmentation is currently
+broken again -- throws `EmptySegmentationError` ("no bone wall was
+found", though the actual failure is the pinna's skin/air threshold
+finding nothing). Not caused by this session's edits (confirmed via
+`git diff` against HEAD). See Known Issues #7 below -- unresolved as of
+the last session; a config.py range widening was tried and Thomas
+confirmed it did NOT fully fix it. Start there next time.
+
 **Not yet exercised in this project's testing:**
 - The **Verify page** (page 8) and the **Curvature page** (page 9)'s Qt
   widgets specifically -- nothing in this conversation history has walked
@@ -117,10 +125,12 @@ handled).
 
 A single Slicer extension, `EarReconstructionPlanner/`, implemented as a
 **scripted module** (no compiled C++, no CMake build step needed for
-development -- see "Installing for testing" below). It's a 10-page wizard:
+development -- see "Installing for testing" below). It's a wizard of
+these pages, in order:
 
 ```
-0. Setup              -- one-time Python dependency install
+0. Setup              -- one-time Python dependency install + Normal/Tutorial mode choice
+0.5. Welcome          -- tutorial-mode only, skipped entirely in Normal mode
 1. DICOM load         -- confirm which already-loaded scan to use
 2. Scutum landmarks   -- place 2 points defining the ear canal axis
 3. Scutum review      -- run/adjust bone-wall threshold segmentation
@@ -640,6 +650,57 @@ projected footprint shape (not a circle) -> exports `pinna_heatmap.ply`
    probably fixed, but never explicitly reconfirmed by Thomas. If it
    resurfaces, that's a signal the speculative fixes weren't the actual
    cause.
+7. **UNRESOLVED: pinna segmentation (Pinna review page) throws
+   `EmptySegmentationError`** -- `mesh_export.label_map_to_mesh()` raises
+   "The segmentation is empty -- no bone wall was found" (that message's
+   wording is scutum-flavored/generic, reused here; the actual failure is
+   in `segment_pinna_threshold.segment_pinna_region()` finding zero
+   voxels above `SKIN_AIR_THRESHOLD` within the ROI). Confirmed this is
+   NOT a regression from this session's edits -- `git diff` against the
+   last commit showed `roi_crop.py`, `segment_pinna_threshold.py`,
+   `mesh_export.py`, and `postprocess.py` byte-identical to HEAD; nothing
+   in this session touched the actual segmentation math.
+
+   Leading hypothesis (not yet confirmed): this scan's intensity values
+   may be shifted from standard Hounsfield units. Evidence: `config.py`'s
+   `DEFAULT_BONE_THRESHOLD` had already been dropped from 300 to 100 (and
+   `BONE_THRESHOLD_ADJUST_RANGE`'s floor widened to -200) based on
+   Thomas's own experimentation finding the *bone* threshold needed to go
+   much lower than the standard-HU default -- if that's true for bone, the
+   skin/air boundary (`SKIN_AIR_THRESHOLD = -300`) may need to shift lower
+   too, which would exactly explain zero voxels clearing the threshold.
+
+   As a first, non-guessing step, `SKIN_THRESHOLD_ADJUST_RANGE` was
+   widened from `(-600, 0)` to `(-900, 0)` in `config.py` so the skin
+   threshold slider can be dragged much lower without editing the file by
+   hand, and Thomas was asked to try progressively lower slider values on
+   the Pinna review page and report which one (if any) first produces a
+   non-empty result.
+
+   **Thomas has since said this doesn't fully resolve it** -- so the
+   range widening was NOT the fix (or wasn't the whole fix). **Start here
+   next session.** Things to check that haven't been done yet:
+   - Get the actual slider value(s) Thomas tried and whether *any* value
+     produces a non-empty segmentation, or whether it's empty across the
+     entire range -- if even the widened range never works, the
+     bone-threshold-drop hypothesis above is probably wrong and the real
+     cause is elsewhere (e.g. the ROI/crop math, or the `ear_center`
+     landmark placement, or the scan itself).
+   - Double check `roi_crop.crop_to_point_region()` /
+     `build_spherical_roi_mask()` actually produce a non-empty ROI around
+     `ear_center` for this specific scan -- add a quick print/log of
+     `roi_mask` voxel count before thresholding, since an empty ROI would
+     produce this exact symptom regardless of threshold.
+   - Consider whether the scutum (bone wall) pipeline is *also* still
+     broken for this same scan/patient with its own new lower defaults,
+     or whether scutum segmentation is working fine now and only pinna
+     is broken -- that comparison would help confirm or rule out the
+     shared-intensity-calibration hypothesis.
+   - If the intensity-shift hypothesis holds up, consider whether the
+     scan actually needs `RescaleSlope`/`RescaleIntercept` DICOM tags
+     applied that aren't being read/applied somewhere in the load path
+     (`io_utils.py`), rather than just chasing the threshold values
+     around as a workaround.
 
 ---
 
@@ -980,6 +1041,76 @@ projected footprint shape (not a circle) -> exports `pinna_heatmap.ply`
    the surgeon sees it immediately instead of needing to manually
    pan/zoom to find it (this only re-frames the camera; it doesn't change
    any data).
+4. **Tutorial mode.** A mode choice on the Setup page
+   (`normalModeRadioButton`/`tutorialModeRadioButton`, Normal checked by
+   default) sets `WizardState.tutorial_mode`, made once and read by every
+   later page -- there's no per-page re-ask and no way to change it
+   mid-wizard other than restarting. Every other page's `.ui` now has a
+   `tutorialLabel` QLabel (italic, hidden by default) directly below its
+   main instruction text; `base_page.WizardPage.set_tutorial_text(text)`
+   is the single place that sets its text and applies the
+   `state.tutorial_mode` visibility check, so no page touches that
+   widget's visibility directly. Multi-step pages (scutum landmarks,
+   scutum/pinna draw) call it again at each step transition so the text
+   stays specific to what the surgeon should do right now, not a static
+   per-page blob.
+
+   Content-wise, tutorial text goes beyond what each page's own controls
+   do and explains the general Slicer mechanics a first-time user
+   wouldn't otherwise know: scrolling a slice view to navigate slices
+   (holding the middle mouse button to pan that slice view), the 3D
+   view's left-drag/middle-drag/scroll-or-right-drag rotate/pan/zoom
+   bindings, the 3D view's own recenter button and R/L/A/P/S/I
+   orientation-axis widget, that left-clicking places a curve point while
+   the outline tool is active (but zooming/panning between clicks doesn't
+   add one, and the camera can't be rotated at all until the loop is
+   finished -- get the camera angle right *before* clicking "Start
+   Outline"), that a loop is finished with a right-click (not by clicking
+   back near the first point) and that points can be dragged or
+   right-clicked afterward to move/delete them (`Delete Control Point`),
+   and how to drive Segment Editor's Paint/Erase tools for manual
+   touch-ups. These specific mouse bindings are Slicer's own long-standing
+   documented defaults, not anything this extension changes -- **not yet
+   visually confirmed against a real Slicer install** (same caveat as
+   everything else in this doc built without a local Slicer), so if a
+   surgeon reports a binding described here is wrong for their Slicer
+   version, that's a wording fix in the relevant page's
+   `set_tutorial_text()` call, not a deeper bug.
+
+   A dedicated **"Welcome" page** (`page_welcome.py`/`.ui`) sits right
+   after Setup, tutorial-mode only, explaining the wizard's shared UI
+   itself before any real work starts: Back/Next navigation, that
+   clicking Next validates the current step is actually finished (you
+   can't skip ahead), and what "Reset"/"Reset This Page" (clears only the
+   current page) vs. "Revert to Here" (keeps the current page, clears
+   everything after it) each do. It owns no `WizardState` fields -- there's
+   nothing on it to reset. It's skipped entirely in Normal mode via a new,
+   small general mechanism: `wizard_state.SKIP_PAGE_IF` maps a page_id to
+   a `state -> bool` predicate (`should_skip_page()`), checked by
+   `EarReconstructionPlanner.py`'s `_show_page()` *before* instantiating
+   that page's controller -- deliberately a plain state check rather than
+   a method on the controller class, so skip-checking a page never forces
+   an early import of its module (would defeat the whole point of the
+   lazy per-page import pattern, see `_get_or_create_controller()`).
+   `_show_page()` now also takes a `direction` (+1/-1) so Back and Next
+   both skip over a skipped page correctly, and the "Step X of Y" label is
+   computed only over pages that aren't currently skipped, so Normal-mode
+   users never see the hidden Welcome page counted in the total.
+
+   Two small corrections worth noting since they affect **both** modes,
+   not just tutorial text: (1) `core/landmarks.py`'s `canal_opening`
+   instruction was corrected from "at skin level" to the *bony*
+   ear-canal opening (the bony-cartilaginous junction) -- skin level is
+   too far lateral and isn't part of the bone wall this pipeline
+   segments. (2) The pinna landmarks page's instruction/status text now
+   says "center of the pinna" instead of "center of the ear", and its
+   tutorial text explicitly tells the surgeon to use the slice views, not
+   the 3D view -- at that point in the wizard (page 5, right after the
+   scutum stage), the pinna hasn't been segmented yet, so the *only*
+   model in the 3D view is the leftover isolated scutum defect patch;
+   telling a surgeon to "rotate the 3D view to see the whole ear" there
+   was simply wrong, since there's nothing pinna-related to see until the
+   next page (Pinna review) runs its segmentation.
 
 ---
 

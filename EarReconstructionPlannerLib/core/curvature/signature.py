@@ -65,12 +65,23 @@ def compute_signature(
     same radius used to size every candidate patch, so the defect and
     every candidate are compared on the same intrinsic scale.
     """
+    # Exclude vertices whose curvature estimate is contaminated by a nearby
+    # open mesh boundary (see descriptors.boundary_unreliable_mask) -- every
+    # patch compared here (the defect, and every geodesic-cut candidate) has
+    # a cut edge, and including those vertices means the histograms end up
+    # comparing boundary-artifact noise as much as real shape. Falls back to
+    # every vertex if a patch is so small/boundary-heavy that no reliable
+    # vertices are left, rather than building an empty histogram.
+    reliable = descriptors.reliable
+    if reliable.sum() < 5:
+        reliable = np.ones_like(reliable, dtype=bool)
+
     si_hist, _ = np.histogram(
-        descriptors.shape_index, bins=hist_bins, range=shape_index_range,
+        descriptors.shape_index[reliable], bins=hist_bins, range=shape_index_range,
         density=True,
     )
     curv_hist, _ = np.histogram(
-        descriptors.curvedness, bins=hist_bins, range=curvedness_range,
+        descriptors.curvedness[reliable], bins=hist_bins, range=curvedness_range,
         density=True,
     )
     radial_hist, _ = np.histogram(

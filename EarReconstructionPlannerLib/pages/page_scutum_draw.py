@@ -22,16 +22,41 @@ both in one call.
 
 Expected widgets in page_scutum_draw.ui:
   - instructionLabel    (QLabel)
+  - tutorialLabel       (QLabel) -- extra guidance, shown only in tutorial mode
   - startCurveButton    (QPushButton)
   - markSeedButton      (QPushButton) -- "Mark a point inside the outline"
   - isolateButton       (QPushButton)
+  - resetPageButton     (QPushButton) -- clear this page's outline/patch
+  - revertToHereButton  (QPushButton) -- clear every later step, keep this patch
   - statusLabel         (QLabel)
 """
 
 from __future__ import annotations
 import os
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
+from EarReconstructionPlannerLib import wizard_state
 from core import mesh_isolate, mesh_export
+
+# Reused in on_enter() and _on_reset_page_clicked() so the tutorial text
+# always goes back to this step-1 guidance when the outline is cleared,
+# instead of staying stuck on whatever later step it last showed.
+_STEP1_TUTORIAL_TEXT = (
+    "Step 1 of 3 -- draw the outline. Important: once you click 'Start "
+    "Outline', left-click is used only for adding points, so you can't "
+    "rotate the 3D view anymore until you finish the loop -- get the "
+    "camera angle you want *before* clicking 'Start Outline'. While "
+    "drawing, you can still zoom (scroll) and pan (middle-drag) without "
+    "adding extra points; only left-clicking adds one, and right-clicking "
+    "finishes the loop (see below), so don't use it to zoom while drawing.\n\n"
+    "Left-click a series of points directly on the bone surface, tracing "
+    "all the way around the defect -- each click snaps onto the mesh. "
+    "When you're done, right-click once to finish (you don't need to "
+    "click back near your starting point -- this is a closed loop, so "
+    "it's already connected end-to-end).\n\n"
+    "After finishing, you can still adjust the outline before moving on: "
+    "click and drag any point to move it, or right-click a point and "
+    "choose 'Delete Control Point' to remove it."
+)
 
 
 class ScutumDrawPage(WizardPage):
@@ -43,18 +68,31 @@ class ScutumDrawPage(WizardPage):
         self.ui.startCurveButton.clicked.connect(self._on_start_curve_clicked)
         self.ui.markSeedButton.clicked.connect(self._on_mark_seed_clicked)
         self.ui.isolateButton.clicked.connect(self._on_isolate_clicked)
+        self.ui.resetPageButton.clicked.connect(self._on_reset_page_clicked)
+        self.ui.revertToHereButton.clicked.connect(self._on_revert_to_here_clicked)
         self.ui.markSeedButton.setEnabled(False)
         self.ui.isolateButton.setEnabled(False)
         self.ui.statusLabel.setText(
             "Click 'Start Outline', then trace the defect boundary on the "
-            "bone surface in the 3D view. Click near your starting point to close it."
+            "bone surface in the 3D view. Right-click to finish the loop."
         )
+        self.set_tutorial_text(_STEP1_TUTORIAL_TEXT)
 
     def _on_start_curve_clicked(self):
         import slicer
 
         if self._curve_node is not None:
             slicer.mrmlScene.RemoveNode(self._curve_node)
+
+        # Starting a new outline invalidates any seed point marked for the
+        # old one -- without this, a stale seed point silently pairs with
+        # the brand-new outline and "Isolate Patch" can stay wrongly
+        # enabled against a seed that no longer means anything.
+        if self._seed_fiducial_node is not None:
+            slicer.mrmlScene.RemoveNode(self._seed_fiducial_node)
+        self._seed_fiducial_node = None
+        self._seed_point = None
+        self.ui.isolateButton.setEnabled(False)
 
         self._curve_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLMarkupsClosedCurveNode", "ScutumDefectOutline"
@@ -72,8 +110,15 @@ class ScutumDrawPage(WizardPage):
 
         self.ui.markSeedButton.setEnabled(True)
         self.ui.statusLabel.setText(
-            "Trace the outline by clicking points on the surface. When you're "
-            "done, click 'Mark Inside Point'."
+            "Trace the outline by clicking points on the surface, then "
+            "right-click to finish. When you're done, click 'Mark Inside Point'."
+        )
+        self.set_tutorial_text(
+            "Step 2 of 3 -- mark a point inside the loop, once it's closed "
+            "(right-click to finish it, if you haven't yet). Click 'Mark "
+            "Inside Point', then left-click once, anywhere on the surface "
+            "inside the outline you just drew. This tells the tool which "
+            "side of the boundary to keep as the defect patch."
         )
 
     def _on_mark_seed_clicked(self):
@@ -105,6 +150,13 @@ class ScutumDrawPage(WizardPage):
         self._seed_point = tuple(ras)
         self.ui.isolateButton.setEnabled(True)
         self.ui.statusLabel.setText("Seed point marked. Click 'Isolate Patch' when ready.")
+        self.set_tutorial_text(
+            "Step 3 of 3 -- click 'Isolate Patch' to extract the defect "
+            "region as its own mesh. If this fails with a message about too "
+            "few points, the outline likely didn't fully close or the "
+            "clicks landed too close together -- click 'Reset This Page' "
+            "and redraw it, spacing your clicks out a bit more."
+        )
 
     def _on_isolate_clicked(self):
         import slicer
@@ -177,6 +229,45 @@ class ScutumDrawPage(WizardPage):
         self.ui.statusLabel.setText(
             f"Defect patch isolated ({len(patch.vertices)} vertices). "
             "Check it in the 3D view, then click Next."
+        )
+
+    def _on_reset_page_clicked(self):
+        import slicer
+
+        if self._curve_node is not None:
+            slicer.mrmlScene.RemoveNode(self._curve_node)
+        if self._seed_fiducial_node is not None:
+            slicer.mrmlScene.RemoveNode(self._seed_fiducial_node)
+        self._curve_node = None
+        self._seed_fiducial_node = None
+        self._seed_point = None
+
+        wizard_state.clear_page_state(self.state, "scutum_draw")
+
+        if self.state.scutum_bone_wall_model_node is not None:
+            self.state.scutum_bone_wall_model_node.GetDisplayNode().SetVisibility(True)
+
+        self.ui.markSeedButton.setEnabled(False)
+        self.ui.isolateButton.setEnabled(False)
+        self.ui.statusLabel.setText(
+            "Outline cleared. Click 'Start Outline', then trace the defect "
+            "boundary on the bone surface in the 3D view."
+        )
+        self.set_tutorial_text(_STEP1_TUTORIAL_TEXT)
+
+    def _on_revert_to_here_clicked(self):
+        import slicer
+
+        if wizard_state.has_downstream_state(self.state, "scutum_draw"):
+            if not slicer.util.confirmYesNoDisplay(
+                "This will clear every step after this one (verification "
+                "and the heatmap result). This isolated patch is kept. "
+                "Continue?"
+            ):
+                return
+            wizard_state.clear_downstream_state(self.state, "scutum_draw")
+        self.ui.statusLabel.setText(
+            "Later steps cleared. Go to Next when ready to redo them."
         )
 
     def on_leave_next(self):
