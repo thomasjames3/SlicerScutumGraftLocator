@@ -34,6 +34,26 @@ from scipy.spatial import cKDTree
 from config import PINNA_CANAL_CROP_MARGIN_MM
 
 
+class LoopDoesNotSeparateError(ValueError):
+    """Raised specifically when a drawn loop's vertices don't actually
+    separate the mesh into two pieces (the flood fill reaches almost
+    everything), as distinct from a malformed/too-small/disconnected loop.
+    A caller may reasonably retry with a different (e.g. more heavily
+    processed) mesh built from the same underlying segmentation and the
+    same curve/seed points, without asking the surgeon to redraw anything
+    -- see page_pinna_draw.py's fallback-mesh retry, added 2026-07-27 after
+    confirming (via [isolate diag] console output on a real scan) that a
+    perfectly well-drawn, densely-sampled, non-self-intersecting loop can
+    still fail to separate a lightly-smoothed mesh because of an unrelated
+    "handle" elsewhere on the surface (two nearby folds close enough to
+    register as touching, more likely with less aggressive smoothing).
+    Other ValueErrors from this module (too few points, a gap that leaves
+    zero enclosed vertices, a disconnected seed) are NOT retry-worthy --
+    those need the surgeon to actually redraw or re-click, so they stay
+    plain ValueError.
+    """
+
+
 def snap_points_to_vertices(mesh: trimesh.Trimesh, points) -> list:
     """
     Convert a list of (x, y, z) points -- e.g. the surgeon's drawn curve --
@@ -117,6 +137,47 @@ def isolate_surface_patch(
             "together. Please re-draw with points spread further apart."
         )
 
+    # TEMPORARY DIAGNOSTICS (2026-07-27) -- prints to the Slicer Python
+    # console (View > Python console). Added to investigate a report that
+    # "isolated region covers almost the entire mesh" started firing on
+    # drawings that used to work, coinciding with a fix elsewhere that
+    # changed how much the mesh gets smoothed before this function ever
+    # sees it. Rather than guess at a second fix blind, this prints enough
+    # to tell whether the mesh is unexpectedly fragmented (many small
+    # components) vs. genuinely leaking within one component. Remove once
+    # this is root-caused.
+    num_components = len(mesh.split(only_watertight=False))
+    print(
+        f"[isolate diag] mesh: {len(mesh.vertices)} vertices, "
+        f"{len(mesh.faces)} faces, {num_components} connected component(s)"
+    )
+    # Euler characteristic (V - E + F) directly reveals genuine topological
+    # handles, no inference from flood-fill behavior needed: for a closed,
+    # connected surface, chi = 2 - 2*genus. chi=2 means genus 0 (sphere/
+    # disk-like, no handles -- what isolate_surface_patch's "draw a loop,
+    # it separates the surface" assumption needs). Each handle (e.g. the
+    # ear canal's tube touching another part of the mesh, per Thomas's
+    # hypothesis 2026-07-27) lowers this by 2. is_watertight/boundary edge
+    # count checks the other possibility: an OPEN mesh (e.g. the ear canal
+    # tube getting cut off by the ROI crop without a proper closing cap),
+    # which is a structurally different problem from a genuine handle.
+    # trimesh has no `edges_boundary` attribute (confirmed the hard way --
+    # this crashed in real use); boundary edges are ones used by exactly
+    # one face, found via grouping.group_rows with require_count=1.
+    _boundary_edge_count = len(
+        trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1)
+    )
+    print(
+        f"[isolate diag] mesh topology: euler_number={mesh.euler_number} "
+        f"(2=genus-0/no handles, lower=handles present), "
+        f"is_watertight={mesh.is_watertight}, "
+        f"boundary edges={_boundary_edge_count}"
+    )
+    print(
+        f"[isolate diag] drawn loop: {len(loop_vertex_indices)} points, "
+        f"{len(raw_loop_set)} distinct vertices before bridging"
+    )
+
     graph = mesh.vertex_adjacency_graph  # networkx.Graph, one node per vertex
 
     # loop_vertex_indices are the drawn curve's control points snapped to
@@ -147,6 +208,8 @@ def isolate_surface_patch(
             )
         loop_set.update(bridge)
 
+    print(f"[isolate diag] loop after bridging: {len(loop_set)} vertices")
+
     # Find the vertex closest to the seed point to start the flood fill
     # from -- searching only among non-loop vertices, so a seed click that's
     # genuinely inside the loop never gets rejected just because its
@@ -166,13 +229,52 @@ def isolate_surface_patch(
         )
 
     tree = cKDTree(mesh.vertices[non_loop_indices])
-    _, nearest_pos = tree.query(np.asarray(seed_point))
+    snap_dist, nearest_pos = tree.query(np.asarray(seed_point))
     seed_idx = int(non_loop_indices[nearest_pos])
+    print(
+        f"[isolate diag] seed snapped {snap_dist:.2f}mm from the clicked "
+        f"point (large = may have snapped to the wrong side of a thin fold)"
+    )
+
+    # Restrict the flood fill to a local neighborhood around the seed point
+    # before removing the loop's vertices, sized from the loop's own
+    # spatial extent (with a safety margin). Confirmed on a real scan
+    # (2026-07-27) that a mesh with only one connected component can still
+    # defeat a perfectly-closed drawn loop: removing the loop's vertices
+    # left the *entire rest of the mesh* as a single connected piece
+    # (99.8% reached, exactly mesh_vertex_count - loop_vertex_count) --
+    # meaning the loop wasn't failing to close, it just wasn't a
+    # topologically separating cut. This happens when the mesh has a
+    # "handle"/tunnel elsewhere entirely (e.g. two nearby folds of the
+    # pinna just barely touching, a real possibility at CT resolution or
+    # with lighter smoothing) that gives the surface a back door from
+    # inside the loop to the rest of the mesh, bypassing the loop
+    # entirely. A globally-applied fix (more morphological smoothing to
+    # try to seal such handles shut) was rejected: it's the same knob that
+    # was found to erode real thin anatomy like the helix (see Known
+    # Issues in CLAUDE.md), so tuning it further just trades one failure
+    # mode for the other. This spatial restriction sidesteps the mesh's
+    # global topology entirely -- a small drawn loop should only ever need
+    # to enclose vertices reasonably close to where it was actually drawn,
+    # so a distant handle can't be reached regardless of whether it
+    # exists.
+    loop_positions = mesh.vertices[list(loop_set)]
+    seed_position = mesh.vertices[seed_idx]
+    max_loop_dist = float(np.max(np.linalg.norm(loop_positions - seed_position, axis=1)))
+    search_radius = max_loop_dist * 2.0
+    nearby_indices = cKDTree(mesh.vertices).query_ball_point(seed_position, r=search_radius)
+    nearby_set = set(nearby_indices)
+    print(
+        f"[isolate diag] local search radius: {search_radius:.1f}mm, "
+        f"{len(nearby_set)} vertices within range"
+    )
 
     # Flood-fill outward from the seed, treating loop vertices as walls the
     # traversal cannot pass through -- this is what confines the fill to
-    # "inside the loop" rather than spreading across the whole mesh.
-    barrier_graph = graph.copy()
+    # "inside the loop" rather than spreading across the whole mesh. Built
+    # from the local subgraph (nearby_set) rather than the full mesh graph,
+    # per the restriction above.
+    barrier_graph = graph.subgraph(nearby_set).copy()
     barrier_graph.remove_nodes_from(loop_set)
 
     if seed_idx not in barrier_graph:
@@ -183,17 +285,30 @@ def isolate_surface_patch(
         )
 
     reached = nx.node_connected_component(barrier_graph, seed_idx)
+    local_total = len(nearby_set) - len(loop_set & nearby_set)
+    print(
+        f"[isolate diag] flood fill reached {len(reached)} of "
+        f"{local_total} locally-reachable vertices "
+        f"({len(reached) / local_total:.1%} local, "
+        f"{len(reached) / len(mesh.vertices):.1%} of whole mesh)"
+    )
 
-    # Sanity check: if the flood fill reached a large fraction of the whole
-    # mesh, the loop likely isn't actually closed (there's a gap letting
-    # the fill leak out), and the result would be the wrong region rather
-    # than a genuine mistake worth silently returning.
-    if len(reached) > 0.9 * len(mesh.vertices):
-        raise ValueError(
-            "The isolated region covers almost the entire mesh, which "
-            "usually means the drawn outline has a gap and isn't fully "
-            "closed. Please double check the drawn loop connects back to "
-            "its starting point."
+    # Sanity check: if the flood fill reached a large fraction of the
+    # *local* search region, the loop likely isn't actually closed (there's
+    # a gap letting the fill leak out within its own neighborhood), and the
+    # result would be the wrong region rather than a genuine mistake worth
+    # silently returning. Checked against the local neighborhood, not the
+    # whole mesh, now that the search itself is spatially restricted.
+    if len(reached) > 0.9 * local_total:
+        raise LoopDoesNotSeparateError(
+            "The isolated region covers almost the entire area near the "
+            "seed point. This can mean the drawn outline has a gap and "
+            "isn't fully closed, but on a well-drawn outline it usually "
+            "means the mesh has an unrelated thin connection elsewhere "
+            "(e.g. two nearby folds just barely touching) that lets the "
+            "fill bypass the loop entirely -- please double check the "
+            "drawn loop connects back to its starting point, but if it "
+            "looks correct, this may resolve itself automatically."
         )
 
     # Include the loop's own vertices in the output so the resulting patch
@@ -212,9 +327,21 @@ def crop_toward_canal(
 ) -> trimesh.Trimesh:
     """
     Removes any part of `mesh` that lies toward the interior of the head
-    from `plane_point` -- cleanup for the isolated pinna patch, which can
-    still include a sliver of head-side attachment near the canal even
-    after the surgeon's drawn outline isolates the pinna itself.
+    from `plane_point`.
+
+    Originally run AFTER isolate_surface_patch(), as cleanup for a sliver
+    of head-side attachment left on the isolated pinna patch. Moved to
+    run BEFORE isolate_surface_patch instead (2026-07-27, Thomas's
+    suggestion) -- see page_pinna_draw.py's `_crop_toward_canal_if_possible()`
+    for why: discarding the head-interior material first removes whatever
+    genuine mesh-topology handles/tunnels were hiding in it (that material
+    was always going to be thrown away eventually, so there's nothing
+    lost by removing it earlier) before isolate_surface_patch's "a closed
+    loop separates the surface" assumption ever has to hold up against
+    them. Works identically either way -- this function only ever cared
+    about vertex positions relative to a cutting plane, not whether the
+    mesh it's given is the full pre-isolation blob or an already-isolated
+    patch.
 
     `plane_point` and `axis_direction` are deliberately separate:
     `plane_point` should be a marker placed directly on *this* pinna
@@ -241,7 +368,9 @@ def crop_toward_canal(
     Parameters
     ----------
     mesh : trimesh.Trimesh
-        The isolated pinna patch (output of isolate_surface_patch()).
+        The pinna mesh to crop -- either the full pre-isolation
+        skin-surface blob (current usage) or an already-isolated patch
+        (original usage); this function doesn't care which.
     plane_point : (x, y, z)
         Where the cut plane sits -- the surgeon's canal-opening marker on
         this mesh.

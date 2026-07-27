@@ -134,14 +134,70 @@ these pages, in order:
 0.5. Welcome          -- tutorial-mode only, skipped entirely in Normal mode
 1. DICOM load         -- confirm which already-loaded scan to use
 2. Scutum landmarks   -- place 2 points defining the ear canal axis
-3. Scutum review      -- run/adjust bone-wall threshold segmentation
-4. Scutum draw        -- surgeon draws the defect outline on the 3D mesh
-5. Pinna landmarks    -- place 1 point + pick left/right ear
-6. Pinna review       -- run/adjust skin-surface threshold segmentation
-7. Pinna draw         -- surgeon draws the pinna outline on the 3D mesh
+3. Pinna landmarks    -- place 1 point + pick left/right ear
+4. Pinna review       -- run/adjust skin-surface threshold segmentation
+5. Pinna draw         -- surgeon draws the pinna outline on the 3D mesh
+6. Scutum review      -- run/adjust bone-wall threshold segmentation
+7. Scutum draw        -- surgeon draws the defect outline on the 3D mesh
 8. Verify             -- surgeon checkboxes confirming both meshes are correct
 9. Curvature          -- runs the curvature comparison in-process, loads heatmap
 ```
+
+**Pinna-first wizard reorder (2026-07-27):** the pinna stage (pages 3-5)
+now runs *before* the scutum review/draw stage (pages 6-7), even though
+scutum work used to come first end-to-end. Thomas's reasoning: a surgeon
+should be able to try different scutum defect shapes/sizes and see how
+each changes the suggested cartilage harvest site, without having to
+re-segment and re-draw the pinna every single time. With the pinna stage
+done once, early, and the scutum stage moved to right before Verify/
+Curvature, redoing just the scutum defect (page 7's "Reset This Page") no
+longer touches any pinna state at all -- `wizard_state.clear_downstream_state`
+already enforces this for free, since it's driven entirely by position in
+`PAGE_ORDER`.
+
+The one wrinkle: the pinna draw page's canal-crop feature
+(`mesh_isolate.crop_toward_canal`, called from `page_pinna_draw.py`) needs
+the scutum ear-canal axis's *direction* (`near_eardrum - canal_opening`)
+to know which way is "into the head" when trimming the isolated pinna
+patch -- so it has to exist before `pinna_draw` runs. Rather than move
+that dependency into the pinna pages (which would mean duplicating
+landmark-placement logic, or teaching `mesh_isolate` a different way to
+get a direction), the 2-point **scutum landmarks** page alone stays at
+its original spot (page 2, right after DICOM load) -- it's just 2 quick
+clicks with no segmentation, so placing it early doesn't cost the surgeon
+anything, and it's not something they'd realistically want to change
+between defect-shape experiments anyway. Only the segmentation+drawing
+part of the scutum stage (review, page 6, and draw, page 7) actually
+moved. `WizardState`'s field comments (`wizard_state.py`) spell out this
+split explicitly.
+
+Visibility follow-on: since the pinna's finished models now sit around in
+the scene through the entire scutum stage (and vice versa, the scutum
+landmark points sit around through the entire pinna stage), each stage
+now explicitly hides the other's leftovers on entry and re-shows its own
+if the surgeon navigates back into it:
+- `page_pinna_landmarks.py`'s `on_enter()` hides
+  `scutum_landmarks_fiducial_node`.
+- `page_scutum_review.py`'s `on_enter()` hides
+  `pinna_region_model_node`/`pinna_isolated_model_node`/
+  `pinna_landmarks_fiducial_node`, and re-shows
+  `scutum_landmarks_fiducial_node`. `page_scutum_draw.py`'s `on_enter()`
+  repeats the same pinna-hiding as a defensive duplicate, since a single
+  "Back" from Verify lands directly on `scutum_draw` without re-running
+  `scutum_review`'s `on_enter()`.
+- `page_pinna_review.py`/`page_pinna_draw.py`'s `on_enter()` re-show
+  their own model (respecting "original hidden once isolated successor
+  exists" -- i.e. `pinna_review` only re-shows `pinna_region_model_node`
+  if `pinna_isolated_model_node` doesn't exist yet) in case the surgeon
+  went forward into the scutum stage (which hides them) and came back.
+- `page_verify.py`'s `on_enter()` re-shows both final isolated models
+  (`pinna_isolated_model_node`, `scutum_defect_model_node`) since the
+  surgeon needs to see both there regardless of which stage hid what.
+
+**Not yet runtime-tested against a real Slicer install** (same caveat as
+everywhere else in this doc without a local Slicer) -- if navigating back
+and forth between the two stages leaves a stale model visible/hidden
+that this logic didn't anticipate, that's the first place to check.
 
 ### Why a wizard instead of a normal Slicer module UI
 
@@ -1000,6 +1056,79 @@ projected footprint shape (not a circle) -> exports `pinna_heatmap.ply`
     piece actually near `ear_center`. **Confirmed working by Thomas** --
     the spike is gone and segmentation quality is otherwise unaffected.
 
+    **Follow-up (2026-07-27, same day): chased into the wrong function
+    twice before finding the real cause.** Thomas reported a circular hole
+    appearing on the pinna's helix in the pre-draw mesh, after the
+    pinna-first wizard reorder (the root cause turned out to be unrelated
+    to that reorder). Two attempts assumed `_remove_boundary_spike()`
+    itself was the culprit (its opening stripping ~3.8% of the mask --
+    68866 of 1797604 voxels -- looked like it was eating the helix) and
+    tried restricting it to a shell near the ROI's own edge, first with a
+    single shared radius (undid the original spike fix, since the
+    graze-artifact's neck isn't confined to a mathematically thin ring
+    right at the sphere surface) then with a separate, wider
+    `PINNA_SPIKE_PROTECTED_CORE_MARGIN_MM`. Both were reverted.
+
+    The decisive clue: Thomas reported the hole was NOT present on the
+    Pinna Review screen (right after clicking Run) -- only after clicking
+    Next, on the Pinna Draw screen. That rules out anything in
+    `_on_run_clicked()`'s pipeline (which includes
+    `_remove_boundary_spike()`) as the cause, since that runs entirely
+    before the Review screen ever renders. The actual cause was in
+    `page_pinna_review.py`'s `_refresh_mesh_from_segmentation()` (called
+    unconditionally on every "Next" click, a `page_scutum_review.py`-
+    mirrored pattern from the Segment Editor fix, #17 below): it
+    re-exports the segmentation and re-applies
+    `postprocess.run_full_postprocess()` -- but that segmentation already
+    went through that exact same postprocessing once, in `_on_run_clicked()`,
+    before ever reaching the Review screen. Running
+    `postprocess.smooth_boundary()`'s fixed-radius morphological
+    closing/opening a second time on already-processed data isn't
+    idempotent for real, thin anatomy -- it eroded the helix further on
+    the second pass, exactly matching the Review-vs-Draw timing Thomas
+    reported (and coincidentally also finished off the spike that the
+    over-cautious core-margin fix had left intact, which is why "the
+    lines are removed" was reported alongside the new hole).
+
+    `_remove_boundary_spike()` was reverted back to its original,
+    whole-mask-opening form (Thomas's originally-confirmed-working
+    version -- see the code's own docstring for why the shell-restriction
+    detour didn't pan out).
+
+    **First real fix attempt (gating just the postprocess re-application)
+    wasn't enough -- Thomas reported the hole was STILL there afterward,**
+    even with `_remove_boundary_spike()` reverted and postprocessing only
+    reapplied when `self._segmentation_edited` was `True`. Thomas's own
+    observation nailed the remaining issue: there is no reason for *any*
+    reprocessing to happen on "Next" if the surgeon is only clicking Next
+    because they're satisfied with what Run Segmentation already produced.
+    The postprocess guard alone still left `_refresh_mesh_from_segmentation()`
+    unconditionally round-tripping the segmentation through
+    `ExportVisibleSegmentsToLabelmapNode` -> `PullVolumeFromSlicer` ->
+    marching cubes every time -- and that round trip alone, even with zero
+    postprocessing, isn't guaranteed to reproduce the exact mesh already
+    built (and already visually approved) in `_on_run_clicked()`. That
+    round trip itself was the remaining source of the erosion.
+
+    **Actual fix:** `on_leave_next()` on both review pages now skips
+    `_refresh_mesh_from_segmentation()` (the whole method, not just its
+    postprocess step) entirely unless `self._segmentation_edited` is
+    `True`. In the default "Run, then Next" path, the mesh/model built by
+    `_on_run_clicked()` is used completely unchanged -- no re-export,
+    re-import, or re-meshing happens at all. Only if the surgeon actually
+    opened Segment Editor does clicking Next re-derive the mesh from the
+    (possibly hand-edited) segmentation, postprocessing it exactly once.
+    **Not yet confirmed by Thomas on a real scan** -- this is the second
+    fix attempt for the same symptom; if the hole is *still* present after
+    this, the round-trip/postprocess theory should be considered
+    disproven and the actual cause is something else in
+    `_on_run_clicked()`'s own pipeline that simply wasn't visible on the
+    Review screen for some other reason (e.g. a stale 3D view not
+    re-rendering the true mesh until Next forces a reload) -- worth
+    asking Thomas to look very closely at the Review screen mesh, zoomed
+    into the helix specifically, rather than assuming the general shape
+    looks right.
+
 16. **Drawn outline/seed points rendered far too large until the "recenter
     3D view" button was pressed.** Reported by Thomas as a long-standing,
     low-priority annoyance on the draw pages. Root cause: Slicer's
@@ -1100,6 +1229,309 @@ projected footprint shape (not a circle) -> exports `pinna_heatmap.ply`
     `ExportVisibleSegmentsToLabelmapNode`'s exact signatures, or the
     Segment Editor widget attribute names, turn out to differ from what's
     written here, that's the first thing to check.
+
+18. **RESOLVED (2026-07-28). Pinna "Isolate Patch" started failing with
+    "isolated region covers almost the entire mesh" on outlines that used
+    to work fine, right after the double-postprocessing fix above (#17's
+    `_segmentation_edited` guard).** This entry is long because it took 8
+    rounds and several false leads to actually fix -- see the "CONFIRMED
+    WORKING" note near the end for the fix that ultimately worked, and
+    the surrounding entries for two other real (partial) contributors.
+    Added `[isolate diag]` prints to
+    `mesh_isolate.isolate_surface_patch()` (same pattern as the pinna
+    diagnostics) rather than guess -- the console output was decisive:
+    `mesh: 182003 vertices ... 1 connected component(s)`, and
+    `flood fill reached 181649 of 182003 vertices (99.8%)`. 181649 is
+    exactly `182003 - 354` (the loop's own vertex count) -- meaning
+    removing the drawn loop's vertices left the *entire rest of the mesh*
+    as one connected piece. The loop wasn't failing to close (bridging
+    added zero extra vertices -- the dense curve-point sampling was
+    already vertex-adjacent end to end); it just wasn't a topologically
+    *separating* cut. Root cause: the mesh has a "handle" -- two nearby
+    folds of the pinna (or the pinna and scalp) close enough to register
+    as touching at CT resolution, especially with less aggressive
+    smoothing -- that gives the surface a back door from inside the loop
+    to the rest of the mesh, bypassing the loop entirely. The earlier
+    double-postprocessing (before #17's fix removed it) was *also*
+    incidentally sealing these small false bridges shut via its extra
+    erosion pass -- the exact same mechanism that was found to be eating
+    the helix. Tuning smoothing again would just trade one failure mode
+    for the other (confirmed painfully via the #15/helix saga just above).
+
+    **First attempted fix (insufficient): local-radius flood-fill
+    restriction.** `isolate_surface_patch()` was changed to restrict the
+    flood-fill to a local neighborhood around the seed point (radius = 2x
+    the loop's own max distance from the seed) before removing the loop's
+    vertices, on the theory that a small drawn loop should only ever need
+    to enclose nearby vertices, so a distant handle couldn't be reached.
+    Verified against a synthetic reproduction (a small loop + a
+    far-away artificial "bridge" vertex) and confirmed working for THAT
+    case -- but Thomas's real scan showed the loop traces almost the
+    entire visible pinna silhouette (as the wizard's own instructions
+    intend), so the loop's own extent is comparable to the whole
+    ROI-cropped mesh's extent. The "local" radius ended up covering
+    100% of the mesh every time (confirmed: `local search radius: 73.0mm,
+    173453 vertices within range` -- exactly the total vertex count), so
+    the restriction was a no-op on the real case. Two more real-scan
+    retries, with different loop sizes, all showed the identical pattern:
+    flood fill reaches *exactly* `total_vertices - loop_vertices` --
+    zero exclusion, every time -- ruling out a subtle/rare handle and
+    pointing at something structural.
+
+    **Ruled out via more diagnostics:** added a check for Slicer's
+    closed-curve auto-close segment (the curve doesn't require the
+    surgeon to click back near the start -- Slicer connects last-to-first
+    via shortest-path-on-surface) cutting across the mesh instead of
+    tracing the intended boundary. Real-scan data showed the largest gap
+    between consecutive drawn points (0.69mm) barely exceeded the median
+    spacing (0.44mm) -- no dramatic jump, so this wasn't it. Seed-snap
+    distance (0.17mm) also ruled out the seed landing on the wrong side of
+    a thin fold via bad nearest-vertex snapping. Thomas also confirmed
+    directly that the outline traces the full helix, not a partial arc.
+
+    **Actual fix:** rather than keep hunting for a mesh-topology
+    explanation, made `isolate_surface_patch()` raise a distinct
+    `LoopDoesNotSeparateError(ValueError)` for this specific failure mode
+    (a >90%-reached loop that otherwise looks well-formed), separate from
+    genuine input errors (too few points, a disconnected seed) that
+    actually need the surgeon to redraw. `page_pinna_draw.py`'s
+    `_on_isolate_clicked()` catches this specific exception and retries
+    the *same* isolate attempt (same `curve_points`/`seed_point`, no
+    redraw needed) against a fallback mesh built by
+    `_build_fallback_mesh()`: re-derives the mesh from the current
+    segmentation node with an *extra* `postprocess.run_full_postprocess()`
+    pass on top -- i.e. exactly the old "double postprocessing" behavior
+    that used to always happen unconditionally (before #17's
+    `_segmentation_edited` guard), but now applied only as a fallback,
+    only in memory, and never written back to
+    `state.pinna_region_mesh_path`/`pinna_region_model_node` -- so the
+    Review page's displayed mesh (and its helix) stays protected from the
+    erosion that extra pass causes, while Isolate Patch gets its old
+    reliability back exactly when it's actually needed. This directly
+    honors Thomas's request to fall back on the old, previously-working
+    architecture rather than keep tuning smoothing parameters blind.
+
+    **Verified with synthetic reproductions** (no Slicer needed): (1) a
+    small loop + a far-away bridge vertex -- confirms `LoopDoesNotSeparateError`
+    specifically (not a generic `ValueError`) is raised, both against the
+    original small-mesh case and (2) a large loop spanning most of a
+    bigger grid mesh (matching the real "trace the whole pinna" case,
+    where local-radius restriction is a no-op) -- confirms the exception
+    type is raised correctly there too, which is what
+    `page_pinna_draw.py`'s `except mesh_isolate.LoopDoesNotSeparateError`
+    depends on to trigger the fallback.
+
+    **The fallback-mesh retry above still wasn't enough** -- Thomas
+    reported the exact same "covers almost the entire area near the seed
+    point" error even after the automatic fallback retry ran (its status
+    message, "That outline didn't isolate cleanly -- retrying...", was
+    seen right before the same failure message). This directly disproves
+    the "double postprocessing seals the handle shut" theory the fallback
+    was built on: if an *extra* postprocessing pass (via
+    `_build_fallback_mesh()`, mimicking the old always-on double-pass)
+    still doesn't fix it, then postprocessing amount was never the actual
+    variable -- something else about this specific scan's anatomy (or an
+    unidentified difference in the round-trip itself) is responsible, not
+    yet understood.
+
+    **Final resolution: reverted to the exact pre-session architecture,
+    per Thomas's explicit request** to stop tuning parameters blind and
+    replicate the old, previously-reliable code instead. `git diff HEAD`
+    against the pre-session commit was used to isolate precisely what
+    `page_pinna_review.py`'s `_refresh_mesh_from_segmentation()`/
+    `on_leave_next()` looked like before today's "no silent reprocessing"
+    change (see [[feedback_no_silent_reprocessing]] in memory -- that
+    principle is NOT wrong in general, it just isn't what's needed here),
+    and restored them to call unconditionally on every "Next" click,
+    exactly as before -- removing the `_segmentation_edited` gating and
+    the now-dead flag-setting code in `_on_run_clicked()`/
+    `_on_open_segment_editor_clicked()`. This is a deliberate, known
+    tradeoff, not an oversight: it reopens the possibility of the
+    helix-hole cosmetic artifact (Known Issues #15 follow-up above), but
+    restores Isolate Patch -- a core, blocking feature -- to its
+    long-confirmed-working behavior. `page_scutum_review.py` was
+    deliberately left AS-IS (still gated, still "no silent reprocessing")
+    since it has never shown this problem, and its bone-wall's simple
+    thin-shell geometry is much less likely to need the extra pass than
+    the pinna's deeply-folded skin surface -- this is an intentional
+    asymmetry between the two review pages, not an inconsistency to
+    "fix" later.
+
+    `mesh_isolate.py`'s `LoopDoesNotSeparateError` + local-radius
+    restriction and `page_pinna_draw.py`'s fallback-mesh retry logic were
+    LEFT IN PLACE as a backstop.
+
+    **The full revert didn't fix it either** -- Thomas confirmed the exact
+    same failure persisted even after `page_pinna_review.py` was restored
+    to its literal pre-session behavior. This is the key finding: it means
+    this bug was NEVER caused by anything changed this session (not the
+    reorder, not the postprocessing gating) -- it's a pre-existing
+    property of how this specific scan's mesh gets built, that just hadn't
+    been exercised/noticed before.
+
+    **The actual root cause, per Thomas's own direct observation:** the
+    pre-cutout "ball of tissue" mesh (`pinna_region.stl`, before any
+    drawing) has "often" had small holes in it -- previously dismissed as
+    insignificant cosmetic noise (same category as the #15 "skinny line"
+    spike, tolerated because the surgeon's drawn outline just routes
+    around it). Added `mesh.euler_number`/`is_watertight` diagnostics to
+    `isolate_surface_patch()` to confirm this directly (a mesh with a
+    genuine hole is not topologically genus-0, which is exactly what
+    `isolate_surface_patch`'s "a closed drawn loop separates the surface
+    into two pieces" assumption requires) -- this is what Thomas's own
+    domain knowledge identified before the diagnostic even ran, and it
+    reframes the whole investigation: these are RECURRING SEGMENTATION-
+    LEVEL ARTIFACTS (small perforations from thresholding/postprocessing
+    noise), not a one-off anatomical quirk (the ear canal, a distant
+    handle, etc.) -- every earlier theory this session was chasing a
+    *symptom location* rather than this *upstream cause*.
+
+    **Fix:** added `trimesh.repair.fill_holes(mesh)` to
+    `mesh_export.label_map_to_mesh()`, right after marching cubes,
+    applying to every mesh this project builds (both scutum and pinna).
+    Deliberately chosen because it's purely ADDITIVE -- it patches
+    boundary gaps with new triangulated faces, it does not remove or
+    erode any existing material -- unlike every postprocessing-based
+    approach tried earlier this session (all of which operate on the
+    volumetric mask via morphological erosion/dilation, which is
+    precisely what ate the helix in the #15 follow-up). Verified directly
+    against trimesh (not the full Slicer pipeline -- SimpleITK/skimage
+    aren't available standalone outside Slicer, so this couldn't be
+    tested through `label_map_to_mesh()` itself): a sphere with a single
+    triangle removed (simplest possible hole) is fully closed by
+    `fill_holes()` (`euler_number` restored from 1 to 2, `is_watertight`
+    True). A sphere with 3 adjacent triangles removed (a bigger,
+    less-trivial gap) is only PARTIALLY closed (`fill_holes()` itself
+    returns `False` to signal this) -- trimesh's fan-triangulation is
+    explicitly documented as unreliable for large/non-convex holes. So
+    this is expected to close many, but not necessarily all, of the
+    recurring holes Thomas described -- `isolate_surface_patch`'s
+    `LoopDoesNotSeparateError` + fallback-retry logic (still in place)
+    remains the backstop for whatever this doesn't fully close.
+
+    **`fill_holes()` had a real bug in it** (caught by an actual crash, not
+    review): the diagnostic print used `mesh.edges_boundary`, which does
+    not exist on a trimesh `Trimesh` (verified the correct API,
+    `trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1)`, in
+    a scratch test earlier but never actually applied that fix to the
+    shipped code -- a real process failure, not caught until it crashed in
+    Thomas's hands). Fixed.
+
+    **The actual, confirmed root cause: this was the SAME double-processing
+    bug as the original helix-hole issue (#15 follow-up), not a
+    pre-existing segmentation artifact at all.** Thomas did the decisive
+    test directly: the segmentation is watertight and hole-free
+    immediately after clicking "Run Segmentation," and reproducibly
+    develops exactly 2 holes (helix + top of the blob) specifically after
+    clicking "Next" -- i.e. specifically from
+    `_refresh_mesh_from_segmentation()`'s re-export/re-postprocess round
+    trip, confirmed by the diagnostics: `euler_number=-20` (many handles),
+    `is_watertight=False`, `344 boundary edges`. This directly disproves
+    both the "pre-existing recurring artifact" theory *and* the
+    "double-postprocessing is needed for Isolate Patch to work" theory
+    that justified reverting to always-on reprocessing earlier in this
+    saga -- the double-processing was never helping isolate, it was
+    actively causing the very holes that break it.
+
+    **Final fix: re-applied the "skip reprocessing unless Segment Editor
+    was used" gating to `page_pinna_review.py`** (`_segmentation_edited`
+    flag, `on_leave_next()`/`_refresh_mesh_from_segmentation()`) --
+    functionally identical to the FIRST fix attempted in this saga hours
+    earlier, which was reverted based on an incorrect assumption. The
+    difference this time is direct, reproducible evidence (watertight
+    before Next, holed after) rather than inference. In the default "Run,
+    then Next" path, the mesh reaching Draw is now exactly what
+    `_on_run_clicked()` built (already confirmed watertight/hole-free by
+    Thomas), with zero re-export/re-import/re-meshing. `page_scutum_review.py`
+    was already left in this gated state throughout (never reverted), so
+    both review pages are now consistent. `mesh_export.label_map_to_mesh()`'s
+    `fill_holes()` call and `mesh_isolate.py`'s `LoopDoesNotSeparateError`/
+    fallback-retry logic all stay in place as defense-in-depth for the
+    first-pass segmentation itself (which Thomas has separately observed
+    CAN sometimes have small holes too, historically tolerated as
+    insignificant) -- just no longer masked by a second, hole-creating
+    pass on top. **Still not confirmed working by Thomas as of this
+    writing.**
+
+    **Lesson for this whole saga:** the same fix (skip unconditional
+    reprocessing) was tried, reverted, and now re-applied -- the
+    difference between the failed attempt and the successful one wasn't
+    the code, it was the evidence backing it. The first time, "Isolate
+    Patch still fails after this fix" was taken as proof the fix was
+    wrong; it should have prompted checking whether the *mesh itself* was
+    actually clean before blaming the isolate algorithm. When a user can
+    give a precise before/after observation ("watertight here, holed
+    there"), that's worth more than several rounds of algorithmic
+    theorizing.
+
+    **Even after the gating fix, isolate still failed -- but the
+    diagnostics revealed something new and important: `is_watertight` and
+    "no handles" are NOT the same property.** Thomas's retest showed
+    `is_watertight=True` (confirming the gating fix worked -- no new open
+    boundary was introduced between Review and Draw) but
+    `euler_number=-14` -- genus 7, meaning 7 genuine handles/tunnels
+    straight through otherwise-sealed tissue. This is a different defect
+    from an open boundary hole: a torus is fully watertight (no missing
+    faces) while still having a handle. Neither `postprocess.fill_holes()`
+    (`sitk.BinaryFillhole`, closes enclosed 2D regions per slice) nor
+    `mesh_export.py`'s new `trimesh.repair.fill_holes()` (patches open
+    mesh boundaries) can fix this -- both need an actual gap/opening to
+    patch, and a sealed tunnel has none. A second retest (different
+    vertex/face count -- a fresh Run Segmentation, likely after adjusting
+    the threshold slider) showed `is_watertight=False` again, confirming
+    Thomas's earlier point that the *original* first-pass segmentation
+    can independently produce open-boundary holes too, on top of the
+    separate handle problem.
+
+    **Fix:** added `postprocess.close_small_tunnels()` -- a
+    closing-ONLY morphological pass (no matching opening/erosion),
+    physically scaled via a new `TUNNEL_CLOSING_RADIUS_MM` (2.0mm,
+    `config.py`), run in `run_full_postprocess()` before the existing
+    `smooth_boundary()`. The existing `smooth_boundary()` already pairs a
+    closing with an opening at a *fixed 1-voxel radius* (~0.45mm at this
+    scan's spacing) -- too narrow to bridge tunnels wider than that, which
+    is presumably why 7 handles survived it. Deliberately closing-only:
+    closing can only ADD material to bridge gaps, never remove/erode
+    existing material, so unlike every opening-based attempt this session
+    (all of which risked/caused the helix erosion), this genuinely cannot
+    cause that failure mode -- it's a fundamentally different, strictly
+    additive kind of operation. **Not yet verified even standalone** --
+    SimpleITK isn't available outside Slicer in this dev environment, so
+    this couldn't be tested at all before shipping, only reasoned about
+    from first principles (a wider closing radius should bridge wider
+    tunnels, the same way the existing narrower one already bridges
+    narrower ones). Confirmed genuinely helpful on retest: genus dropped
+    from 7 handles (`euler_number=-14`) to 3 handles (`euler_number=-4`)
+    -- real, measurable progress, just not enough on its own.
+
+    **Thomas's own suggestion broke the remaining deadlock: crop toward
+    the ear canal BEFORE isolating, not after.** The canal-crop step
+    (`mesh_isolate.crop_toward_canal()` + `keep_connected_component_containing()`)
+    used to run on the already-isolated patch, as cleanup for a sliver of
+    head-side attachment. Reordered to run on the *whole* pre-isolation
+    mesh instead, in a new `page_pinna_draw.py` helper
+    `_crop_toward_canal_if_possible()` (called before
+    `isolate_surface_patch()`, both for the primary mesh and the fallback
+    mesh). Reasoning: the head-interior material this discards was always
+    going to be thrown away eventually -- if it's the source of some of
+    the remaining handles (the ear canal's own tube-like anatomy is a
+    strong candidate, given the canal is a genuine biological tunnel), removing it
+    *before* isolation means those handles never get a chance to defeat
+    `isolate_surface_patch`. Even for a handle that isn't fully inside the
+    discarded region, severing it at the cut plane converts it from a
+    genus-raising tunnel into a harmless open boundary edge --
+    `isolate_surface_patch`'s flood fill doesn't care about open
+    boundaries at all, only about handles. `crop_toward_canal()`'s
+    docstring was updated to reflect it's now used both ways (works
+    identically either way -- it only ever cared about vertex positions
+    relative to a plane, never about isolation order).
+
+    **CONFIRMED WORKING by Thomas (2026-07-28).** Isolate Patch isolates
+    correctly again. This was the fix that actually closed out the whole
+    saga -- moving the canal-crop earlier turned out to matter more than
+    any amount of tuning the postprocessing/tunnel-closing radii (both of
+    which are still in place as real, if partial, contributors -- see the
+    two entries just above this one).
 
 ## Features added after the pipeline started working end-to-end
 

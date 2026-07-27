@@ -110,6 +110,31 @@ MIN_CASES_TO_TRAIN = 15
 # (in mm^3) are removed automatically as noise.
 MIN_COMPONENT_VOLUME_MM3 = 5.0
 
+# Radius (mm) of a closing-only (dilate then erode) pass run before
+# postprocess.smooth_boundary(), specifically to seal small tunnels/
+# handles straight through otherwise-solid tissue -- confirmed on a real
+# scan (2026-07-27) that these are a genuinely different defect from an
+# open boundary hole: a mesh can be fully watertight (is_watertight=True,
+# no open edges) while still having several handles (mesh.euler_number
+# well below 2), which postprocess.fill_holes() and mesh_export.py's
+# trimesh.repair.fill_holes() both cannot fix, since neither has any open
+# boundary to patch -- a tunnel through sealed material is more like a
+# torus than a hole. smooth_boundary()'s existing closing+opening pair
+# uses a fixed 1-voxel radius (~0.45mm at typical scan spacing), too
+# narrow to bridge tunnels wider than that.
+#
+# Deliberately closing-only (no matching opening/erosion step) -- closing
+# only ADDS material to bridge small gaps, it can never remove/erode
+# existing material, so unlike smooth_boundary's opening step (or any of
+# the spike-removal machinery in segment_pinna_threshold.py), this can't
+# cause the kind of erosion that ate the pinna's helix (Known Issues #15/
+# #18 in CLAUDE.md). Expressed in mm (converted to a per-axis voxel
+# radius from the scan's own spacing), like other physically-scaled
+# kernels in this project. If tunnels/handles persist, raise this; if it
+# ever visibly merges two anatomically-separate structures that should
+# stay apart, lower it.
+TUNNEL_CLOSING_RADIUS_MM = 2.0
+
 # Mesh smoothing iterations applied before STL export. Higher = smoother
 # but less true to the raw voxel boundary.
 MESH_SMOOTHING_ITERATIONS = 15
@@ -177,6 +202,15 @@ MIN_INTERAURAL_DISTANCE_MM = 100.0
 # not a fixed voxel count, so it behaves consistently across scans with
 # different spacing. If a real thin feature ever gets clipped, lower this;
 # if the spike survives, raise it.
+#
+# A 2026-07-27 real-scan report of a circular hole on the pinna's helix
+# looked at first like this radius eating real anatomy, and a same-day
+# attempt to restrict this opening to a shell near the ROI's own edge (see
+# segment_pinna_threshold._remove_boundary_spike's docstring) was tried
+# and reverted -- the actual cause turned out to be an unrelated bug (see
+# page_pinna_review.py's `_segmentation_edited` guard), not this radius or
+# this function. Applied to the whole mask, as originally confirmed
+# working by Thomas.
 PINNA_SPIKE_REMOVAL_RADIUS_MM = 1.5
 
 # After the surgeon draws and isolates the pinna outline, any remaining

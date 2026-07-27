@@ -80,6 +80,27 @@ def label_map_to_mesh(label_image: sitk.Image) -> trimesh.Trimesh:
 
     mesh = trimesh.Trimesh(vertices=verts_physical, faces=faces, process=True)
 
+    # Close small holes/perforations in the mesh surface. These have been
+    # a long-standing, previously-tolerated artifact on real scans (per
+    # Thomas: the pre-cutout "ball of tissue" mesh has often had small
+    # holes, never deemed significant since the surgeon's drawn outline
+    # just routes around them) -- but confirmed 2026-07-27 that a mesh
+    # with genuine open holes isn't topologically simple, and can defeat
+    # core/mesh_isolate.py's "a closed drawn loop separates the surface
+    # into two pieces" assumption regardless of where the loop is drawn
+    # (see Known Issues #18 in CLAUDE.md). This is purely additive --
+    # trimesh.repair.fill_holes() patches gaps with new triangulated
+    # faces rather than removing or eroding any existing material, so
+    # unlike postprocess.py's volumetric morphological operations, it
+    # can't cause the kind of erosion that ate the pinna's helix (Known
+    # Issues #15 follow-up). Not guaranteed to close every hole --
+    # trimesh's fan-triangulation can fail on large or non-convex
+    # boundary loops (confirmed: works reliably for a single-face-sized
+    # gap, only partially closes a 3-face gap in a standalone test) -- so
+    # isolate_surface_patch's LoopDoesNotSeparateError + fallback-retry
+    # logic stays in place as a backstop for whatever slips through.
+    trimesh.repair.fill_holes(mesh)
+
     if MESH_SMOOTHING_ITERATIONS > 0:
         trimesh.smoothing.filter_laplacian(
             mesh, iterations=MESH_SMOOTHING_ITERATIONS

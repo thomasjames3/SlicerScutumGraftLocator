@@ -7,14 +7,20 @@ from a loaded CT scan through to a cartilage-graft-harvest-site heatmap:
 1. Setup              -- one-time dependency install
 2. Load DICOM         -- confirm which loaded scan to use
 3. Scutum landmarks   -- place 2 points defining the ear canal axis
-4. Scutum review      -- run/adjust the bone-wall segmentation
-5. Scutum draw        -- trace the defect outline on the 3D mesh
-6. Pinna landmarks    -- place 1 point + pick left/right ear
-7. Pinna review       -- run/adjust the skin-surface segmentation
-8. Pinna draw         -- trace the pinna outline on the 3D mesh
+4. Pinna landmarks    -- place 1 point + pick left/right ear
+5. Pinna review       -- run/adjust the skin-surface segmentation
+6. Pinna draw         -- trace the pinna outline on the 3D mesh
+7. Scutum review      -- run/adjust the bone-wall segmentation
+8. Scutum draw        -- trace the defect outline on the 3D mesh
 9. Verify             -- surgeon confirms both meshes look correct
 10. Curvature          -- run Curvature Project v4, load the heatmap
 ```
+
+The pinna stage runs before the scutum review/draw steps (only the 2-point
+scutum ear-canal axis is placed early, since the pinna draw step needs its
+direction) so a surgeon can redo the scutum defect shape repeatedly -- to
+see how it changes the suggested harvest site -- without re-segmenting the
+pinna each time. See "Pinna-first wizard reorder" in `CLAUDE.md`.
 
 ## Installing in Slicer (for testing)
 

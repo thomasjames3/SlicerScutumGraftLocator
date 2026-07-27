@@ -12,7 +12,7 @@ import numpy as np
 import SimpleITK as sitk
 from scipy import ndimage
 
-from config import MIN_COMPONENT_VOLUME_MM3
+from config import MIN_COMPONENT_VOLUME_MM3, TUNNEL_CLOSING_RADIUS_MM
 
 
 def remove_small_specks(label_image: sitk.Image) -> sitk.Image:
@@ -58,6 +58,23 @@ def fill_holes(label_image: sitk.Image) -> sitk.Image:
     return filled
 
 
+def close_small_tunnels(label_image: sitk.Image, radius_mm: float = TUNNEL_CLOSING_RADIUS_MM) -> sitk.Image:
+    """
+    Seals small tunnels/handles straight through otherwise-solid tissue
+    via a morphological closing (dilate then erode), with NO matching
+    opening/erosion step -- see TUNNEL_CLOSING_RADIUS_MM in config.py for
+    the full mechanism and why this is a genuinely different defect from
+    an open boundary hole (fill_holes() can't fix it; a mesh can be fully
+    watertight while still having handles). Deliberately closing-only:
+    unlike smooth_boundary()'s closing+opening pair, this can only ADD
+    material to bridge gaps, never remove/erode existing material, so it
+    can't cause the kind of erosion that ate the pinna's helix.
+    """
+    spacing = label_image.GetSpacing()
+    radius_vox = [max(1, int(round(radius_mm / s))) for s in spacing]
+    return sitk.BinaryMorphologicalClosing(label_image, radius_vox)
+
+
 def smooth_boundary(label_image: sitk.Image, iterations: int = 2) -> sitk.Image:
     """
     Light morphological smoothing (closing then opening) to reduce
@@ -76,5 +93,6 @@ def run_full_postprocess(label_image: sitk.Image) -> sitk.Image:
     """Convenience wrapper running the standard cleanup sequence in order."""
     result = remove_small_specks(label_image)
     result = fill_holes(result)
+    result = close_small_tunnels(result)
     result = smooth_boundary(result)
     return result

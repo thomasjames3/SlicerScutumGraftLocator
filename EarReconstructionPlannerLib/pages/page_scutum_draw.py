@@ -1,7 +1,7 @@
 """
 page_scutum_draw.py
 ======================
-Page 4: the surgeon draws a closed outline directly on the 3D bone-wall
+Page 7: the surgeon draws a closed outline directly on the 3D bone-wall
 mesh to mark the scutum defect boundary; the enclosed patch is extracted
 as an open-surface mesh for Curvature Project v4.
 
@@ -65,6 +65,18 @@ class ScutumDrawPage(WizardPage):
         self._curve_node = None
         self._seed_fiducial_node = None
         self._seed_point = None
+
+        # Defensive duplicate of the same hide performed in
+        # page_scutum_review.py's on_enter -- covers the case where the
+        # surgeon backs up into the pinna stage and returns straight to
+        # this page (a single "Back" from Verify lands here directly,
+        # without re-running scutum_review's on_enter).
+        if self.state.pinna_region_model_node is not None:
+            self.state.pinna_region_model_node.GetDisplayNode().SetVisibility(False)
+        if self.state.pinna_isolated_model_node is not None:
+            self.state.pinna_isolated_model_node.GetDisplayNode().SetVisibility(False)
+        if self.state.pinna_landmarks_fiducial_node is not None:
+            self.state.pinna_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
 
         self.ui.startCurveButton.clicked.connect(self._on_start_curve_clicked)
         self.ui.markSeedButton.clicked.connect(self._on_mark_seed_clicked)

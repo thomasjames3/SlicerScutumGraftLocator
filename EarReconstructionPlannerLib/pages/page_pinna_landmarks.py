@@ -1,7 +1,7 @@
 """
 page_pinna_landmarks.py
 =========================
-Page 5: place the single ear-center point.
+Page 3: place the single ear-center point.
 
 Simpler than the scutum's page since the pinna's Stage A only
 needs a search region, not an orientation (see core/pinna_landmarks.py for
@@ -43,14 +43,23 @@ class PinnaLandmarksPage(WizardPage):
             self.state.pinna_landmarks_fiducial_node = self._fiducial_node
         self._fiducial_node.GetDisplayNode().SetVisibility(True)
 
+        # Hide the scutum ear-canal-axis points now that the pinna stage is
+        # starting -- they were placed first only because the pinna draw
+        # page's canal-crop feature needs their direction later, and would
+        # otherwise sit visibly in the slice/3D views for no reason through
+        # this entire pinna stage. Re-shown once the surgeon reaches the
+        # scutum review page (see page_scutum_review.py's on_enter).
+        if self.state.scutum_landmarks_fiducial_node is not None:
+            self.state.scutum_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
+
         self.ui.instructionLabel.setText(PINNA_LANDMARK_STEP["instruction"])
         self.set_tutorial_text(
             "This point just gives the tool a rough search area for the "
-            "pinna, so it doesn't need to be precise. Nothing pinna-related "
-            "is in the 3D view yet -- the only model currently shown is the "
-            "isolated scutum defect patch from the previous stage (ignore "
-            "it here; the pinna's own model isn't created until the next "
-            "page). Instead, use the 2D slice views (Red/Yellow/Green): "
+            "pinna, so it doesn't need to be precise. Nothing is in the 3D "
+            "view yet -- the pinna's own model isn't created until the next "
+            "page, and the scutum stage (which would show a bone-wall or "
+            "defect mesh) doesn't run until after the pinna stage in this "
+            "wizard. Use the 2D slice views (Red/Yellow/Green): "
             "hover over one and scroll the mouse wheel to move through "
             "slices (hold the middle mouse button and drag to pan) until "
             "you can see the ear on the scan, then click 'Place Point' "
@@ -98,8 +107,9 @@ class PinnaLandmarksPage(WizardPage):
         if wizard_state.has_downstream_state(self.state, "pinna_landmarks"):
             if not slicer.util.confirmYesNoDisplay(
                 "This will clear every step after this one (the pinna "
-                "segmentation and outline, verification, and the heatmap "
-                "result). This point is kept. Continue?"
+                "segmentation and outline, the scutum segmentation and "
+                "outline, verification, and the heatmap result). This "
+                "point is kept. Continue?"
             ):
                 return
             wizard_state.clear_downstream_state(self.state, "pinna_landmarks")

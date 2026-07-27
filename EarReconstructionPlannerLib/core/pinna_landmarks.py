@@ -37,9 +37,12 @@ class PinnaLandmarks:
 
         This is placed *before* any pinna segmentation exists (the pinna
         review page, which creates the first pinna-related 3D model,
-        doesn't run until the step after this one) -- so at this point the
-        only model in the 3D view is the already-isolated scutum defect
-        patch from the previous stage. Find this point on the slice views
+        doesn't run until the step after this one) -- and before the
+        scutum stage's own review/draw steps too (the wizard places the
+        2-point scutum ear-canal axis early, then does the whole pinna
+        stage, then comes back for scutum review/draw -- see
+        "Pinna-first wizard reorder" in CLAUDE.md), so there is no model
+        of any kind in the 3D view yet. Find this point on the slice views
         instead (same as the ear canal landmarks), not by looking for the
         pinna as a 3D model, since there isn't one yet.
     """

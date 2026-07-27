@@ -21,6 +21,15 @@ from EarReconstructionPlannerLib.pages.base_page import WizardPage
 
 class VerifyPage(WizardPage):
     def on_enter(self):
+        # The pinna's isolated model was hidden during the scutum stage
+        # (see page_scutum_review.py/page_scutum_draw.py's on_enter) so it
+        # didn't clutter the 3D view there -- both isolated meshes need to
+        # be visible here for the surgeon to actually review them.
+        if self.state.pinna_isolated_model_node is not None:
+            self.state.pinna_isolated_model_node.GetDisplayNode().SetVisibility(True)
+        if self.state.scutum_defect_model_node is not None:
+            self.state.scutum_defect_model_node.GetDisplayNode().SetVisibility(True)
+
         self.set_tutorial_text(
             "Both meshes from the earlier steps are loaded in the 3D view "
             "now -- use left-drag to rotate, scroll or right-drag to zoom, "

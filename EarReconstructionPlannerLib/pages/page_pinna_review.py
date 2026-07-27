@@ -1,7 +1,7 @@
 """
 page_pinna_review.py
 =======================
-Page 6: run the pinna region (skin surface) segmentation and let the
+Page 4: run the pinna region (skin surface) segmentation and let the
 surgeon review/adjust the threshold before drawing the pinna outline on
 the next page.
 
@@ -31,6 +31,17 @@ import config
 
 class PinnaReviewPage(WizardPage):
     def on_enter(self):
+        # Re-show this stage's own model in case it was hidden by the
+        # scutum review page (see page_scutum_review.py's on_enter) after
+        # the surgeon navigated forward into the scutum stage and then
+        # back again -- but only if it hasn't since been superseded by an
+        # isolated patch, which should stay hidden (see the "original
+        # models hidden once isolated successor exists" feature).
+        if self.state.pinna_region_model_node is not None:
+            self.state.pinna_region_model_node.GetDisplayNode().SetVisibility(
+                self.state.pinna_isolated_model_node is None
+            )
+
         self.set_tutorial_text(
             "This step finds the outer skin surface around the ear you "
             "marked (not the cartilage itself -- that gets isolated by "
@@ -153,6 +164,11 @@ class PinnaReviewPage(WizardPage):
         # exported model node the surgeon actually draws on).
         segmentation_node.GetDisplayNode().SetVisibility(False)
         self.state.pinna_region_segmentation_node = segmentation_node
+        # This freshly-built segmentation already went through
+        # run_full_postprocess() once, right above -- see
+        # _refresh_mesh_from_segmentation()'s matching comment for why
+        # this flag exists.
+        self._segmentation_edited = False
 
         # Uses the still-RAS-consistent `region_mask` so the exported
         # mesh's vertices line up correctly when loaded back into Slicer.
@@ -185,6 +201,11 @@ class PinnaReviewPage(WizardPage):
     def _on_open_segment_editor_clicked(self):
         import slicer
 
+        # Mark the segmentation as possibly touched, so
+        # _refresh_mesh_from_segmentation() knows to re-derive the mesh --
+        # see that method's comment for why this matters.
+        self._segmentation_edited = True
+
         slicer.util.selectModule("SegmentEditor")
         # Hide the drawing model and show the segmentation in its place --
         # otherwise the two would overlap in the 3D view while editing.
@@ -205,8 +226,28 @@ class PinnaReviewPage(WizardPage):
 
     def _refresh_mesh_from_segmentation(self):
         """Re-bakes the drawn-on mesh from the segmentation node's current
-        contents -- see the matching method in page_scutum_review.py for
-        the full reasoning. Called every time Next is clicked."""
+        contents, to reflect manual Segment Editor edits. Only called (see
+        on_leave_next()) if self._segmentation_edited is True -- i.e. the
+        surgeon actually opened Segment Editor since the segmentation was
+        last (re)built.
+
+        History (2026-07-27, all same day): this WAS unconditional (ran on
+        every "Next" click regardless of edits). A same-day attempt to
+        gate it was reverted, on the theory that Isolate Patch depended on
+        this exact double-processing to reliably separate from the rest
+        of the head. That theory was then DISPROVEN directly: Thomas
+        confirmed the segmentation is watertight and hole-free
+        immediately after Run Segmentation, and reproducibly gets 2 holes
+        (one in the helix, one at the top of the blob) specifically after
+        clicking Next -- i.e. specifically from THIS re-export/postprocess
+        round trip, not from the original segmentation. Gated back to
+        conditional per that direct evidence: skipping this when nothing
+        was edited keeps the mesh exactly as built (and confirmed
+        watertight) by _on_run_clicked(), avoiding the round trip that
+        was demonstrably creating the holes. If Segment Editor WAS used,
+        the freshly hand-edited content hasn't been through any
+        postprocessing yet, so re-deriving and postprocessing once here
+        is still correct and necessary."""
         import slicer
         import sitkUtils
 
@@ -258,8 +299,9 @@ class PinnaReviewPage(WizardPage):
         if wizard_state.has_downstream_state(self.state, "pinna_review"):
             if not slicer.util.confirmYesNoDisplay(
                 "This will clear every step after this one (the drawn "
-                "pinna outline, verification, and the heatmap result). "
-                "This segmentation is kept. Continue?"
+                "pinna outline, the scutum segmentation and outline, "
+                "verification, and the heatmap result). This segmentation "
+                "is kept. Continue?"
             ):
                 return
             wizard_state.clear_downstream_state(self.state, "pinna_review")
@@ -270,4 +312,11 @@ class PinnaReviewPage(WizardPage):
     def on_leave_next(self):
         if self.state.pinna_region_mesh_path is None:
             return False, "Please run the segmentation before continuing."
-        return self._refresh_mesh_from_segmentation()
+        # Only re-derive the mesh from the segmentation if Segment Editor
+        # was actually used -- confirmed directly (2026-07-27, real scan)
+        # that this re-derivation is what creates holes in the mesh, not
+        # the original segmentation, so skip it entirely when nothing
+        # changed. See _refresh_mesh_from_segmentation's docstring.
+        if getattr(self, "_segmentation_edited", False):
+            return self._refresh_mesh_from_segmentation()
+        return True, ""

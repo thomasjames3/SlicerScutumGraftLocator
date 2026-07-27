@@ -149,6 +149,21 @@ def _remove_boundary_spike(
     landmark -- opening can occasionally split the mask into more than one
     piece, and only the one actually touching/near the landmark should
     survive.
+
+    NOTE: an attempt (2026-07-27, same day) to restrict this opening to a
+    shell near the ROI sphere's own edge -- reasoning that the artifact is
+    caused by the *ROI boundary* grazing the scalp, so only material near
+    that boundary should ever be at risk -- made things worse: whatever
+    distance-from-ROI-edge threshold was tried either let the graze
+    artifact's neck survive (undoing the fix) or risked clipping real
+    anatomy, and tuning it blind (no local Slicer to test against) wasn't
+    converging. Reverted back to this simpler, whole-mask approach, which
+    Thomas already confirmed correctly removes the spike with no visible
+    anatomy loss (see Known Issues #15 in CLAUDE.md). The circular hole on
+    the helix reported afterward turned out to be a separate, unrelated
+    bug -- see page_pinna_review.py's `_refresh_mesh_from_segmentation()`
+    and its `_segmentation_edited` guard -- not something this function
+    needs to solve.
     """
     spacing = reference_image.GetSpacing()
     radius_vox = [max(1, int(round(PINNA_SPIKE_REMOVAL_RADIUS_MM / s))) for s in spacing]

@@ -1,7 +1,7 @@
 """
 page_pinna_draw.py
 =====================
-Page 7: the surgeon draws a closed outline around the pinna on the 3D
+Page 5: the surgeon draws a closed outline around the pinna on the 3D
 skin-surface mesh; the enclosed patch is extracted as the isolated pinna
 mesh for Curvature Project v4.
 
@@ -15,7 +15,7 @@ the surrounding head/scalp skin (they're physically continuous tissue), and
 the drawn outline alone doesn't always fully separate "just the pinna" from
 a sliver of that head-side attachment right where the pinna meets the skull
 near the ear canal. Reusing the *ear canal's* own canal_opening landmark
-(from the scutum stage) as the cut-plane position wasn't reliable -- it was
+(from the scutum landmarks page) as the cut-plane position wasn't reliable -- it was
 placed on a different mesh/context and doesn't necessarily sit far enough
 outward relative to this specific pinna geometry. So the surgeon marks a
 fresh point directly on THIS pinna model, at the ear canal opening, used
@@ -44,7 +44,7 @@ import os
 import numpy as np
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
 from EarReconstructionPlannerLib import wizard_state
-from core import mesh_isolate, mesh_export
+from core import mesh_isolate, mesh_export, postprocess, io_utils
 import config
 
 # Reused in on_enter() and _on_reset_page_clicked() so the tutorial text
@@ -81,6 +81,15 @@ class PinnaDrawPage(WizardPage):
         self._seed_point = None
         self._canal_fiducial_node = None
         self._canal_point = None
+
+        # Re-show the isolated patch (or, if not isolated yet, the
+        # pre-isolation region model) in case it was hidden by the scutum
+        # review page after the surgeon navigated forward into the scutum
+        # stage and then back again -- see page_scutum_review.py's on_enter.
+        if self.state.pinna_isolated_model_node is not None:
+            self.state.pinna_isolated_model_node.GetDisplayNode().SetVisibility(True)
+        elif self.state.pinna_region_model_node is not None:
+            self.state.pinna_region_model_node.GetDisplayNode().SetVisibility(True)
 
         self.ui.startCurveButton.clicked.connect(self._on_start_curve_clicked)
         self.ui.markSeedButton.clicked.connect(self._on_mark_seed_clicked)
@@ -256,6 +265,28 @@ class PinnaDrawPage(WizardPage):
         for i in range(curve_points_world.GetNumberOfPoints()):
             curve_points.append(tuple(curve_points_world.GetPoint(i)))
 
+        # TEMPORARY DIAGNOSTICS (2026-07-27) -- see CLAUDE.md Known Issues
+        # #18 follow-up. Checks whether Slicer's closed-curve auto-close
+        # segment (connecting the last click back to the first, since the
+        # surgeon isn't required to close the loop by hand) is a sane,
+        # short hop or an unexpectedly large jump -- a big jump here would
+        # mean the "closing" part of the loop cuts across the mesh in a
+        # way that doesn't actually trace the intended boundary, which
+        # would explain the seed point ending up on the wrong side of the
+        # loop entirely.
+        import numpy as _np
+        _pts = _np.asarray(curve_points)
+        _consecutive = _np.linalg.norm(_np.diff(_pts, axis=0), axis=1)
+        _wrap = _np.linalg.norm(_pts[0] - _pts[-1])
+        _all_gaps = _np.append(_consecutive, _wrap)
+        _max_gap_idx = int(_np.argmax(_all_gaps))
+        print(
+            f"[isolate diag] drawn curve: {len(curve_points)} raw points, "
+            f"median consecutive spacing {_np.median(_consecutive):.2f}mm, "
+            f"largest gap {_all_gaps[_max_gap_idx]:.2f}mm "
+            f"(at index {_max_gap_idx}{'=wrap-around/auto-close' if _max_gap_idx == len(_all_gaps) - 1 else ''})"
+        )
+
         mesh = trimesh.load(self.state.pinna_region_mesh_path)
         # The STL file on disk is LPS-numbered (see mesh_export.export_mesh's
         # docstring for why) -- flip back to RAS so mesh.vertices matches
@@ -263,30 +294,86 @@ class PinnaDrawPage(WizardPage):
         # RAS from Slicer's Markups nodes.
         mesh.vertices = mesh_export.flip_ras_lps_points(mesh.vertices)
 
+        # Crop toward the ear canal FIRST, before isolating -- Thomas's
+        # suggestion (2026-07-27), after several rounds chasing genuine
+        # topological handles (mesh.euler_number well below 2, confirmed
+        # via [isolate diag]) that survived multiple rounds of
+        # postprocessing fixes. The head-interior material this discards
+        # was always going to be thrown away eventually (this same crop
+        # used to run AFTER isolate_surface_patch, on the already-isolated
+        # patch) -- cropping first means whatever handles/tunnels are
+        # hiding in that interior material (very plausibly the ear canal's
+        # own tube-like anatomy, or postprocessing noise deep in the
+        # ROI's less-visible interior) are gone before
+        # isolate_surface_patch ever has to deal with them. Also has a
+        # useful side effect even for handles that aren't fully inside
+        # the discarded region: any handle whose "loop" crosses the cut
+        # plane gets severed into a harmless open boundary edge instead of
+        # remaining a genus-raising tunnel -- isolate_surface_patch's
+        # vertex-removal flood fill doesn't care about open boundaries at
+        # all, only about handles.
         try:
-            loop_indices = mesh_isolate.snap_points_to_vertices(mesh, curve_points)
-            patch = mesh_isolate.isolate_surface_patch(mesh, loop_indices, self._seed_point)
-
-            # Crop away anything toward the head's interior from the
-            # surgeon's own canal-opening marker on this mesh, using the
-            # ear canal's landmarks (from the earlier scutum stage) only
-            # for the "which way is inward" direction.
-            canal_landmarks = self.state.scutum_landmarks
-            if canal_landmarks.canal_opening is not None and canal_landmarks.near_eardrum is not None:
-                axis_direction = np.array(canal_landmarks.near_eardrum) - np.array(
-                    canal_landmarks.canal_opening
-                )
-                patch = mesh_isolate.crop_toward_canal(patch, self._canal_point, axis_direction)
-                # The crop can leave severed head-interior material as a
-                # disconnected island rather than removing it in one
-                # clean cut -- keep only the piece still connected to the
-                # surgeon's own seed point.
-                patch = mesh_isolate.keep_connected_component_containing(
-                    patch, self._seed_point
-                )
+            mesh = self._crop_toward_canal_if_possible(mesh)
         except ValueError as e:
             self.ui.statusLabel.setText(str(e))
             return
+
+        try:
+            loop_indices = mesh_isolate.snap_points_to_vertices(mesh, curve_points)
+            patch = mesh_isolate.isolate_surface_patch(mesh, loop_indices, self._seed_point)
+        except mesh_isolate.LoopDoesNotSeparateError as e:
+            # Confirmed on a real scan (2026-07-27) that a perfectly-drawn,
+            # densely-sampled, non-self-intersecting loop can still fail to
+            # separate this mesh -- likely an unrelated thin "handle"
+            # elsewhere on the surface (two nearby folds close enough to
+            # register as touching), more likely now that the mesh only
+            # goes through postprocessing once (see page_pinna_review.py's
+            # _segmentation_edited guard, added to stop that same
+            # postprocessing from eroding the pinna's own helix when
+            # applied twice). Rather than re-erode the reviewed mesh by
+            # default to guard against this, retry just this isolate
+            # attempt against a more heavily processed version of the same
+            # underlying segmentation -- using the SAME already-drawn
+            # curve_points/seed_point, so the surgeon never has to redraw
+            # anything. This mirrors the old, previously-reliable
+            # behavior (the mesh used to always go through postprocessing
+            # twice by the time it reached this page) but only pays that
+            # cost when actually needed.
+            self.ui.statusLabel.setText(
+                "That outline didn't isolate cleanly -- retrying against a "
+                "more thoroughly cleaned-up version of the segmentation..."
+            )
+            slicer.app.processEvents()
+            fallback_mesh = self._build_fallback_mesh()
+            if fallback_mesh is None:
+                self.ui.statusLabel.setText(str(e))
+                return
+            try:
+                # Crop the fallback mesh too, same reasoning as the
+                # primary attempt above.
+                fallback_mesh = self._crop_toward_canal_if_possible(fallback_mesh)
+                loop_indices = mesh_isolate.snap_points_to_vertices(fallback_mesh, curve_points)
+                patch = mesh_isolate.isolate_surface_patch(
+                    fallback_mesh, loop_indices, self._seed_point
+                )
+            except ValueError:
+                # The fallback didn't help either -- report the original
+                # error, since it's the more informative one (mentions the
+                # actual mesh-topology explanation, not a generic failure).
+                self.ui.statusLabel.setText(str(e))
+                return
+        except ValueError as e:
+            # Any other failure (too few points, a gap enclosing zero
+            # vertices, a disconnected seed) needs the surgeon to actually
+            # redraw or re-click -- not retry-worthy, unlike
+            # LoopDoesNotSeparateError above.
+            self.ui.statusLabel.setText(str(e))
+            return
+
+        # Note: the head-interior crop used to happen here, AFTER
+        # isolation -- it now happens BEFORE, on the whole pre-isolation
+        # mesh (see _crop_toward_canal_if_possible() above), so there's
+        # nothing left to crop from `patch` at this point.
 
         output_path = os.path.join(
             self.state.working_dir or slicer.app.temporaryPath, "pinna_isolated.stl"
@@ -323,6 +410,86 @@ class PinnaDrawPage(WizardPage):
             "Check it in the 3D view, then click Next."
         )
 
+    def _crop_toward_canal_if_possible(self, mesh):
+        """Crops `mesh` toward the interior of the head using the
+        surgeon's canal-opening marker (self._canal_point) and the ear
+        canal's own axis direction (from the earlier scutum landmarks
+        page), then keeps only whatever's still connected to the seed
+        point. No-ops (returns `mesh` unchanged) if the ear canal
+        landmarks aren't available.
+
+        Moved to run BEFORE isolate_surface_patch (2026-07-27, Thomas's
+        suggestion) -- see the comment at its call site in
+        _on_isolate_clicked() for why cropping first, rather than after,
+        helps with genuine mesh-topology handles."""
+        canal_landmarks = self.state.scutum_landmarks
+        if canal_landmarks.canal_opening is None or canal_landmarks.near_eardrum is None:
+            return mesh
+        axis_direction = np.array(canal_landmarks.near_eardrum) - np.array(
+            canal_landmarks.canal_opening
+        )
+        mesh = mesh_isolate.crop_toward_canal(mesh, self._canal_point, axis_direction)
+        # The crop can leave severed head-interior material as a
+        # disconnected island rather than removing it in one clean cut --
+        # keep only the piece still connected to the surgeon's own seed
+        # point.
+        return mesh_isolate.keep_connected_component_containing(mesh, self._seed_point)
+
+    def _build_fallback_mesh(self):
+        """Re-derives a more heavily postprocessed pinna mesh from the
+        current segmentation node, for isolate_surface_patch() to retry
+        against after a LoopDoesNotSeparateError. Purely local to this one
+        isolate attempt -- does NOT touch state.pinna_region_mesh_path or
+        state.pinna_region_model_node, so the Review page's displayed mesh
+        (and its helix, protected by only postprocessing once -- see
+        page_pinna_review.py) is never affected by this fallback. Mirrors
+        page_pinna_review.py's _refresh_mesh_from_segmentation(), minus
+        the parts that write to a file/load a model, since this mesh is
+        only needed in memory, transiently, here.
+
+        Returns None if there's no segmentation node to rebuild from, or
+        if the rebuilt result is empty -- both treated as "fallback not
+        available" by the caller.
+        """
+        import slicer
+        import sitkUtils
+
+        segmentation_node = self.state.pinna_region_segmentation_node
+        if segmentation_node is None:
+            return None
+
+        temp_label_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode", "PinnaRegionFallback"
+        )
+        try:
+            slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
+                segmentation_node, temp_label_node
+            )
+            sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(temp_label_node))
+        finally:
+            slicer.mrmlScene.RemoveNode(temp_label_node)
+
+        # A second postprocessing pass, on top of whatever's already baked
+        # into the segmentation -- this is exactly the "double
+        # postprocessing" that used to always happen by the time a
+        # surgeon reached this page (before page_pinna_review.py's
+        # _segmentation_edited guard stopped it from happening
+        # unconditionally). It was found to erode the helix when applied
+        # to the *reviewed/displayed* mesh -- but used only transiently
+        # here, to recover a working isolate result, that tradeoff is
+        # worth it: an isolate failure blocks the whole wizard, while this
+        # fallback mesh is discarded immediately after use.
+        sitk_image = postprocess.run_full_postprocess(sitk_image)
+
+        try:
+            mesh = mesh_export.label_map_to_mesh(sitk_image)
+        except mesh_export.EmptySegmentationError:
+            return None
+
+        if len(mesh.vertices) == 0:
+            return None
+        return mesh
+
     def _on_reset_page_clicked(self):
         import slicer
 
@@ -357,9 +524,9 @@ class PinnaDrawPage(WizardPage):
 
         if wizard_state.has_downstream_state(self.state, "pinna_draw"):
             if not slicer.util.confirmYesNoDisplay(
-                "This will clear every step after this one (verification "
-                "and the heatmap result). This isolated patch is kept. "
-                "Continue?"
+                "This will clear every step after this one (the scutum "
+                "segmentation and outline, verification, and the heatmap "
+                "result). This isolated patch is kept. Continue?"
             ):
                 return
             wizard_state.clear_downstream_state(self.state, "pinna_draw")

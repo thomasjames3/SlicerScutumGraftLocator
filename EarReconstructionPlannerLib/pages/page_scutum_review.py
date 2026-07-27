@@ -1,7 +1,7 @@
 """
 page_scutum_review.py
 ========================
-Page 3: run the bone-wall segmentation and let the surgeon review/adjust
+Page 6: run the bone-wall segmentation and let the surgeon review/adjust
 it before moving on.
 
 Two sliders (air threshold, bone threshold) mirror config.py's tunable
@@ -32,6 +32,23 @@ import config
 
 class ScutumReviewPage(WizardPage):
     def on_enter(self):
+        # The scutum stage resumes here after the whole pinna stage (see
+        # "Pinna-first wizard reorder" in CLAUDE.md) -- hide the pinna's
+        # finished models/landmarks now, since they were left visible from
+        # that earlier stage and would otherwise clutter the 3D view while
+        # reviewing the bone-wall segmentation. Re-show the scutum
+        # ear-canal-axis points, hidden during the pinna stage (see
+        # page_pinna_landmarks.py's on_enter) since they're relevant again
+        # now.
+        if self.state.pinna_region_model_node is not None:
+            self.state.pinna_region_model_node.GetDisplayNode().SetVisibility(False)
+        if self.state.pinna_isolated_model_node is not None:
+            self.state.pinna_isolated_model_node.GetDisplayNode().SetVisibility(False)
+        if self.state.pinna_landmarks_fiducial_node is not None:
+            self.state.pinna_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
+        if self.state.scutum_landmarks_fiducial_node is not None:
+            self.state.scutum_landmarks_fiducial_node.GetDisplayNode().SetVisibility(True)
+
         self.set_tutorial_text(
             "This step automatically finds the bone wall of the ear canal "
             "near the 2 points you placed. The two sliders control how "
@@ -163,6 +180,11 @@ class ScutumReviewPage(WizardPage):
         # visible to work on it.
         segmentation_node.GetDisplayNode().SetVisibility(False)
         self.state.scutum_bone_wall_segmentation_node = segmentation_node
+        # This freshly-built segmentation already went through
+        # run_full_postprocess() once, right above -- see
+        # _refresh_mesh_from_segmentation()'s matching comment for why
+        # this flag exists.
+        self._segmentation_edited = False
 
         # Also export a mesh now -- the draw page (next-but-one) needs an
         # actual surface to draw on, and re-running mesh export there would
@@ -214,6 +236,11 @@ class ScutumReviewPage(WizardPage):
     def _on_open_segment_editor_clicked(self):
         import slicer
 
+        # Mark the segmentation as possibly touched, so
+        # _refresh_mesh_from_segmentation() knows to re-postprocess it --
+        # see that method's comment for why this matters.
+        self._segmentation_edited = True
+
         slicer.util.selectModule("SegmentEditor")
         # Hide the drawing model and show the segmentation in its place --
         # otherwise the two would overlap in the 3D view while editing.
@@ -234,12 +261,21 @@ class ScutumReviewPage(WizardPage):
 
     def _refresh_mesh_from_segmentation(self):
         """Re-bakes the drawn-on mesh from the segmentation node's current
-        contents, so any manual Segment Editor touch-ups are reflected
-        before the surgeon draws the defect outline on it. Called every
-        time Next is clicked (not just when Segment Editor was actually
-        used) -- cheap, and means the draw page always matches whatever is
-        currently in the segmentation node rather than the stale,
-        pre-edit mesh."""
+        contents, to reflect manual Segment Editor edits. Only called (see
+        on_leave_next()) if self._segmentation_edited is True -- i.e. the
+        surgeon actually opened Segment Editor since this segmentation was
+        last (re)built. Skipped entirely otherwise: see the matching
+        comment in page_pinna_review.py's version of this method -- even
+        without reapplying postprocessing, routing an *unedited*
+        segmentation back through ExportVisibleSegmentsToLabelmapNode ->
+        PullVolumeFromSlicer -> marching cubes isn't guaranteed to
+        reproduce the exact mesh already built (and already reviewed) in
+        _on_run_clicked(), and confirmed on a real scan (2026-07-27, pinna
+        stage) that this round trip can erode real thin anatomy for no
+        benefit when nothing actually changed. Same risk applies here in
+        principle. If Segment Editor WAS used, the freshly hand-edited
+        content hasn't been postprocessed at all yet, so re-deriving and
+        postprocessing once here is still correct and necessary."""
         import slicer
         import sitkUtils
 
@@ -304,4 +340,10 @@ class ScutumReviewPage(WizardPage):
     def on_leave_next(self):
         if self.state.scutum_bone_wall_mesh_path is None:
             return False, "Please run the segmentation before continuing."
-        return self._refresh_mesh_from_segmentation()
+        # Only re-derive the mesh from the segmentation if Segment Editor
+        # was actually used -- see _refresh_mesh_from_segmentation's
+        # docstring for why doing this unconditionally is both pointless
+        # and risky when nothing was actually edited.
+        if getattr(self, "_segmentation_edited", False):
+            return self._refresh_mesh_from_segmentation()
+        return True, ""

@@ -34,23 +34,35 @@ class WizardState:
     # instead of a per-page field prevents the two ever disagreeing.
     ear_side: Optional[str] = None
 
-    # --- Pages 2-4: Scutum (ear canal bone wall + defect outline) ---
+    # --- Page 2: Scutum landmarks only (ear canal axis) ---
+    # Placed early, before any pinna work, even though the rest of the
+    # scutum stage (review/draw, pages 6-7) now runs after the pinna stage.
+    # This is a deliberate split, not an oversight: the pinna draw page's
+    # canal-crop feature needs this axis's *direction* (near_eardrum -
+    # canal_opening) to know which way is "into the head" when trimming the
+    # isolated pinna patch, so it has to exist before pinna_draw runs. It's
+    # just 2 quick clicks (no segmentation), so placing it first doesn't
+    # cost the surgeon anything -- see "Pinna-first wizard reorder" in
+    # CLAUDE.md for the full reasoning and why the rest of the scutum stage
+    # moved instead of this.
     scutum_landmarks: EarCanalLandmarks = field(default_factory=EarCanalLandmarks)
-    scutum_landmarks_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, hidden once drawing starts
-    scutum_bone_wall_segmentation_node = None  # vtkMRMLSegmentationNode, hands off to Segment Editor for manual touch-ups
-    scutum_bone_wall_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
-    scutum_bone_wall_mesh_path: Optional[str] = None
-    scutum_defect_mesh_path: Optional[str] = None  # after the drawn-outline isolation step
-    scutum_defect_model_node = None  # vtkMRMLModelNode for the isolated defect patch
+    scutum_landmarks_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, hidden during the pinna stage, re-shown for scutum review/draw
 
-    # --- Pages 5-7: Pinna ---
+    # --- Pages 3-5: Pinna (landmarks, review, draw) ---
     pinna_landmarks: PinnaLandmarks = field(default_factory=PinnaLandmarks)
     pinna_landmarks_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, hidden once drawing starts
     pinna_region_segmentation_node = None  # vtkMRMLSegmentationNode, hands off to Segment Editor for manual touch-ups
     pinna_region_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
     pinna_region_mesh_path: Optional[str] = None
     pinna_isolated_mesh_path: Optional[str] = None  # after the drawn-outline isolation step
-    pinna_isolated_model_node = None  # vtkMRMLModelNode for the isolated pinna patch
+    pinna_isolated_model_node = None  # vtkMRMLModelNode for the isolated pinna patch, hidden during the scutum stage, re-shown for Verify
+
+    # --- Pages 6-7: Scutum review + draw (ear canal bone wall + defect outline) ---
+    scutum_bone_wall_segmentation_node = None  # vtkMRMLSegmentationNode, hands off to Segment Editor for manual touch-ups
+    scutum_bone_wall_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
+    scutum_bone_wall_mesh_path: Optional[str] = None
+    scutum_defect_mesh_path: Optional[str] = None  # after the drawn-outline isolation step
+    scutum_defect_model_node = None  # vtkMRMLModelNode for the isolated defect patch
 
     # --- Page 8: Verify ---
     surgeon_approved_scutum: bool = False
@@ -82,11 +94,11 @@ PAGE_ORDER = [
     ("welcome", "page_welcome.ui", "WelcomePage"),
     ("dicom_load", "page_dicom_load.ui", "DicomLoadPage"),
     ("scutum_landmarks", "page_scutum_landmarks.ui", "ScutumLandmarksPage"),
-    ("scutum_review", "page_scutum_review.ui", "ScutumReviewPage"),
-    ("scutum_draw", "page_scutum_draw.ui", "ScutumDrawPage"),
     ("pinna_landmarks", "page_pinna_landmarks.ui", "PinnaLandmarksPage"),
     ("pinna_review", "page_pinna_review.ui", "PinnaReviewPage"),
     ("pinna_draw", "page_pinna_draw.ui", "PinnaDrawPage"),
+    ("scutum_review", "page_scutum_review.ui", "ScutumReviewPage"),
+    ("scutum_draw", "page_scutum_draw.ui", "ScutumDrawPage"),
     ("verify", "page_verify.ui", "VerifyPage"),
     ("curvature", "page_curvature.ui", "CurvaturePage"),
 ]
@@ -100,12 +112,6 @@ PAGE_ORDER = [
 PAGE_OWNED_FIELDS = {
     "dicom_load": ["volume_node", "ear_side"],
     "scutum_landmarks": ["scutum_landmarks", "scutum_landmarks_fiducial_node"],
-    "scutum_review": [
-        "scutum_bone_wall_segmentation_node",
-        "scutum_bone_wall_model_node",
-        "scutum_bone_wall_mesh_path",
-    ],
-    "scutum_draw": ["scutum_defect_mesh_path", "scutum_defect_model_node"],
     "pinna_landmarks": ["pinna_landmarks", "pinna_landmarks_fiducial_node"],
     "pinna_review": [
         "pinna_region_segmentation_node",
@@ -113,6 +119,12 @@ PAGE_OWNED_FIELDS = {
         "pinna_region_mesh_path",
     ],
     "pinna_draw": ["pinna_isolated_mesh_path", "pinna_isolated_model_node"],
+    "scutum_review": [
+        "scutum_bone_wall_segmentation_node",
+        "scutum_bone_wall_model_node",
+        "scutum_bone_wall_mesh_path",
+    ],
+    "scutum_draw": ["scutum_defect_mesh_path", "scutum_defect_model_node"],
     "verify": ["surgeon_approved_scutum", "surgeon_approved_pinna"],
     "curvature": ["heatmap_output_path", "heatmap_model_node", "ranked_sites_csv_path"],
 }

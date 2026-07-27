@@ -158,8 +158,8 @@ class ScutumLandmarksPage(WizardPage):
 
         if wizard_state.has_downstream_state(self.state, "scutum_landmarks"):
             if not slicer.util.confirmYesNoDisplay(
-                "This will clear every step after this one (the scutum "
-                "segmentation and outline, the pinna steps, verification, "
+                "This will clear every step after this one (the pinna "
+                "steps, the scutum segmentation and outline, verification, "
                 "and the heatmap result). These 2 points are kept. Continue?"
             ):
                 return
