@@ -131,16 +131,38 @@ class ScutumReviewPage(WizardPage):
         )
         bone_wall = postprocess.run_full_postprocess(bone_wall)
 
-        # Push into Slicer as a labelmap node so the surgeon can see it in
-        # the slice/3D views and hand it to Segment Editor.
-        label_node = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLLabelMapVolumeNode", "ScutumBoneWall"
+        # Push into a segmentation node (not a plain labelmap) so it's
+        # something Segment Editor can actually operate on -- Segment
+        # Editor edits vtkMRMLSegmentationNodes, not label map volumes
+        # directly. The labelmap node here is just a throwaway bridge for
+        # the conversion Slicer's segmentations logic expects; it's
+        # removed once the segmentation node owns the data.
+        temp_label_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode", "ScutumBoneWallTemp"
         )
         # bone_wall is RAS-consistent (inherited from the flipped
         # sitk_image above); flip back to LPS since PushVolumeToSlicer
         # expects plain ITK convention and converts LPS->RAS itself.
-        sitkUtils.PushVolumeToSlicer(io_utils.flip_ras_lps(bone_wall), label_node)
-        self.state.scutum_bone_wall_label_node = label_node
+        sitkUtils.PushVolumeToSlicer(io_utils.flip_ras_lps(bone_wall), temp_label_node)
+
+        if self.state.scutum_bone_wall_segmentation_node is not None:
+            slicer.mrmlScene.RemoveNode(self.state.scutum_bone_wall_segmentation_node)
+        segmentation_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", "ScutumBoneWallSegmentation"
+        )
+        segmentation_node.CreateDefaultDisplayNodes()
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+            temp_label_node, segmentation_node
+        )
+        slicer.mrmlScene.RemoveNode(temp_label_node)
+        # Hidden by default -- the exported/smoothed model node below is
+        # what the surgeon sees and draws on in the 3D view. Without this,
+        # the segmentation's own auto-generated 3D surface would sit right
+        # on top of that model as a visually-duplicated, unsmoothed copy.
+        # Segment Editor's own slice-view painting doesn't need this node
+        # visible to work on it.
+        segmentation_node.GetDisplayNode().SetVisibility(False)
+        self.state.scutum_bone_wall_segmentation_node = segmentation_node
 
         # Also export a mesh now -- the draw page (next-but-one) needs an
         # actual surface to draw on, and re-running mesh export there would
@@ -191,7 +213,71 @@ class ScutumReviewPage(WizardPage):
 
     def _on_open_segment_editor_clicked(self):
         import slicer
+
         slicer.util.selectModule("SegmentEditor")
+        # Hide the drawing model and show the segmentation in its place --
+        # otherwise the two would overlap in the 3D view while editing.
+        if self.state.scutum_bone_wall_model_node is not None:
+            self.state.scutum_bone_wall_model_node.GetDisplayNode().SetVisibility(False)
+        segmentation_display_node = self.state.scutum_bone_wall_segmentation_node.GetDisplayNode()
+        segmentation_display_node.SetVisibility(True)
+        segmentation_display_node.SetVisibility3D(True)
+        editor_widget = slicer.modules.segmenteditor.widgetRepresentation().self().editor
+        editor_widget.setSegmentationNode(self.state.scutum_bone_wall_segmentation_node)
+        # Slicer 5.2+ renamed "master volume" to "source volume" -- support
+        # both since this hasn't been runtime-tested against a specific
+        # Slicer version.
+        if hasattr(editor_widget, "setSourceVolumeNode"):
+            editor_widget.setSourceVolumeNode(self.state.volume_node)
+        else:
+            editor_widget.setMasterVolumeNode(self.state.volume_node)
+
+    def _refresh_mesh_from_segmentation(self):
+        """Re-bakes the drawn-on mesh from the segmentation node's current
+        contents, so any manual Segment Editor touch-ups are reflected
+        before the surgeon draws the defect outline on it. Called every
+        time Next is clicked (not just when Segment Editor was actually
+        used) -- cheap, and means the draw page always matches whatever is
+        currently in the segmentation node rather than the stale,
+        pre-edit mesh."""
+        import slicer
+        import sitkUtils
+
+        segmentation_node = self.state.scutum_bone_wall_segmentation_node
+        if segmentation_node is None:
+            return True, ""
+
+        temp_label_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode", "ScutumBoneWallEdited"
+        )
+        slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
+            segmentation_node, temp_label_node
+        )
+        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(temp_label_node))
+        slicer.mrmlScene.RemoveNode(temp_label_node)
+        sitk_image = postprocess.run_full_postprocess(sitk_image)
+
+        try:
+            mesh = mesh_export.label_map_to_mesh(sitk_image)
+        except mesh_export.EmptySegmentationError:
+            return False, (
+                "The segmentation is empty after your Segment Editor edits. "
+                "Go back to Segment Editor and add material back, or "
+                "re-run the automatic segmentation."
+            )
+
+        mesh_export.export_mesh(mesh, self.state.scutum_bone_wall_mesh_path)
+        if self.state.scutum_bone_wall_model_node is not None:
+            slicer.mrmlScene.RemoveNode(self.state.scutum_bone_wall_model_node)
+        self.state.scutum_bone_wall_model_node = slicer.util.loadModel(
+            self.state.scutum_bone_wall_mesh_path
+        )
+        self.state.scutum_bone_wall_model_node.GetDisplayNode().SetVisibility(True)
+        # Hide the segmentation again now that the refreshed model node is
+        # showing the same thing -- keeps it from visually duplicating the
+        # drawing model on the next page.
+        segmentation_node.GetDisplayNode().SetVisibility(False)
+        return True, ""
 
     def _on_reset_page_clicked(self):
         wizard_state.clear_page_state(self.state, "scutum_review")
@@ -218,4 +304,4 @@ class ScutumReviewPage(WizardPage):
     def on_leave_next(self):
         if self.state.scutum_bone_wall_mesh_path is None:
             return False, "Please run the segmentation before continuing."
-        return True, ""
+        return self._refresh_mesh_from_segmentation()

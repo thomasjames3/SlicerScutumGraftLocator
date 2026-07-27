@@ -56,13 +56,14 @@ and working:
   marker + isolate pinna patch, cropped toward the ear canal and cleaned
   of disconnected islands).
 
-**Update, since regressed:** pinna review's segmentation is currently
-broken again -- throws `EmptySegmentationError` ("no bone wall was
-found", though the actual failure is the pinna's skin/air threshold
-finding nothing). Not caused by this session's edits (confirmed via
-`git diff` against HEAD). See Known Issues #7 below -- unresolved as of
-the last session; a config.py range widening was tried and Thomas
-confirmed it did NOT fully fix it. Start there next time.
+**RESOLVED (2026-07-27):** the pinna review `EmptySegmentationError`
+regression (previously Known Issues #7) is fixed, and so is a
+long-standing pinna-model cosmetic artifact ("skinny line" sticking out
+near the top). See "Bugs already found and fixed" #14 and #15 below for
+full detail -- both confirmed working by Thomas. Diagnostic
+`print("[pinna diag] ...")` statements added to reach the root cause of
+#14 are still in `segment_pinna_threshold.py`/`page_pinna_review.py`
+(harmless, console-only) -- safe to strip once stable across more scans.
 
 **Not yet exercised in this project's testing:**
 - The **Verify page** (page 8) and the **Curvature page** (page 9)'s Qt
@@ -650,57 +651,21 @@ projected footprint shape (not a circle) -> exports `pinna_heatmap.ply`
    probably fixed, but never explicitly reconfirmed by Thomas. If it
    resurfaces, that's a signal the speculative fixes weren't the actual
    cause.
-7. **UNRESOLVED: pinna segmentation (Pinna review page) throws
-   `EmptySegmentationError`** -- `mesh_export.label_map_to_mesh()` raises
-   "The segmentation is empty -- no bone wall was found" (that message's
-   wording is scutum-flavored/generic, reused here; the actual failure is
-   in `segment_pinna_threshold.segment_pinna_region()` finding zero
-   voxels above `SKIN_AIR_THRESHOLD` within the ROI). Confirmed this is
-   NOT a regression from this session's edits -- `git diff` against the
-   last commit showed `roi_crop.py`, `segment_pinna_threshold.py`,
-   `mesh_export.py`, and `postprocess.py` byte-identical to HEAD; nothing
-   in this session touched the actual segmentation math.
-
-   Leading hypothesis (not yet confirmed): this scan's intensity values
-   may be shifted from standard Hounsfield units. Evidence: `config.py`'s
-   `DEFAULT_BONE_THRESHOLD` had already been dropped from 300 to 100 (and
-   `BONE_THRESHOLD_ADJUST_RANGE`'s floor widened to -200) based on
-   Thomas's own experimentation finding the *bone* threshold needed to go
-   much lower than the standard-HU default -- if that's true for bone, the
-   skin/air boundary (`SKIN_AIR_THRESHOLD = -300`) may need to shift lower
-   too, which would exactly explain zero voxels clearing the threshold.
-
-   As a first, non-guessing step, `SKIN_THRESHOLD_ADJUST_RANGE` was
-   widened from `(-600, 0)` to `(-900, 0)` in `config.py` so the skin
-   threshold slider can be dragged much lower without editing the file by
-   hand, and Thomas was asked to try progressively lower slider values on
-   the Pinna review page and report which one (if any) first produces a
-   non-empty result.
-
-   **Thomas has since said this doesn't fully resolve it** -- so the
-   range widening was NOT the fix (or wasn't the whole fix). **Start here
-   next session.** Things to check that haven't been done yet:
-   - Get the actual slider value(s) Thomas tried and whether *any* value
-     produces a non-empty segmentation, or whether it's empty across the
-     entire range -- if even the widened range never works, the
-     bone-threshold-drop hypothesis above is probably wrong and the real
-     cause is elsewhere (e.g. the ROI/crop math, or the `ear_center`
-     landmark placement, or the scan itself).
-   - Double check `roi_crop.crop_to_point_region()` /
-     `build_spherical_roi_mask()` actually produce a non-empty ROI around
-     `ear_center` for this specific scan -- add a quick print/log of
-     `roi_mask` voxel count before thresholding, since an empty ROI would
-     produce this exact symptom regardless of threshold.
-   - Consider whether the scutum (bone wall) pipeline is *also* still
-     broken for this same scan/patient with its own new lower defaults,
-     or whether scutum segmentation is working fine now and only pinna
-     is broken -- that comparison would help confirm or rule out the
-     shared-intensity-calibration hypothesis.
-   - If the intensity-shift hypothesis holds up, consider whether the
-     scan actually needs `RescaleSlope`/`RescaleIntercept` DICOM tags
-     applied that aren't being read/applied somewhere in the load path
-     (`io_utils.py`), rather than just chasing the threshold values
-     around as a workaround.
+7. **RESOLVED (2026-07-27): pinna segmentation (Pinna review page) threw
+   `EmptySegmentationError`.** Root cause was never the threshold values
+   (the `SKIN_THRESHOLD_ADJUST_RANGE` widening tried in earlier sessions
+   was a reasonable guess but not the actual fix). Diagnostic prints
+   added to `segment_pinna_threshold.py`/`page_pinna_review.py` proved
+   the ROI and threshold were both fine (millions of voxels passing), but
+   thresholding fragmented the region into 135 disconnected components on
+   Thomas's (noisy/artifact-heavy) scan -- `_closest_component_to_point()`
+   picked a component by nearest *center-of-mass* distance to
+   `ear_center`, which a large real-skin blob can lose to a tiny noise
+   speck sitting right next to the landmark; `postprocess.
+   remove_small_specks()` then deleted that speck, leaving an all-zero
+   mask. Fixed by switching the selection to nearest-*voxel* distance
+   (`scipy.ndimage.distance_transform_edt`). Full detail in "Bugs already
+   found and fixed" #14 and in the "Current status" section above.
 
 ---
 
@@ -971,6 +936,170 @@ projected footprint shape (not a circle) -> exports `pinna_heatmap.ply`
     path between them. A new `ValueError` covers the (rare) case where
     two consecutive points aren't connected on the mesh surface at all
     (disconnected mesh components).
+
+14. **`segment_pinna_threshold._closest_component_to_point()` selected
+    scan-noise specks over the real skin-surface blob on artifact-heavy
+    scans.** This is the real root cause of Known Issues #7's
+    `EmptySegmentationError`, chased across several earlier sessions via
+    threshold/config guesses that never fully fixed it. Diagnosed with
+    temporary `print("[pinna diag] ...")` statements added to
+    `segment_pinna_threshold.py`/`page_pinna_review.py` (still in place,
+    harmless -- visible in Slicer's Python console, View > Python
+    console): on the failing scan, the ROI (3.7M voxels) and threshold
+    (1.68M voxels passing) were both completely fine, but thresholding
+    fragmented the region into **135 disconnected components**. The
+    original selection picked whichever component's *center of mass* was
+    closest to `ear_center` -- but the real skin-surface component is a
+    large, irregular blob whose center of mass can sit far from the
+    landmark (e.g. it bulges toward the neck/scalp), while a small
+    scan-noise speck immediately next to the click can have a center of
+    mass much closer. The speck won, then `postprocess.
+    remove_small_specks()` deleted it entirely (below
+    `MIN_COMPONENT_VOLUME_MM3`), leaving an all-zero mask that only
+    surfaced later, at `mesh_export.label_map_to_mesh()`, as a generic
+    "no bone wall was found" error with no link back to the real cause.
+    This also explains why the exact same code worked on a different
+    computer: that test scan likely had far less fragmentation, so the
+    flawed heuristic never got triggered.
+
+    Fixed by rewriting `_closest_component_to_point()` to select by
+    nearest-*voxel* distance instead: convert `ear_center` to an array
+    index: `sitk.Image.TransformPhysicalPointToContinuousIndex()`, and if
+    that voxel is inside a component, use its label directly; otherwise
+    use `scipy.ndimage.distance_transform_edt(..., return_indices=True)`
+    to find the nearest voxel that IS part of a component and use its
+    label. This picks whichever blob the landmark is actually
+    touching/closest to, independent of that blob's overall shape/spread
+    -- much more robust to fragmentation than center-of-mass distance.
+    **Confirmed working by Thomas** on his first retest.
+15. **Recurring cosmetic artifact: a thin "skinny line" sticking out
+    (usually near the top) of the pre-draw pinna region model.** Present
+    across many sessions/scans but never flagged as a priority since the
+    surgeon's drawn outline (next page) just routes around it -- fixed
+    once raised. Root cause: `PINNA_ROI_RADIUS_MM`'s spherical ROI can
+    graze the scalp surface almost tangentially near its edge, leaving a
+    thin wedge of tissue attached to the main blob by a narrow neck (a
+    classic artifact of intersecting a sphere with a curved surface near
+    the tangent point). Fixed with a new
+    `segment_pinna_threshold._remove_boundary_spike()`, called right
+    after component selection: a morphological opening (erode then
+    dilate) sized in physical mm via a new `PINNA_SPIKE_REMOVAL_RADIUS_MM`
+    config constant (1.5mm default) -- converted to a per-axis voxel
+    radius from the scan's own spacing, NOT a fixed voxel count, so it
+    behaves consistently across scans with different spacing (a fixed
+    voxel-count kernel, like the 1-voxel radius already used elsewhere in
+    `postprocess.smooth_boundary()`, would be a much smaller physical
+    radius on a fine-spacing scan than a coarse one, which is likely why
+    this artifact was inconsistent rather than reliably cleaned up by
+    the existing postprocessing). Since this pipeline stage is still a
+    blobby "head skin near the ear" mask (not yet isolated to the
+    delicate ear folds themselves -- that's the surgeon's drawn outline's
+    job), a small opening radius here is safe and shouldn't visibly
+    affect real anatomy. If opening splits the mask into multiple pieces,
+    the same nearest-voxel `_closest_component_to_point()` re-selects the
+    piece actually near `ear_center`. **Confirmed working by Thomas** --
+    the spike is gone and segmentation quality is otherwise unaffected.
+
+16. **Drawn outline/seed points rendered far too large until the "recenter
+    3D view" button was pressed.** Reported by Thomas as a long-standing,
+    low-priority annoyance on the draw pages. Root cause: Slicer's
+    default Markups point size (`vtkMRMLMarkupsDisplayNode.GlyphScale`)
+    is a *percentage of screen size*, recomputed from the 3D view's
+    camera scale factor -- right after a curve/fiducial node is freshly
+    created, that scale factor can still be stale (left over from
+    whatever camera/clipping state the previous page ended on), so points
+    render far too large until something (e.g. pressing "recenter",
+    which forces a camera/clipping recompute) refreshes it. Deliberately
+    did NOT fix this by calling the existing `recenter_3d_view()` helper
+    at curve-creation time -- that also reorients the camera to a
+    canonical left/right anatomical view (`lookFromAxis`), which would
+    silently discard the camera angle the surgeon is explicitly told to
+    set up *before* clicking "Start Outline" (see each draw page's step-1
+    tutorial text). Instead, added `base_page.WizardPage.
+    set_absolute_point_size(markups_node, size_mm)`: sets
+    `UseGlyphScale(False)` + a fixed `GlyphSize` in mm, which sidesteps
+    the stale-scale-factor computation entirely (points are always this
+    physical size, independent of any camera state) and never touches
+    the camera. Called right after every markups node creation on both
+    draw pages: the outline curve and seed point (`page_scutum_draw.py`),
+    and the outline curve, seed point, and canal-opening marker
+    (`page_pinna_draw.py`). **Confirmed working** (points no longer
+    depend on camera state / recenter).
+
+    `size_mm` is a required argument, not a single shared config
+    constant, because the scutum and pinna outlines are drawn at very
+    different physical scales -- one shared value didn't work for both.
+    Tuned independently in `config.py`: `SCUTUM_DRAW_POINT_SIZE_MM = 0.3`,
+    `PINNA_DRAW_POINT_SIZE_MM = 2.0`.
+
+17. **"Open Segment Editor" did literally nothing useful -- it opened the
+    module but handed it no data to edit.** Thomas caught this: both
+    review pages only ever pushed a `vtkMRMLLabelMapVolumeNode` into the
+    scene, but Segment Editor edits `vtkMRMLSegmentationNode`s, not plain
+    labelmap volumes -- the button's `_on_open_segment_editor_clicked`
+    was just `slicer.util.selectModule("SegmentEditor")`, which opened an
+    empty editor with nothing selected. Fixed in both
+    `page_scutum_review.py`/`page_pinna_review.py`'s `_on_run_clicked` by
+    converting the segmentation result into a real segmentation node
+    right after building it (`slicer.modules.segmentations.logic().
+    ImportLabelmapToSegmentationNode()`, via a throwaway labelmap bridge
+    that's removed immediately after), stored as
+    `state.scutum_bone_wall_segmentation_node` /
+    `state.pinna_region_segmentation_node` (replacing the old, otherwise
+    unused `..._label_node` fields in `WizardState`/
+    `PAGE_OWNED_FIELDS` -- those were never read anywhere except by this
+    button, so this wasn't a behavior-preserving rename, it's a real
+    replacement).
+
+    `_on_open_segment_editor_clicked` now actually wires the module:
+    after `selectModule`, it reaches into
+    `slicer.modules.segmenteditor.widgetRepresentation().self().editor`
+    and calls `setSegmentationNode(...)` + `setSourceVolumeNode(...)`
+    (falling back to the older `setMasterVolumeNode` name via `hasattr`,
+    since Slicer 5.2 renamed "master volume" to "source volume" and which
+    one Thomas's install uses hasn't been confirmed -- same "flagged, not
+    yet runtime-tested" caveat as everywhere else in this doc without a
+    local Slicer).
+
+    The segmentation node is created **hidden** (`GetDisplayNode().
+    SetVisibility(False)`) and only shown while Segment Editor is
+    actually open -- `CreateDefaultDisplayNodes()` auto-generates a 3D
+    surface for it, which would otherwise sit visually on top of the
+    already-loaded, already-smoothed drawing model as a confusing
+    duplicate. `_on_open_segment_editor_clicked` swaps visibility
+    explicitly when opening -- hides the drawing model node and shows the
+    segmentation (`SetVisibility(True)` **and** `SetVisibility3D(True)`,
+    since a segmentation display node's overall visibility flag and its
+    per-representation 3D visibility flag are separate) -- and
+    `_refresh_mesh_from_segmentation()` swaps them back (re-shows the
+    freshly reloaded model node, re-hides the segmentation) once the
+    surgeon returns and clicks Next.
+
+    The other real piece: manual edits have to actually flow back into
+    the mesh the surgeon draws on next, since drawing works off the
+    exported STL, not the segmentation node. Both pages now have a
+    `_refresh_mesh_from_segmentation()`, called from `on_leave_next()`
+    every time Next is clicked (regardless of whether Segment Editor was
+    actually touched -- cheap, and removes any risk of a stale pre-edit
+    mesh silently going to the draw page instead). It exports the
+    segmentation node's current contents back to a labelmap
+    (`ExportVisibleSegmentsToLabelmapNode`), applies the same
+    `postprocess.run_full_postprocess()` used on the original automatic
+    result (so manual edits get the same speck-removal/hole-fill/
+    smoothing treatment, not an inconsistently rougher mesh), then
+    re-runs `mesh_export.label_map_to_mesh()`/`export_mesh()` and reloads
+    the model node -- i.e. the same mesh-building tail end as
+    `_on_run_clicked`, just fed from the (possibly hand-edited)
+    segmentation instead of the fresh algorithmic output. If the surgeon
+    edits the segmentation down to nothing, this surfaces the same
+    `EmptySegmentationError` message pattern as the automatic path,
+    rather than a cryptic downstream marching-cubes crash.
+
+    **Not yet runtime-tested against a real Slicer install** (no Slicer
+    in this dev environment) -- if `ImportLabelmapToSegmentationNode`/
+    `ExportVisibleSegmentsToLabelmapNode`'s exact signatures, or the
+    Segment Editor widget attribute names, turn out to differ from what's
+    written here, that's the first thing to check.
 
 ## Features added after the pipeline started working end-to-end
 

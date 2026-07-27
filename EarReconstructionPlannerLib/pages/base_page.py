@@ -108,3 +108,29 @@ class WizardPage:
         }.get(self.state.ear_side)
         if axis is not None:
             three_d_view.lookFromAxis(axis)
+
+    def set_absolute_point_size(self, markups_node, size_mm: float) -> None:
+        """Give a Markups node (curve or fiducial) a fixed physical point
+        size (in mm) instead of Slicer's default screen-relative
+        percentage sizing. Works around a real bug seen in practice on the
+        draw pages: right after a curve/fiducial node is freshly created,
+        the 3D view's camera-derived screen-scale factor can be stale
+        (left over from whatever the previous page's camera state was),
+        making points render far too large until the view is recentered.
+        A fixed mm size has no dependency on that computation at all.
+        Deliberately does NOT touch the camera (unlike recenter_3d_view())
+        -- the draw pages tell the surgeon to set up their camera angle
+        before drawing, and this must not disturb that.
+
+        `size_mm` is a required argument, not read from config here,
+        because the scutum and pinna draw pages need different values
+        (config.SCUTUM_DRAW_POINT_SIZE_MM / config.PINNA_DRAW_POINT_SIZE_MM
+        -- the two outlines are drawn at very different physical scales).
+        Call this right after creating any markups node on a draw page."""
+        display_node = markups_node.GetDisplayNode()
+        if display_node is None:
+            markups_node.CreateDefaultDisplayNodes()
+            display_node = markups_node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetUseGlyphScale(False)
+            display_node.SetGlyphSize(size_mm)

@@ -36,6 +36,7 @@ import os
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
 from EarReconstructionPlannerLib import wizard_state
 from core import mesh_isolate, mesh_export
+import config
 
 # Reused in on_enter() and _on_reset_page_clicked() so the tutorial text
 # always goes back to this step-1 guidance when the outline is cleared,
@@ -97,6 +98,7 @@ class ScutumDrawPage(WizardPage):
         self._curve_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLMarkupsClosedCurveNode", "ScutumDefectOutline"
         )
+        self.set_absolute_point_size(self._curve_node, config.SCUTUM_DRAW_POINT_SIZE_MM)
         if self.state.scutum_bone_wall_model_node is not None:
             self._curve_node.SetCurveTypeToShortestDistanceOnSurface(
                 self.state.scutum_bone_wall_model_node
@@ -132,6 +134,7 @@ class ScutumDrawPage(WizardPage):
         self._seed_fiducial_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLMarkupsFiducialNode", "ScutumSeedPoint"
         )
+        self.set_absolute_point_size(self._seed_fiducial_node, config.SCUTUM_DRAW_POINT_SIZE_MM)
 
         selection_node = slicer.app.applicationLogic().GetSelectionNode()
         selection_node.SetActivePlaceNodeID(self._seed_fiducial_node.GetID())

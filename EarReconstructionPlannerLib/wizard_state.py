@@ -37,7 +37,7 @@ class WizardState:
     # --- Pages 2-4: Scutum (ear canal bone wall + defect outline) ---
     scutum_landmarks: EarCanalLandmarks = field(default_factory=EarCanalLandmarks)
     scutum_landmarks_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, hidden once drawing starts
-    scutum_bone_wall_label_node = None  # vtkMRMLLabelMapVolumeNode
+    scutum_bone_wall_segmentation_node = None  # vtkMRMLSegmentationNode, hands off to Segment Editor for manual touch-ups
     scutum_bone_wall_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
     scutum_bone_wall_mesh_path: Optional[str] = None
     scutum_defect_mesh_path: Optional[str] = None  # after the drawn-outline isolation step
@@ -46,7 +46,7 @@ class WizardState:
     # --- Pages 5-7: Pinna ---
     pinna_landmarks: PinnaLandmarks = field(default_factory=PinnaLandmarks)
     pinna_landmarks_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, hidden once drawing starts
-    pinna_region_label_node = None  # vtkMRMLLabelMapVolumeNode
+    pinna_region_segmentation_node = None  # vtkMRMLSegmentationNode, hands off to Segment Editor for manual touch-ups
     pinna_region_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
     pinna_region_mesh_path: Optional[str] = None
     pinna_isolated_mesh_path: Optional[str] = None  # after the drawn-outline isolation step
@@ -101,14 +101,14 @@ PAGE_OWNED_FIELDS = {
     "dicom_load": ["volume_node", "ear_side"],
     "scutum_landmarks": ["scutum_landmarks", "scutum_landmarks_fiducial_node"],
     "scutum_review": [
-        "scutum_bone_wall_label_node",
+        "scutum_bone_wall_segmentation_node",
         "scutum_bone_wall_model_node",
         "scutum_bone_wall_mesh_path",
     ],
     "scutum_draw": ["scutum_defect_mesh_path", "scutum_defect_model_node"],
     "pinna_landmarks": ["pinna_landmarks", "pinna_landmarks_fiducial_node"],
     "pinna_review": [
-        "pinna_region_label_node",
+        "pinna_region_segmentation_node",
         "pinna_region_model_node",
         "pinna_region_mesh_path",
     ],

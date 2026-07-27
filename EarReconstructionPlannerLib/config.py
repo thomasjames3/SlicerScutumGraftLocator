@@ -162,6 +162,23 @@ PINNA_ROI_RADIUS_MM = 45.0
 # in the same session (e.g. planning bilateral reconstruction).
 MIN_INTERAURAL_DISTANCE_MM = 100.0
 
+# Morphological opening radius (mm) applied to the pinna region mask right
+# after component selection. Fixes a recurring cosmetic artifact Thomas
+# flagged (a thin "skinny line" sticking out of the pre-draw pinna model,
+# usually near the top): the spherical PINNA_ROI_RADIUS_MM boundary can
+# graze the scalp surface almost tangentially, leaving a thin wedge of
+# tissue attached to the main blob by a narrow neck. An opening (erode
+# then dilate) at this radius severs a neck that thin without visibly
+# affecting the much thicker real anatomy that makes up the rest of this
+# stage's blobby "head skin near the ear" mask -- this stage isn't yet
+# isolating the delicate ear folds themselves (that's the surgeon's drawn
+# outline, on the next page), so a small radius here is safe. Expressed in
+# mm (converted to a per-axis voxel radius from the scan's own spacing),
+# not a fixed voxel count, so it behaves consistently across scans with
+# different spacing. If a real thin feature ever gets clipped, lower this;
+# if the spike survives, raise it.
+PINNA_SPIKE_REMOVAL_RADIUS_MM = 1.5
+
 # After the surgeon draws and isolates the pinna outline, any remaining
 # part of the mesh toward the interior of the head (past the ear canal
 # opening) is cropped away automatically -- the drawn outline marks the
@@ -172,6 +189,31 @@ MIN_INTERAURAL_DISTANCE_MM = 100.0
 # pinna's own tissue right at its base isn't clipped by an imprecisely
 # placed landmark.
 PINNA_CANAL_CROP_MARGIN_MM = 2.0
+
+# ---------------------------------------------------------------------------
+# Draw pages (scutum + pinna outline drawing)
+# ---------------------------------------------------------------------------
+
+# Absolute (not screen-relative) size, in mm, used for Markups
+# curve/fiducial points placed on the draw pages (the drawn outline's own
+# points, the seed point, the pinna's canal-opening marker). Slicer's
+# default point size is a PERCENTAGE of screen size
+# (vtkMRMLMarkupsDisplayNode.GlyphScale), recomputed from the 3D view's
+# camera scale factor -- Thomas found that right after a curve/fiducial
+# node is freshly created, that scale factor can still be stale (left
+# over from whatever camera state the previous page ended on), making
+# points render far too large until the "recenter 3D view" button is
+# pressed and the camera/clipping state gets recalculated. A fixed mm
+# size sidesteps that bug entirely, since rendering no longer depends on
+# any camera computation -- points are always this physical size
+# regardless of zoom or camera state. See base_page.set_absolute_point_size().
+#
+# Split into two separate constants (originally one shared
+# DRAW_POINT_SIZE_MM) because the scutum defect outline is drawn at a much
+# finer scale than the pinna outline -- a size that reads well on one felt
+# wrong on the other. Tune independently if needed.
+SCUTUM_DRAW_POINT_SIZE_MM = 0.3
+PINNA_DRAW_POINT_SIZE_MM = 2.0
 
 # ---------------------------------------------------------------------------
 # Curvature comparison (core/curvature/ -- ported from the standalone

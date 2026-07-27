@@ -82,6 +82,22 @@ class PinnaReviewPage(WizardPage):
         # captured in Slicer's own RAS convention.
         sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(self.state.volume_node))
 
+        # TEMPORARY DIAGNOSTICS (see Known Issues #7 in CLAUDE.md) -- prints
+        # to the Slicer Python console (View > Python console). Confirms
+        # whether ear_center actually lands inside this scan's physical
+        # (RAS mm) bounds -- if not, the ROI will be empty regardless of
+        # threshold, and the fix is in landmark placement/capture, not
+        # SKIN_AIR_THRESHOLD. Remove once #7 is resolved.
+        import numpy as _np
+        _origin = _np.array(sitk_image.GetOrigin())
+        _size = _np.array(sitk_image.GetSize())
+        _spacing = _np.array(sitk_image.GetSpacing())
+        _direction = _np.array(sitk_image.GetDirection()).reshape(3, 3)
+        _corner_far = _origin + (_size * _spacing) @ _direction.T
+        print(f"[pinna diag] ear_center landmark (RAS mm): {self.state.pinna_landmarks.ear_center}")
+        print(f"[pinna diag] volume physical corners (RAS mm): {tuple(_origin)} to {tuple(_corner_far)}")
+        print(f"[pinna diag] volume size/spacing: {tuple(_size)} / {tuple(_spacing)}")
+
         # Same coarse pre-crop fix as the scutum review page -- see
         # roi_crop.crop_to_point_region's docstring for why this has to
         # happen before build_spherical_roi_mask() on a real, full-
@@ -108,14 +124,35 @@ class PinnaReviewPage(WizardPage):
         )
         region_mask = postprocess.run_full_postprocess(region_mask)
 
-        label_node = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLLabelMapVolumeNode", "PinnaRegion"
+        # Push into a segmentation node (not a plain labelmap) so it's
+        # something Segment Editor can actually operate on -- see the
+        # matching comment in page_scutum_review.py for why. The labelmap
+        # node here is just a throwaway bridge for the conversion Slicer's
+        # segmentations logic expects; it's removed once the segmentation
+        # node owns the data.
+        temp_label_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode", "PinnaRegionTemp"
         )
         # region_mask is RAS-consistent; flip back to LPS since
         # PushVolumeToSlicer expects plain ITK convention (see
         # page_scutum_review.py for the matching comment).
-        sitkUtils.PushVolumeToSlicer(io_utils.flip_ras_lps(region_mask), label_node)
-        self.state.pinna_region_label_node = label_node
+        sitkUtils.PushVolumeToSlicer(io_utils.flip_ras_lps(region_mask), temp_label_node)
+
+        if self.state.pinna_region_segmentation_node is not None:
+            slicer.mrmlScene.RemoveNode(self.state.pinna_region_segmentation_node)
+        segmentation_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", "PinnaRegionSegmentation"
+        )
+        segmentation_node.CreateDefaultDisplayNodes()
+        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
+            temp_label_node, segmentation_node
+        )
+        slicer.mrmlScene.RemoveNode(temp_label_node)
+        # Hidden by default -- see the matching comment in
+        # page_scutum_review.py for why (avoids visually duplicating the
+        # exported model node the surgeon actually draws on).
+        segmentation_node.GetDisplayNode().SetVisibility(False)
+        self.state.pinna_region_segmentation_node = segmentation_node
 
         # Uses the still-RAS-consistent `region_mask` so the exported
         # mesh's vertices line up correctly when loaded back into Slicer.
@@ -147,7 +184,67 @@ class PinnaReviewPage(WizardPage):
 
     def _on_open_segment_editor_clicked(self):
         import slicer
+
         slicer.util.selectModule("SegmentEditor")
+        # Hide the drawing model and show the segmentation in its place --
+        # otherwise the two would overlap in the 3D view while editing.
+        if self.state.pinna_region_model_node is not None:
+            self.state.pinna_region_model_node.GetDisplayNode().SetVisibility(False)
+        segmentation_display_node = self.state.pinna_region_segmentation_node.GetDisplayNode()
+        segmentation_display_node.SetVisibility(True)
+        segmentation_display_node.SetVisibility3D(True)
+        editor_widget = slicer.modules.segmenteditor.widgetRepresentation().self().editor
+        editor_widget.setSegmentationNode(self.state.pinna_region_segmentation_node)
+        # Slicer 5.2+ renamed "master volume" to "source volume" -- support
+        # both since this hasn't been runtime-tested against a specific
+        # Slicer version.
+        if hasattr(editor_widget, "setSourceVolumeNode"):
+            editor_widget.setSourceVolumeNode(self.state.volume_node)
+        else:
+            editor_widget.setMasterVolumeNode(self.state.volume_node)
+
+    def _refresh_mesh_from_segmentation(self):
+        """Re-bakes the drawn-on mesh from the segmentation node's current
+        contents -- see the matching method in page_scutum_review.py for
+        the full reasoning. Called every time Next is clicked."""
+        import slicer
+        import sitkUtils
+
+        segmentation_node = self.state.pinna_region_segmentation_node
+        if segmentation_node is None:
+            return True, ""
+
+        temp_label_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode", "PinnaRegionEdited"
+        )
+        slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
+            segmentation_node, temp_label_node
+        )
+        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(temp_label_node))
+        slicer.mrmlScene.RemoveNode(temp_label_node)
+        sitk_image = postprocess.run_full_postprocess(sitk_image)
+
+        try:
+            mesh = mesh_export.label_map_to_mesh(sitk_image)
+        except mesh_export.EmptySegmentationError:
+            return False, (
+                "The segmentation is empty after your Segment Editor edits. "
+                "Go back to Segment Editor and add material back, or "
+                "re-run the automatic segmentation."
+            )
+
+        mesh_export.export_mesh(mesh, self.state.pinna_region_mesh_path)
+        if self.state.pinna_region_model_node is not None:
+            slicer.mrmlScene.RemoveNode(self.state.pinna_region_model_node)
+        self.state.pinna_region_model_node = slicer.util.loadModel(
+            self.state.pinna_region_mesh_path
+        )
+        self.state.pinna_region_model_node.GetDisplayNode().SetVisibility(True)
+        # Hide the segmentation again now that the refreshed model node is
+        # showing the same thing -- keeps it from visually duplicating the
+        # drawing model on the next page.
+        segmentation_node.GetDisplayNode().SetVisibility(False)
+        return True, ""
 
     def _on_reset_page_clicked(self):
         wizard_state.clear_page_state(self.state, "pinna_review")
@@ -173,4 +270,4 @@ class PinnaReviewPage(WizardPage):
     def on_leave_next(self):
         if self.state.pinna_region_mesh_path is None:
             return False, "Please run the segmentation before continuing."
-        return True, ""
+        return self._refresh_mesh_from_segmentation()
