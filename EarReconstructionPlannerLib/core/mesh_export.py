@@ -19,10 +19,10 @@ from skimage import measure
 
 from config import (
     MESH_SMOOTHING_ITERATIONS,
-    GAUSSIAN_SMOOTHING_SIGMA_MM,
     SUBVOXEL_MESH_BAND_MM,
     SUBVOXEL_MESH_SAFETY_MARGIN_HU,
 )
+from core.smoothing import smooth_for_thresholding
 
 
 class EmptySegmentationError(ValueError):
@@ -84,7 +84,6 @@ def label_map_to_mesh_subvoxel(
     label_image: sitk.Image,
     raw_threshold_mask: sitk.Image,
     threshold_value: float,
-    smoothing_sigma_mm: float = GAUSSIAN_SMOOTHING_SIGMA_MM,
     band_radius_mm: float = SUBVOXEL_MESH_BAND_MM,
 ) -> trimesh.Trimesh:
     """
@@ -161,9 +160,6 @@ def label_map_to_mesh_subvoxel(
     threshold_value : float
         The actual bone_threshold used to produce `label_image` -- the
         isovalue marching_cubes extracts.
-    smoothing_sigma_mm : float
-        Must match segment_bone_wall()'s own smoothing sigma (defaults to
-        the same config constant) so this samples the identical field.
     band_radius_mm : float
         How far from the mask boundary (on both sides) to trust the real
         smoothed intensity before blending toward the safety clamp. See
@@ -181,7 +177,7 @@ def label_map_to_mesh_subvoxel(
     raw_mask_array = sitk.GetArrayFromImage(raw_threshold_mask).astype(bool)
     postprocess_unchanged = mask_array == raw_mask_array
 
-    smoothed = sitk.SmoothingRecursiveGaussian(cropped_image, sigma=smoothing_sigma_mm)
+    smoothed = smooth_for_thresholding(cropped_image)
     smoothed_array = sitk.GetArrayFromImage(smoothed).astype(np.float64)
 
     spacing = label_image.GetSpacing()  # (x, y, z) order

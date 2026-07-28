@@ -223,6 +223,144 @@ flat gray).
 
 ---
 
+## Improving Canal Segmentation
+
+Multi-session push to improve `segment_threshold.py` quality, motivated by
+three concrete complaints: general precision on small/thin bone, the
+scutum and malleus reading as fused (air gap between them mis-segmented as
+bone), and missing wall chunks near the tympanic membrane. All new `core/`
+logic in this section was verified with synthetic NumPy/SimpleITK scripts
+in the scratchpad (not committed) before touching real Slicer, per the
+existing Testing Approach below — but see the closing lesson: synthetic
+tests validated *mechanisms* here without reliably predicting real-scan
+outcomes, twice, in opposite directions.
+
+**Shipped, confirmed working:**
+
+- **Seed-based threshold calibration** (`core/threshold_seeds.py`,
+  optional). Surgeon clicks 3 points (air lumen / bone / soft tissue);
+  `calibrate_thresholds()` samples the same smoothed field thresholding
+  itself sees and pre-fills the review page's air/bone sliders —
+  `soft_tissue_seed` anchors both boundaries (air/tissue split and
+  bone/tissue split). Sliders remain the actual source of truth, fully
+  surgeon-adjustable after. Synthetic 150-patient experiment: mean Dice
+  0.599→0.650, improvement roughly doubling under simulated scanner HU
+  drift vs. a no-drift control — confirms it's correcting inter-scan
+  calibration, not just averaging noise. Real-Slicer use showed calibrated
+  `bone_threshold` routinely hitting the old slider ceiling (700) — real
+  cortical bone HU legitimately runs higher than the old fixed-default-era
+  range assumed — so `BONE_THRESHOLD_ADJUST_RANGE` was widened to
+  `(-200, 2000)`.
+- **Thin-wall warning** (`core/wall_quality.py`, advisory-only, never
+  blocks Next). A second synthetic diagnostic (same 150-patient set,
+  instrumented) found catastrophic segmentation failures do NOT correlate
+  with air-lumen scaffold accuracy (r=-0.15) or noise (r=0.05) — only with
+  true wall thickness (r=+0.83). This is a genuine partial-volume/
+  resolution limit: no threshold choice, calibrated or not, can recover a
+  wall thinner than the scan can resolve. `check_wall_thickness()`
+  estimates local thickness via a distance-transform + local-max-filter
+  approximation (not true sphere-fitting) and warns below
+  `MIN_SAFE_WALL_THICKNESS_MM` (1.0mm) — flags risk, doesn't fix it.
+- **Sub-voxel mesh extraction** (`mesh_export.label_map_to_mesh_subvoxel()`,
+  scutum bone-wall pipeline only, NOT used for Segment-Editor-hand-edited
+  masks). Extracts the isosurface from the real smoothed grayscale field
+  near the boundary instead of the already-binarized mask, recovering
+  genuine sub-voxel boundary position instead of snapping to the voxel
+  grid. **Caught a real bug in review before shipping**: an early version
+  let the sub-voxel blend partially undo `postprocess.close_small_tunnels()`
+  (a postprocessing-closed tunnel's true intensity is below threshold by
+  construction, so blending toward the true field there would silently
+  reopen exactly the defect the 8-round "Isolate Patch" saga fixed). Fixed
+  by requiring a `raw_threshold_mask` (pre-postprocess) argument and only
+  blending where it agrees with the final mask; everywhere postprocessing
+  changed something, hard-clamps to that decision instead. Verified via a
+  synthetic thin-plate-with-tunnel test using `euler_number` (genus) as
+  the signal, plus a stress test proving the guard (not just conservative
+  defaults) is what prevents reopening. Real improvement is modest by
+  design (~15-20% RMS boundary-error reduction in testing) — the same
+  safety margin that protects against tunnel-reopening also damps the
+  effect near the boundary; `SUBVOXEL_MESH_BAND_MM` is the documented
+  lever if a stronger effect is ever wanted, at the cost of some of that
+  safety margin.
+- **Gaussian → CurvatureFlow smoothing swap** (`core/smoothing.py`,
+  scutum/canal pipeline only — pinna pipeline deliberately left on plain
+  Gaussian, already working, wasn't showing this problem). Root cause of
+  the scutum/malleus fusion: the true air gap between them is thin enough
+  that indiscriminate Gaussian blur pulls its smoothed intensity above
+  `bone_threshold` before thresholding ever runs — not fixable by any
+  threshold value after the fact, since the blurred data no longer
+  contains the distinction. `CurvatureFlow` (edge-preserving diffusion —
+  smooths within regions, doesn't diffuse across sharp transitions) was
+  compared against plain Gaussian, a median filter, and a bilateral filter
+  on synthetic data along two axes: noise suppression (spurious connected
+  components surviving thresholding of a uniformly-noisy region right at
+  the threshold value) and thin-gap preservation. CurvatureFlow was the
+  only candidate matching Gaussian's noise suppression (~40 vs ~37
+  residual components) while preserving a true 0.6mm gap almost exactly
+  (-700 HU, vs. Gaussian's -128 — uncomfortably close to a typical
+  `bone_threshold` around 100). **Confirmed fixed on a real scan** (direct
+  A/B by Thomas) with no wall-quality regression — kept.
+  `CURVATURE_FLOW_TIME_STEP=0.01`, `CURVATURE_FLOW_ITERATIONS=10`. One new
+  shared module (`smoothing.smooth_for_thresholding()`) so
+  `segment_threshold.py`/`threshold_seeds.py`/`mesh_export.py` can't drift
+  out of sync on smoothing method, which they previously only did via a
+  documented "must match" convention.
+
+**Dead ends — don't re-suggest:**
+
+- **Pure intensity-based bone segmentation (no shell restriction)**:
+  briefly tried thresholding bone across the whole ROI instead of a fixed
+  shell dilated from the selected air-lumen component, to catch irregular
+  canal anatomy (septa, wider cross-sections) a single-component shell
+  would silently miss. Reverted before real-Slicer testing at Thomas's
+  request (not confirmed bad, just abandoned in favor of the epitympanum
+  approach below) — the shell restriction is what stops the segmentation
+  from grabbing the mastoid or ossicles, and removing it trades that
+  safety for the irregular-anatomy coverage. Revisit only with an explicit
+  decision to accept that tradeoff.
+- **Epitympanum inclusion via `near_eardrum` reuse**: tried unioning a
+  second air component (found within `EPITYMPANUM_SEARCH_RADIUS_MM`=8mm of
+  the existing `near_eardrum` landmark) into the lumen scaffold before
+  shell dilation, so the bone-wall shell would reach around the attic
+  cavity where the scutum sits. Synthetic testing looked clean (correctly
+  found a separate air pocket, correctly ignored distant unrelated ones).
+  **Confirmed harmful on a real scan**: caused widespread real wall
+  dropout (a strip down the anterior wall, a chunk of the posterior wall —
+  not localized to the epitympanum region) without fixing the scutum/
+  malleus fusion it targeted. Fully reverted, including inlining
+  `_component_centroids_physical` back into `_closest_component_to_axis_line`
+  once it lost its second caller. If revisited, use a dedicated 3rd
+  landmark click placed directly inside the epitympanum instead of
+  guessing proximity to `near_eardrum` — that landmark's own instruction
+  text ("just outside the eardrum, at the inner end of the canal") never
+  promised it was inside the attic recess.
+
+**Still open**: the scutum/malleus fusion persists even with CurvatureFlow
+smoothing. A direct synthetic test found neither Gaussian nor CurvatureFlow
+preserves a true gap at exactly 1 voxel (0.3mm = `TARGET_VOXEL_SPACING_MM`)
+— if the real gap is that thin, this is a genuine resolution limit no
+denoising-method choice can fix. Next idea (not yet implemented, Thomas's
+preferred next direction): a sheetness/tubeness (Hessian-eigenvalue-based)
+enhancement filter run before thresholding — actively enhances thin-sheet
+structure signal rather than just avoiding damaging it, a different
+mechanism than anything tried so far.
+
+**Lesson**: synthetic tests here validated real mechanisms (calibration
+math, tunnel-reopening guard, noise-vs-gap-preservation tradeoffs) but
+twice failed to predict real-scan outcomes in opposite directions —
+epitympanum inclusion looked clean synthetically but damaged real walls;
+CurvatureFlow's real fix was never fully reproduced synthetically either
+(a flat-slab and a curved-tube test both showed zero measurable erosion
+risk, so the synthetic evidence for adopting it was suggestive, not
+proof). Real-scan A/B comparison by Thomas was what actually decided both
+calls. Doesn't invalidate synthetic-first testing (it still caught a real
+bug in sub-voxel meshing before it ever reached Slicer) — just confirms
+the existing Testing Approach note below: synthetic tests catch what they
+model, real-Slicer feedback is still the only way to catch what they
+don't.
+
+---
+
 ## Known open issues
 
 1. **Reset All Points (scutum landmarks)** — reported broken, never

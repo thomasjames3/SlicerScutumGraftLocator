@@ -32,10 +32,10 @@ from config import (
     DEFAULT_AIR_THRESHOLD,
     DEFAULT_BONE_THRESHOLD,
     BONE_WALL_THICKNESS_MM,
-    GAUSSIAN_SMOOTHING_SIGMA_MM,
     CONNECTED_COMPONENT_CONNECTIVITY,
 )
 from core.landmarks import EarCanalLandmarks
+from core.smoothing import smooth_for_thresholding
 
 
 def segment_bone_wall(
@@ -116,9 +116,7 @@ def segment_bone_wall(
     dilated_mask = sitk.BinaryDilate(air_mask, radius_voxels)
     shell_array = sitk.GetArrayFromImage(dilated_mask).astype(bool) & ~air_array
 
-    smoothed = sitk.SmoothingRecursiveGaussian(
-        cropped_image, sigma=GAUSSIAN_SMOOTHING_SIGMA_MM
-    )
+    smoothed = smooth_for_thresholding(cropped_image)
     smoothed_array = sitk.GetArrayFromImage(smoothed)
 
     # Bone = above threshold, restricted to the thin shell around the
@@ -153,9 +151,7 @@ def _segment_air_lumen(
     sitk.Image
         A UInt8 label image, 1 = air lumen, 0 = everything else.
     """
-    smoothed = sitk.SmoothingRecursiveGaussian(
-        cropped_image, sigma=GAUSSIAN_SMOOTHING_SIGMA_MM
-    )
+    smoothed = smooth_for_thresholding(cropped_image)
 
     smoothed_array = sitk.GetArrayFromImage(smoothed)
     roi_array = sitk.GetArrayFromImage(roi_mask).astype(bool)

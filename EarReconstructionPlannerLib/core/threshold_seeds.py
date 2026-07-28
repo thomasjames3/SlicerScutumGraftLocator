@@ -32,6 +32,7 @@ from typing import Optional, Tuple
 import SimpleITK as sitk
 
 import config
+from core.smoothing import smooth_for_thresholding
 
 Point3D = Tuple[float, float, float]  # (x, y, z) in RAS mm, Slicer's convention
 
@@ -146,17 +147,17 @@ def _sample_hu_at_point(smoothed_image: sitk.Image, point: Point3D) -> float:
 def calibrate_thresholds(
     image: sitk.Image,
     seeds: ThresholdSeeds,
-    smoothing_sigma_mm: float = config.GAUSSIAN_SMOOTHING_SIGMA_MM,
 ) -> Tuple[float, float]:
     """
     Derives (air_threshold, bone_threshold) from the 3 seed points, to
     pre-fill the review page's sliders for this specific scan.
 
-    Smooths `image` with the exact same filter/sigma
-    segment_threshold.segment_bone_wall() itself uses before thresholding,
-    so the sampled intensities reflect what thresholding will actually see
-    -- calibrating against the raw (unsmoothed) image would systematically
-    mismatch the values the sliders are meant to drive.
+    Smooths `image` with the exact same function
+    segment_threshold.segment_bone_wall() itself uses before thresholding
+    (core/smoothing.py), so the sampled intensities reflect what
+    thresholding will actually see -- calibrating against the raw
+    (unsmoothed) image would systematically mismatch the values the
+    sliders are meant to drive.
 
     air_threshold = midpoint(air_seed, soft_tissue_seed) -- the air/tissue
     boundary used internally to find the air-lumen scaffold.
@@ -171,7 +172,7 @@ def calibrate_thresholds(
     if not seeds.is_complete():
         raise ValueError("Cannot calibrate thresholds: not all 3 calibration points are placed yet.")
 
-    smoothed = sitk.SmoothingRecursiveGaussian(image, sigma=smoothing_sigma_mm)
+    smoothed = smooth_for_thresholding(image)
 
     air_hu = _sample_hu_at_point(smoothed, seeds.air_seed)
     bone_hu = _sample_hu_at_point(smoothed, seeds.bone_seed)
@@ -185,7 +186,6 @@ def calibrate_thresholds(
 def check_seed_plausibility(
     image: sitk.Image,
     seeds: ThresholdSeeds,
-    smoothing_sigma_mm: float = config.GAUSSIAN_SMOOTHING_SIGMA_MM,
 ) -> Optional[str]:
     """
     Plain-English, advisory-only warning (never raises) if the bone seed's
@@ -197,7 +197,7 @@ def check_seed_plausibility(
     if not seeds.is_complete():
         return None
 
-    smoothed = sitk.SmoothingRecursiveGaussian(image, sigma=smoothing_sigma_mm)
+    smoothed = smooth_for_thresholding(image)
     bone_hu = _sample_hu_at_point(smoothed, seeds.bone_seed)
     soft_hu = _sample_hu_at_point(smoothed, seeds.soft_tissue_seed)
 

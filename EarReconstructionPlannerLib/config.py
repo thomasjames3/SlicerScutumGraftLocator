@@ -22,7 +22,44 @@ TARGET_VOXEL_SPACING_MM = 0.3
 # Sigma (in mm) for the Gaussian smoothing pass that reduces noise before
 # thresholding. Matches the "sigma = mean voxel size" rule of thumb used in
 # the Matin-Mann et al. (2025) EEC segmentation paper.
+#
+# Only used by the PINNA pipeline now (core/segment_pinna_threshold.py),
+# which is already confirmed working end-to-end and wasn't showing the
+# problem CURVATURE_FLOW_TIME_STEP/_ITERATIONS below were introduced to
+# fix -- deliberately left alone rather than switched over too. The
+# ear-canal (scutum) pipeline uses core/smoothing.py instead; see that
+# module's docstring for why plain Gaussian blur was replaced there.
 GAUSSIAN_SMOOTHING_SIGMA_MM = TARGET_VOXEL_SPACING_MM
+
+# Pre-thresholding denoise parameters for the ear-canal (scutum) pipeline
+# -- see core/smoothing.py for the full mechanism and the evidence that
+# led here. A real reported failure was the scutum and malleus reading as
+# fused in the exported mesh: the thin true air gap between them was
+# getting blurred above bone_threshold by the (formerly plain Gaussian)
+# smoothing pass before thresholding ever ran, which no threshold value
+# could fix after the fact. CurvatureFlow (edge-preserving diffusion) was
+# chosen over plain Gaussian, a median filter, and a bilateral filter
+# after comparing all four on synthetic data along both axes that matter:
+# noise suppression (spurious connected components surviving thresholding
+# of a uniformly noisy region right at the threshold value -- the worst
+# case for segment_threshold._closest_component_to_axis_line's selection)
+# and thin-gap preservation (how close a true air gap's minimum intensity
+# stays to its real value after smoothing). At these settings, measured
+# noise suppression was ~40 residual components vs. plain Gaussian's ~37
+# (effectively tied), while a true 0.6mm gap's minimum intensity stayed at
+# -700 (its real value) vs. Gaussian's -128 -- uncomfortably close to a
+# typical bone_threshold around 100. Median and bilateral filters
+# preserved gaps just as well but suppressed noise noticeably worse (205
+# and 313 residual components respectively).
+#
+# Iteration count is the main lever if this ever needs retuning: fewer
+# iterations = less smoothing (better gap preservation, worse noise
+# suppression, faster); more = the opposite. ~30x slower than the plain
+# Gaussian pass on a realistic crop (~270ms vs ~9ms at 10 iterations) --
+# immaterial for an explicit "Run Segmentation" click, but worth knowing
+# if iterations are ever raised substantially.
+CURVATURE_FLOW_TIME_STEP = 0.01
+CURVATURE_FLOW_ITERATIONS = 10
 
 # ---------------------------------------------------------------------------
 # ROI (region of interest) cropping
@@ -98,6 +135,18 @@ BONE_WALL_THICKNESS_MM = 3.0
 # the EEC paper) rather than 26-connected, which is more conservative and
 # less likely to bridge across a thin bone wall by accident.
 CONNECTED_COMPONENT_CONNECTIVITY = 1  # scipy.ndimage.label(structure=...) uses 1 = 6-connectivity in 3D
+
+# Dead end -- do not reintroduce: an EPITYMPANUM_SEARCH_RADIUS_MM constant
+# and matching _closest_component_to_point() lookup in segment_threshold.py
+# once unioned a second (near_eardrum-proximity) air component into the
+# lumen scaffold, trying to include the epitympanum so the bone-wall shell
+# would reach around it. Confirmed on a real scan: this damaged real canal
+# wall coverage (missing strips on the anterior and posterior wall,
+# widespread, not localized to the epitympanum region) without actually
+# fixing the scutum/malleus fusion it was meant to help with. Reverted.
+# If this gets revisited, the next attempt should be a dedicated 3rd
+# landmark click placed directly inside the epitympanum, not an automatic
+# near_eardrum-proximity guess -- see git history for the removed code.
 
 # ---------------------------------------------------------------------------
 # Stage A: seed-based threshold calibration (optional convenience)
@@ -218,7 +267,16 @@ MESH_SMOOTHING_ITERATIONS = 15
 # tunnel-reopening safety margin (and a bit more risk of the "unrelated
 # nearby structure" issue described above) for a stronger pull toward the
 # true intensity near the boundary.
-SUBVOXEL_MESH_BAND_MM = 2.0 * GAUSSIAN_SMOOTHING_SIGMA_MM
+#
+# Set as a direct mm value (was previously derived as
+# 2 * GAUSSIAN_SMOOTHING_SIGMA_MM, back when the canal pipeline's own
+# pre-thresholding smoothing was a plain Gaussian blur with that sigma;
+# it now uses core/smoothing.py's CurvatureFlow-based denoise instead,
+# which has no single "sigma" to derive from -- see CURVATURE_FLOW_
+# TIME_STEP/_ITERATIONS above). Kept at the same 0.6mm this formula used
+# to produce, since that value's reasoning (2x TARGET_VOXEL_SPACING_MM)
+# still holds on its own terms.
+SUBVOXEL_MESH_BAND_MM = 0.6
 
 # How far (in Hounsfield-Unit-like intensity, on both sides of
 # threshold_value) label_map_to_mesh_subvoxel() pushes the blended field
