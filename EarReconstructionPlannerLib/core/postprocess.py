@@ -89,10 +89,27 @@ def smooth_boundary(label_image: sitk.Image, iterations: int = 2) -> sitk.Image:
     return smoothed
 
 
-def run_full_postprocess(label_image: sitk.Image) -> sitk.Image:
-    """Convenience wrapper running the standard cleanup sequence in order."""
+def run_full_postprocess(label_image: sitk.Image, close_tunnels: bool = False) -> sitk.Image:
+    """Convenience wrapper running the standard cleanup sequence in order.
+
+    close_tunnels defaults to False: close_small_tunnels()'s 2mm closing
+    radius is wide enough to bridge (i.e. erase) real anatomical folds on
+    the pinna's outer skin surface -- the helix rim, antihelix grooves,
+    concha bowl are all on that same ~1-3mm scale, confirmed against a
+    synthetic 2mm-wide groove (fully sealed by a 2mm-radius closing). It
+    only earns its keep on the pinna's post-isolation mesh, where genus>0
+    handles from canal-adjacent anatomy were the actual problem -- see the
+    close_tunnels=True call in page_pinna_draw.py's isolate-fallback path.
+    Applied at Stage A (before the surgeon has even drawn anything, see
+    page_pinna_review.py), it was silently flattening the raw segmentation
+    the surgeon draws on, degrading accuracy with no matching benefit
+    (2026-07-28 regression report). Scutum's bone-wall shell still opts in
+    explicitly (page_scutum_review.py) since that structure is genuinely
+    tube/tunnel-shaped and unaffected by this fix.
+    """
     result = remove_small_specks(label_image)
     result = fill_holes(result)
-    result = close_small_tunnels(result)
+    if close_tunnels:
+        result = close_small_tunnels(result)
     result = smooth_boundary(result)
     return result

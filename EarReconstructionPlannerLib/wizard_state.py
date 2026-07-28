@@ -20,6 +20,7 @@ from typing import Optional
 
 from core.landmarks import EarCanalLandmarks
 from core.pinna_landmarks import PinnaLandmarks
+from core.threshold_seeds import ThresholdSeeds
 
 
 @dataclass
@@ -58,6 +59,11 @@ class WizardState:
     pinna_isolated_model_node = None  # vtkMRMLModelNode for the isolated pinna patch, hidden during the scutum stage, re-shown for Verify
 
     # --- Pages 6-7: Scutum review + draw (ear canal bone wall + defect outline) ---
+    # Optional seed-click calibration for the air/bone threshold sliders
+    # below -- see core/threshold_seeds.py. Purely a pre-fill convenience;
+    # the sliders remain the actual source of truth.
+    scutum_threshold_seeds: ThresholdSeeds = field(default_factory=ThresholdSeeds)
+    scutum_threshold_seeds_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, the 3 calibration seed points
     scutum_bone_wall_segmentation_node = None  # vtkMRMLSegmentationNode, hands off to Segment Editor for manual touch-ups
     scutum_bone_wall_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
     scutum_bone_wall_mesh_path: Optional[str] = None
@@ -120,6 +126,8 @@ PAGE_OWNED_FIELDS = {
     ],
     "pinna_draw": ["pinna_isolated_mesh_path", "pinna_isolated_model_node"],
     "scutum_review": [
+        "scutum_threshold_seeds",
+        "scutum_threshold_seeds_fiducial_node",
         "scutum_bone_wall_segmentation_node",
         "scutum_bone_wall_model_node",
         "scutum_bone_wall_mesh_path",
@@ -134,6 +142,7 @@ PAGE_OWNED_FIELDS = {
 _FIELD_RESET_DEFAULTS = {
     "scutum_landmarks": EarCanalLandmarks,
     "pinna_landmarks": PinnaLandmarks,
+    "scutum_threshold_seeds": ThresholdSeeds,
     "surgeon_approved_scutum": lambda: False,
     "surgeon_approved_pinna": lambda: False,
 }

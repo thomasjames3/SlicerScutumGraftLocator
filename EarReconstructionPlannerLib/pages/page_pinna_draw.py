@@ -479,7 +479,7 @@ class PinnaDrawPage(WizardPage):
         # here, to recover a working isolate result, that tradeoff is
         # worth it: an isolate failure blocks the whole wizard, while this
         # fallback mesh is discarded immediately after use.
-        sitk_image = postprocess.run_full_postprocess(sitk_image)
+        sitk_image = postprocess.run_full_postprocess(sitk_image, close_tunnels=True)
 
         try:
             mesh = mesh_export.label_map_to_mesh(sitk_image)

@@ -22,6 +22,37 @@
     </widget>
    </item>
    <item>
+    <widget class="QLabel" name="calibrationStepProgressLabel">
+     <property name="text">
+      <string>Optional calibration: 0 of 3</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="calibrationInstructionLabel">
+     <property name="text">
+      <string>Optional: click 3 points (air, bone, soft tissue) to auto-fill the thresholds below.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="placeCalibrationPointButton">
+     <property name="text">
+      <string>Place Calibration Point</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="redoCalibrationButton">
+     <property name="text">
+      <string>Redo Calibration Points</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="label1">
      <property name="text">
       <string>Air threshold</string>
@@ -70,6 +101,22 @@
      </property>
      <property name="wordWrap">
       <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="wallThicknessWarningLabel">
+     <property name="text">
+      <string></string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+     <property name="visible">
+      <bool>false</bool>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">color: #b35c00;</string>
      </property>
     </widget>
    </item>

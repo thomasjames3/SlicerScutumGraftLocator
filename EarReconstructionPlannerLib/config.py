@@ -70,10 +70,21 @@ AIR_THRESHOLD_ADJUST_RANGE = (-600, 0)
 DEFAULT_BONE_THRESHOLD = 100
 
 # Range the review-step slider is allowed to move the bone threshold within.
-# Widened below the new 100 default (previously the range bottomed out
+# Widened below the old 100 default (previously the range bottomed out
 # exactly at 100, leaving no room to try lower values) so a surgeon can
 # still explore lower thresholds if 100 isn't optimal for a given scan.
-BONE_THRESHOLD_ADJUST_RANGE = (-200, 700)
+#
+# Upper bound raised from 700 to 2000 after real-Slicer use of seed-based
+# calibration (core/threshold_seeds.py) routinely computed a bone_threshold
+# above 700 and got silently clamped there -- real cortical bone HU on a
+# given scan can legitimately sit well above 700 (dense temporal bone is
+# commonly 1000-2000+ HU), and per-scan calibration sampling actual bone
+# intensity is a more reliable signal than the old fixed default (100,
+# deliberately lowered from 300 to compensate for partial-volume blending
+# on an *uncalibrated* threshold) for how high this can reasonably go. 2000
+# comfortably covers dense cortical bone while still ruling out clearly
+# implausible values.
+BONE_THRESHOLD_ADJUST_RANGE = (-200, 2000)
 
 # Expected thickness (in mm) of the bony ear canal wall. This defines how
 # far outward from the air-lumen scaffold we look for bone. Generous on
@@ -87,6 +98,34 @@ BONE_WALL_THICKNESS_MM = 3.0
 # the EEC paper) rather than 26-connected, which is more conservative and
 # less likely to bridge across a thin bone wall by accident.
 CONNECTED_COMPONENT_CONNECTIVITY = 1  # scipy.ndimage.label(structure=...) uses 1 = 6-connectivity in 3D
+
+# ---------------------------------------------------------------------------
+# Stage A: seed-based threshold calibration (optional convenience)
+# ---------------------------------------------------------------------------
+#
+# DEFAULT_AIR_THRESHOLD/DEFAULT_BONE_THRESHOLD above are one fixed HU pair
+# used for every patient/scanner. A synthetic 150-patient experiment (run
+# against the real segment_threshold.segment_bone_wall() function, varying
+# per-patient HU calibration drift, noise, blur, and anatomy) found that
+# deriving both thresholds instead from 3 quick surgeon seed-clicks (air
+# lumen / bone / general soft tissue -- see core/threshold_seeds.py) raised
+# mean Dice from 0.599 to 0.650, and the improvement roughly doubled
+# specifically under simulated scanner HU drift vs. a no-drift control --
+# confirming this really corrects inter-scan calibration drift, not just
+# averages out noise. This is optional: the review page's sliders remain
+# the actual source of truth, and seed calibration only pre-fills their
+# starting values (see page_scutum_review.py).
+
+# Minimum plausible difference (in Hounsfield-Unit-like intensity) between
+# the bone seed and soft-tissue seed's sampled values. If the difference is
+# smaller than this, one of the two clicks probably landed in the wrong
+# place (most likely the "bone" click actually landed on soft tissue) --
+# core/threshold_seeds.check_seed_plausibility() uses this to show an
+# advisory warning (not a hard block; the surgeon can still proceed and
+# manually adjust the sliders afterward). Set well below a typical
+# bone-vs-soft-tissue HU gap (hundreds of HU) so this only fires on a
+# clearly implausible pair of clicks, not routine per-patient variation.
+MIN_BONE_SOFT_TISSUE_SEPARATION_HU = 50.0
 
 # ---------------------------------------------------------------------------
 # Stage B: trained-model segmentation (used once a model exists)
@@ -133,11 +172,98 @@ MIN_COMPONENT_VOLUME_MM3 = 5.0
 # kernels in this project. If tunnels/handles persist, raise this; if it
 # ever visibly merges two anatomically-separate structures that should
 # stay apart, lower it.
+#
+# NOT applied by default: postprocess.run_full_postprocess()'s
+# close_tunnels defaults to False (2026-07-28 fix). At 2mm this closing
+# radius also seals real ~1-3mm anatomical folds (helix rim, antihelix,
+# concha bowl) on the pinna's raw skin-surface segmentation, degrading
+# the surgeon-facing Run Segmentation result with no matching benefit --
+# genus>0 handles only ever showed up post-isolation. Only pass
+# close_tunnels=True where actually validated: the pinna isolate-fallback
+# path (page_pinna_draw.py) and scutum's bone-wall shell
+# (page_scutum_review.py), which is genuinely tube-shaped.
 TUNNEL_CLOSING_RADIUS_MM = 2.0
 
 # Mesh smoothing iterations applied before STL export. Higher = smoother
 # but less true to the raw voxel boundary.
 MESH_SMOOTHING_ITERATIONS = 15
+
+# mesh_export.label_map_to_mesh_subvoxel() extracts the scutum bone-wall
+# mesh from the actual smoothed grayscale field near the mask boundary,
+# instead of the already-binarized mask (which snaps every vertex to the
+# voxel grid) -- added after real-Slicer use surfaced a general precision
+# complaint on small/thin bone regions. How far (mm, on both sides of the
+# boundary) to trust the real intensity before blending toward a safety-
+# clamped constant; see that function's docstring for the full mechanism.
+# Set to 2x GAUSSIAN_SMOOTHING_SIGMA_MM -- wide enough to comfortably
+# contain where a Gaussian blur of that sigma actually spreads a sharp
+# edge's partial-volume transition, narrow enough to stay well clear of
+# other same-density structures elsewhere in the (already-cropped, but not
+# empty) ROI, e.g. the mastoid or ossicles -- see segment_threshold.py's
+# shell-restriction docstring for why those are real, previously-observed
+# neighbors within this same crop.
+#
+# Tuning note: a discrete voxel can never sit closer than one full
+# TARGET_VOXEL_SPACING_MM from an opposite-class voxel, so the blend
+# weight at even the single closest boundary-adjacent voxel is always at
+# least spacing/band_radius_mm -- at this default (2x the spacing), that
+# floor is 0.5, meaning SUBVOXEL_MESH_SAFETY_MARGIN_HU's clamp value
+# already makes up half of even the closest voxel's blended intensity.
+# Synthetic testing confirmed this still gives a real, consistent
+# (if modest -- roughly 15-20% RMS reduction in boundary position error
+# in that test) accuracy improvement, while never reopening a
+# postprocessing-closed tunnel even under an adversarial stress test. If
+# real-scan use shows the effect is too weak to matter, raising this
+# constant is the first lever to try -- it trades some of that
+# tunnel-reopening safety margin (and a bit more risk of the "unrelated
+# nearby structure" issue described above) for a stronger pull toward the
+# true intensity near the boundary.
+SUBVOXEL_MESH_BAND_MM = 2.0 * GAUSSIAN_SMOOTHING_SIGMA_MM
+
+# How far (in Hounsfield-Unit-like intensity, on both sides of
+# threshold_value) label_map_to_mesh_subvoxel() pushes the blended field
+# once outside SUBVOXEL_MESH_BAND_MM, to guarantee marching_cubes can't
+# pick up a spurious extra surface component from an unrelated same-HU
+# structure far from the true boundary. Just needs to comfortably clear
+# realistic within-ROI intensity variation on either side of a typical
+# threshold value -- not physically meaningful beyond that, so not worth
+# tying to a real calibrated HU range.
+SUBVOXEL_MESH_SAFETY_MARGIN_HU = 1000.0
+
+# ---------------------------------------------------------------------------
+# Post-segmentation wall-thickness warning
+# ---------------------------------------------------------------------------
+#
+# A second synthetic 150-patient diagnostic (same set as the seed-
+# calibration experiment above, instrumented) found catastrophic
+# segmentation failures (Dice ~0) are NOT caused by the internal air-lumen
+# scaffold failing (its Dice stayed ~0.90-0.97 even in failing cases,
+# uncorrelated with wall failure, r=-0.15) -- they're caused by the TRUE
+# anatomical wall being thin relative to the scan's effective blur/PSF:
+# partial-volume effect smears a thin wall's intensity into its neighbors
+# before any threshold (fixed or seed-calibrated) can separate it. True
+# wall thickness alone correlated r=+0.83 with final wall Dice; noise
+# correlated ~0.05. No threshold choice can fix this failure mode, so
+# core/wall_quality.py detects and flags it instead of silently producing
+# a confidently-wrong-looking mesh.
+
+# Minimum acceptable local wall thickness (mm) before
+# wall_quality.check_wall_thickness() warns the surgeon. Chosen as roughly
+# 3x TARGET_VOXEL_SPACING_MM (0.3mm) -- a common rule-of-thumb minimum-
+# resolvable-feature-size margin -- and cross-checked against where the
+# synthetic experiment's Dice actually cratered: mean Dice 0.24 when
+# true-wall-thickness/blur-sigma ratio was below 1.5, vs. 0.70+ above a
+# ratio of 2.5. KNOWN LIMITATION: this compares against the pipeline's
+# post-resample spacing (TARGET_VOXEL_SPACING_MM), not the scan's true
+# native acquisition resolution -- native slice thickness isn't currently
+# tracked anywhere in this pipeline, so a scan with coarser native
+# resolution than the resample target could still hit this failure mode
+# without tripping this check as early as it ideally should. Good
+# candidate for a future improvement (track native spacing through
+# io_utils and factor it in here); not needed for v1, since the check
+# still fires correctly whenever the resampled data itself can't resolve
+# the wall, which is the failure mode actually observed so far.
+MIN_SAFE_WALL_THICKNESS_MM = 1.0
 
 # ---------------------------------------------------------------------------
 # File locations (relative to the project's data directory)

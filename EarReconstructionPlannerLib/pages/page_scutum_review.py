@@ -13,20 +13,40 @@ touch-ups (painting/erasing), rather than reinventing that tool.
 
 Expected widgets in page_scutum_review.ui:
   - tutorialLabel        (QLabel) -- extra guidance, shown only in tutorial mode
+  - calibrationStepProgressLabel (QLabel) -- e.g. "Optional calibration: 0 of 3"
+  - calibrationInstructionLabel  (QLabel) -- current calibration step's instruction
+  - placeCalibrationPointButton  (QPushButton)
+  - redoCalibrationButton        (QPushButton) -- clear just the 3 calibration points
   - airThresholdSlider   (QSlider or ctkSliderWidget)
   - boneThresholdSlider  (QSlider or ctkSliderWidget)
   - runButton            (QPushButton)
   - openSegmentEditorButton (QPushButton)
+  - statusLabel          (QLabel)
+  - wallThicknessWarningLabel (QLabel) -- advisory-only, shown if the segmented wall looks too thin to trust
   - resetPageButton      (QPushButton) -- clear this page's own segmentation
   - revertToHereButton   (QPushButton) -- clear every later step, keep this segmentation
-  - statusLabel          (QLabel)
+
+Optional seed-click calibration (core/threshold_seeds.py): the surgeon can
+click 3 points (air / bone / soft tissue) before running, which pre-fills
+the two sliders below with per-scan-calibrated starting values. This is
+purely a convenience -- the sliders remain the actual source of truth and
+stay manually adjustable either way. See config.py's "seed-based threshold
+calibration" section for why this helps.
+
+Post-segmentation thin-wall check (core/wall_quality.py): after Run (or
+after a Segment Editor edit is re-baked), the resulting wall is checked
+for suspiciously-thin regions and flagged via wallThicknessWarningLabel if
+found. Advisory only -- never blocks Next. See config.py's "post-
+segmentation wall-thickness warning" section for why no threshold choice
+can fix this failure mode.
 """
 
 from __future__ import annotations
 import os
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
 from EarReconstructionPlannerLib import wizard_state
-from core import roi_crop, segment_dl, postprocess, mesh_export, io_utils
+from core import roi_crop, segment_dl, postprocess, mesh_export, io_utils, threshold_seeds, wall_quality
+from core.threshold_seeds import SEED_STEPS, ThresholdSeeds
 import config
 
 
@@ -36,10 +56,11 @@ class ScutumReviewPage(WizardPage):
         # "Pinna-first wizard reorder" in CLAUDE.md) -- hide the pinna's
         # finished models/landmarks now, since they were left visible from
         # that earlier stage and would otherwise clutter the 3D view while
-        # reviewing the bone-wall segmentation. Re-show the scutum
-        # ear-canal-axis points, hidden during the pinna stage (see
-        # page_pinna_landmarks.py's on_enter) since they're relevant again
-        # now.
+        # reviewing the bone-wall segmentation. The scutum ear-canal-axis
+        # points stay hidden too (they were hidden during the pinna stage by
+        # page_pinna_landmarks.py's on_enter) -- they're only used
+        # programmatically by the segmentation math below, not as a visual
+        # reference, so there's no reason to clutter the view with them here.
         if self.state.pinna_region_model_node is not None:
             self.state.pinna_region_model_node.GetDisplayNode().SetVisibility(False)
         if self.state.pinna_isolated_model_node is not None:
@@ -47,9 +68,18 @@ class ScutumReviewPage(WizardPage):
         if self.state.pinna_landmarks_fiducial_node is not None:
             self.state.pinna_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
         if self.state.scutum_landmarks_fiducial_node is not None:
-            self.state.scutum_landmarks_fiducial_node.GetDisplayNode().SetVisibility(True)
+            self.state.scutum_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
+
+        self._setup_calibration_seeds()
 
         self.set_tutorial_text(
+            "Before running, you can optionally click 'Place Calibration "
+            "Point' three times -- once inside the air-filled canal, once "
+            "on bone, once on soft tissue -- to automatically fill in good "
+            "starting values for the two sliders below, tuned to this "
+            "specific scan. This step is optional; the default slider "
+            "values work reasonably well without it. If a point lands in "
+            "the wrong spot, use 'Redo Calibration Points' to start over.\n\n"
             "This step automatically finds the bone wall of the ear canal "
             "near the 2 points you placed. The two sliders control how "
             "sensitive that search is:\n"
@@ -77,7 +107,12 @@ class ScutumReviewPage(WizardPage):
             "the 'Paint' or 'Erase' effect on the left, adjust the brush "
             "size, then click or drag over the volume in a slice view to add "
             "or remove material by hand. Come back to this module (the "
-            "modules dropdown at the top) when you're done."
+            "modules dropdown at the top) when you're done.\n\n"
+            "If a message appears after running saying the wall looks very "
+            "thin in places, it means the scan's resolution may not be fine "
+            "enough to reliably show the true wall thickness there. You can "
+            "still continue, but treat that area with extra caution and "
+            "consider a manual double-check."
         )
         self.ui.airThresholdSlider.minimum = config.AIR_THRESHOLD_ADJUST_RANGE[0]
         self.ui.airThresholdSlider.maximum = config.AIR_THRESHOLD_ADJUST_RANGE[1]
@@ -91,8 +126,135 @@ class ScutumReviewPage(WizardPage):
         self.ui.openSegmentEditorButton.clicked.connect(self._on_open_segment_editor_clicked)
         self.ui.resetPageButton.clicked.connect(self._on_reset_page_clicked)
         self.ui.revertToHereButton.clicked.connect(self._on_revert_to_here_clicked)
+        self.ui.placeCalibrationPointButton.clicked.connect(self._on_place_calibration_point_clicked)
+        self.ui.redoCalibrationButton.clicked.connect(self._on_redo_calibration_clicked)
         self.ui.openSegmentEditorButton.setEnabled(self.state.scutum_bone_wall_mesh_path is not None)
+        self.ui.wallThicknessWarningLabel.setText("")
+        self.ui.wallThicknessWarningLabel.setVisible(False)
         self.ui.statusLabel.setText("Adjust the sliders if needed, then click Run.")
+
+    def _setup_calibration_seeds(self):
+        import slicer
+
+        # Reuse the fiducial node from a previous visit if it's still live,
+        # same reasoning as page_scutum_landmarks.py's on_enter -- creating
+        # a fresh node on every re-entry would orphan earlier visits' nodes
+        # and always restart the step counter at 0.
+        existing = self.state.scutum_threshold_seeds_fiducial_node
+        if existing is not None and slicer.mrmlScene.IsNodePresent(existing):
+            self._seed_fiducial_node = existing
+        else:
+            self._seed_fiducial_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode", "ScutumThresholdSeeds"
+            )
+            self._seed_fiducial_node.SetLocked(False)
+            self._seed_fiducial_node.CreateDefaultDisplayNodes()
+            self.state.scutum_threshold_seeds_fiducial_node = self._seed_fiducial_node
+        self._seed_fiducial_node.GetDisplayNode().SetVisibility(True)
+
+        # Resume at whichever step matches what's already been placed.
+        self._current_calib_step = 0
+        for step in SEED_STEPS:
+            if getattr(self.state.scutum_threshold_seeds, step["field"]) is None:
+                break
+            self._current_calib_step += 1
+
+        self._calib_observer_tag = None
+        self._update_calibration_step_display()
+
+    def _update_calibration_step_display(self):
+        if self._current_calib_step >= len(SEED_STEPS):
+            self.ui.calibrationInstructionLabel.setText(f"All {len(SEED_STEPS)} calibration points placed.")
+            self.ui.calibrationStepProgressLabel.setText(
+                f"Optional calibration: {len(SEED_STEPS)} of {len(SEED_STEPS)}"
+            )
+            self.ui.placeCalibrationPointButton.setEnabled(False)
+        else:
+            step = SEED_STEPS[self._current_calib_step]
+            self.ui.calibrationInstructionLabel.setText(step["instruction"])
+            self.ui.calibrationStepProgressLabel.setText(
+                f"Optional calibration: {self._current_calib_step} of {len(SEED_STEPS)}"
+            )
+            self.ui.placeCalibrationPointButton.setEnabled(True)
+
+    def _on_place_calibration_point_clicked(self):
+        import slicer
+
+        interaction_node = slicer.app.applicationLogic().GetInteractionNode()
+        selection_node = slicer.app.applicationLogic().GetSelectionNode()
+        selection_node.SetActivePlaceNodeID(self._seed_fiducial_node.GetID())
+        interaction_node.SetCurrentInteractionMode(interaction_node.Place)
+        interaction_node.SetPlaceModePersistence(0)  # one point, then back to normal mode
+
+        self._calib_observer_tag = self._seed_fiducial_node.AddObserver(
+            self._seed_fiducial_node.PointPositionDefinedEvent, self._on_calibration_point_placed
+        )
+        self.ui.placeCalibrationPointButton.setEnabled(False)
+        self.ui.statusLabel.setText("Click a point in the 3D view or on a slice...")
+
+    def _on_calibration_point_placed(self, caller, event):
+        if self._calib_observer_tag is not None:
+            self._seed_fiducial_node.RemoveObserver(self._calib_observer_tag)
+            self._calib_observer_tag = None
+
+        point_index = self._seed_fiducial_node.GetNumberOfControlPoints() - 1
+        ras = [0.0, 0.0, 0.0]
+        self._seed_fiducial_node.GetNthControlPointPositionWorld(point_index, ras)
+
+        field_name = SEED_STEPS[self._current_calib_step]["field"]
+        setattr(self.state.scutum_threshold_seeds, field_name, tuple(ras))
+        self._seed_fiducial_node.SetNthControlPointLabel(point_index, field_name)
+
+        self._current_calib_step += 1
+        self._update_calibration_step_display()
+
+        if self.state.scutum_threshold_seeds.is_complete():
+            self._run_calibration()
+
+    def _run_calibration(self):
+        import sitkUtils
+
+        if self.state.volume_node is None:
+            self.ui.statusLabel.setText("No scan loaded -- go back and select one first.")
+            return
+
+        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(self.state.volume_node))
+        coarse_cropped = roi_crop.crop_to_landmark_region(sitk_image, self.state.scutum_landmarks)
+
+        try:
+            air_threshold, bone_threshold = threshold_seeds.calibrate_thresholds(
+                coarse_cropped, self.state.scutum_threshold_seeds
+            )
+        except ValueError as exc:
+            self.ui.statusLabel.setText(str(exc))
+            return
+
+        self.ui.airThresholdSlider.value = air_threshold
+        self.ui.boneThresholdSlider.value = bone_threshold
+
+        warning = self.state.scutum_threshold_seeds.validate() or threshold_seeds.check_seed_plausibility(
+            coarse_cropped, self.state.scutum_threshold_seeds
+        )
+        self.ui.statusLabel.setText(
+            warning
+            or "Calibration points placed -- thresholds below were pre-filled. "
+            "Adjust the sliders if needed, then click Run Segmentation."
+        )
+
+    def _on_redo_calibration_clicked(self):
+        if self._seed_fiducial_node is not None:
+            self._seed_fiducial_node.RemoveAllControlPoints()
+        self.state.scutum_threshold_seeds = ThresholdSeeds()
+        self._current_calib_step = 0
+        self._update_calibration_step_display()
+        self.ui.statusLabel.setText(
+            "Calibration points cleared. Place them again, or adjust the sliders directly."
+        )
+
+    def _check_and_display_wall_thickness(self, bone_wall_sitk_image):
+        warning = wall_quality.check_wall_thickness(bone_wall_sitk_image)
+        self.ui.wallThicknessWarningLabel.setText(warning or "")
+        self.ui.wallThicknessWarningLabel.setVisible(bool(warning))
 
     def _on_run_clicked(self):
         import sitkUtils
@@ -109,6 +271,8 @@ class ScutumReviewPage(WizardPage):
         # silently carrying forward a now-mismatched downstream result.
         wizard_state.clear_downstream_state(self.state, "scutum_review")
 
+        self.ui.wallThicknessWarningLabel.setText("")
+        self.ui.wallThicknessWarningLabel.setVisible(False)
         self.ui.statusLabel.setText("Segmenting bone wall...")
         slicer.app.processEvents()
 
@@ -139,14 +303,18 @@ class ScutumReviewPage(WizardPage):
         cropped_image = roi_crop.crop_to_roi_bounding_box(coarse_cropped, roi_mask)
         cropped_roi_mask = roi_crop.crop_to_roi_bounding_box(roi_mask, roi_mask)
 
-        bone_wall = segment_dl.segment(
+        raw_bone_wall = segment_dl.segment(
             cropped_image,
             cropped_roi_mask,
             self.state.scutum_landmarks,
             air_threshold=self.ui.airThresholdSlider.value,
             bone_threshold=self.ui.boneThresholdSlider.value,
         )
-        bone_wall = postprocess.run_full_postprocess(bone_wall)
+        # Kept alongside the postprocessed result -- mesh_export.
+        # label_map_to_mesh_subvoxel() needs both, to tell which voxels
+        # postprocessing actually changed (see its docstring).
+        bone_wall = postprocess.run_full_postprocess(raw_bone_wall, close_tunnels=True)
+        self._check_and_display_wall_thickness(bone_wall)
 
         # Push into a segmentation node (not a plain labelmap) so it's
         # something Segment Editor can actually operate on -- Segment
@@ -192,8 +360,19 @@ class ScutumReviewPage(WizardPage):
         # (not the flipped copy just pushed above) so the exported mesh's
         # vertices are in RAS and line up correctly when loaded back into
         # Slicer alongside the volume.
+        #
+        # Uses the sub-voxel extraction (real smoothed intensity near the
+        # boundary, not the already-binarized mask) since this mesh comes
+        # straight from thresholding `cropped_image` at boneThresholdSlider's
+        # value -- there's a real isovalue to extract against. This is NOT
+        # used in _refresh_mesh_from_segmentation() below: after a Segment
+        # Editor hand-edit, the mask boundary is whatever the surgeon
+        # painted, with no single threshold it corresponds to, so that path
+        # correctly keeps using plain label_map_to_mesh().
         try:
-            mesh = mesh_export.label_map_to_mesh(bone_wall)
+            mesh = mesh_export.label_map_to_mesh_subvoxel(
+                cropped_image, bone_wall, raw_bone_wall, self.ui.boneThresholdSlider.value
+            )
         except mesh_export.EmptySegmentationError:
             self.ui.openSegmentEditorButton.setEnabled(False)
             self.ui.statusLabel.setText(
@@ -217,9 +396,12 @@ class ScutumReviewPage(WizardPage):
         # Hide the landmark points now that the model exists -- they've
         # served their purpose, and otherwise sit right on top of the mesh
         # and get in the way of clicking to draw the outline on the next
-        # page.
+        # page. Same reasoning for the calibration seed points, if any were
+        # placed.
         if self.state.scutum_landmarks_fiducial_node is not None:
             self.state.scutum_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
+        if self.state.scutum_threshold_seeds_fiducial_node is not None:
+            self.state.scutum_threshold_seeds_fiducial_node.GetDisplayNode().SetVisibility(False)
 
         # Recenter the 3D view on the new model and orient the camera to
         # look from the correct side for this ear (self.state.ear_side) --
@@ -291,7 +473,8 @@ class ScutumReviewPage(WizardPage):
         )
         sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(temp_label_node))
         slicer.mrmlScene.RemoveNode(temp_label_node)
-        sitk_image = postprocess.run_full_postprocess(sitk_image)
+        sitk_image = postprocess.run_full_postprocess(sitk_image, close_tunnels=True)
+        self._check_and_display_wall_thickness(sitk_image)
 
         try:
             mesh = mesh_export.label_map_to_mesh(sitk_image)
@@ -316,10 +499,20 @@ class ScutumReviewPage(WizardPage):
         return True, ""
 
     def _on_reset_page_clicked(self):
+        # clear_page_state already resets scutum_threshold_seeds/
+        # scutum_threshold_seeds_fiducial_node to defaults (they're owned
+        # by "scutum_review" -- see wizard_state.PAGE_OWNED_FIELDS) and
+        # removes the seed fiducial node from the scene entirely. Re-run
+        # the same setup on_enter() uses so a fresh node exists if the
+        # surgeon places calibration points again -- self._seed_fiducial_node
+        # would otherwise be left pointing at a now-deleted node.
         wizard_state.clear_page_state(self.state, "scutum_review")
+        self._setup_calibration_seeds()
         self.ui.airThresholdSlider.value = config.DEFAULT_AIR_THRESHOLD
         self.ui.boneThresholdSlider.value = config.DEFAULT_BONE_THRESHOLD
         self.ui.openSegmentEditorButton.setEnabled(False)
+        self.ui.wallThicknessWarningLabel.setText("")
+        self.ui.wallThicknessWarningLabel.setVisible(False)
         self.ui.statusLabel.setText("Segmentation cleared. Adjust the sliders if needed, then click Run.")
 
     def _on_revert_to_here_clicked(self):
