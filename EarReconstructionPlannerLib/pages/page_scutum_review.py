@@ -1,15 +1,56 @@
 """
 page_scutum_review.py
 ========================
-Page 6: run the bone-wall segmentation and let the surgeon review/adjust
-it before moving on.
+Page 6: segment the bone wall using Slicer's own, surgeon-familiar
+Segment Editor -- embedded directly in this page (no navigating away to
+a separate module) -- and let the surgeon review/adjust it live before
+moving on.
 
-Two sliders (air threshold, bone threshold) mirror config.py's tunable
-values -- moving them re-runs the fast threshold-based segmentation
-(core/segment_dl.py, which itself may use a trained model later, or falls
-back to core/segment_threshold.py today). "Open Segment Editor" hands the
-result to Slicer's own, surgeon-familiar Segment Editor for manual
-touch-ups (painting/erasing), rather than reinventing that tool.
+Interactive Segment Editor rework (2026-07-30): previously this page ran
+its own custom SimpleITK threshold pipeline (core/segment_threshold.py's
+shell-restricted air-lumen-then-bone-wall search, with optional Hessian
+sheet enhancement) behind two plain sliders, with a separate "Open Segment
+Editor" button that navigated away to Slicer's SegmentEditor module for
+manual paint/erase touch-up. Thomas found Slicer's own interactive
+Threshold effect -- live preview as you drag, directly against the real
+data -- consistently more accurate than the automated pipeline could
+manage on its own (see CLAUDE.md's "Canal segmentation improvements" for
+the repeated real-scan struggles that pipeline had). This page now embeds
+a real `qMRMLSegmentEditorWidget` (Threshold + Paint/Erase/Islands/
+Smoothing effects) directly here:
+
+  1. "Auto-Calibrate & Segment" (one click) computes a starting bone
+     threshold -- from the optional 3-point seed calibration if placed,
+     else config.DEFAULT_BONE_THRESHOLD -- and applies it via the
+     Threshold effect to the WHOLE loaded volume (not a shell/ROI
+     restriction; that came later, see below), giving an immediate live
+     segmentation. Slicer auto-generates a real-time 3D closed-surface
+     preview for a visible segmentation node, so the surgeon sees the
+     result in the 3D view immediately, no custom mesh pipeline needed
+     yet.
+  2. The embedded widget stays live and interactive: dragging the
+     Threshold effect's own Minimum/Maximum sliders re-previews instantly
+     against the real volume, and Paint/Erase/Islands/Smoothing are
+     available for manual touch-up -- all inline, no page navigation.
+  3. "Preview 3D Result" (or Next) finalizes: pulls the segmentation's
+     current content, crops it down to the precise cylinder ROI (see
+     core/roi_crop.py), keeps only the connected component nearest the
+     canal axis (core/segment_threshold.py's axis-distance trick, reused
+     here since whole-volume thresholding can otherwise pick up unrelated
+     bone elsewhere in the ROI -- e.g. ossicles, or a sliver of adjacent
+     skull), runs the existing postprocess (speck removal/hole fill/
+     tunnel closing), and meshes the result for the draw page.
+
+Not used anymore by this page (left in place, still valid as a possible
+future Stage B fallback path via segment_dl.py): the old
+segment_threshold.segment_bone_wall()/segment_dl.segment() call, its air/
+bone slider pair, and the Hessian sheet-enhancement feature. Sub-voxel
+mesh extraction (mesh_export.label_map_to_mesh_subvoxel) is also no
+longer used here -- it only makes sense when a mask comes from a single,
+known threshold value with nothing else touching it, which no longer
+holds once Paint/Erase/manual edits can sit on top of the initial
+threshold. Plain label_map_to_mesh() is used instead, same as this page
+already did for a hand-edited segmentation before this rework.
 
 Expected widgets in page_scutum_review.ui:
   - tutorialLabel        (QLabel) -- extra guidance, shown only in tutorial mode
@@ -17,10 +58,11 @@ Expected widgets in page_scutum_review.ui:
   - calibrationInstructionLabel  (QLabel) -- current calibration step's instruction
   - placeCalibrationPointButton  (QPushButton)
   - redoCalibrationButton        (QPushButton) -- clear just the 3 calibration points
-  - airThresholdSlider   (QSlider or ctkSliderWidget)
-  - boneThresholdSlider  (QSlider or ctkSliderWidget)
-  - runButton            (QPushButton)
-  - openSegmentEditorButton (QPushButton)
+  - calibrateButton      (QPushButton) -- one-click auto-threshold + apply
+  - segmentEditorPlaceholder (QWidget, native, with its own layout) -- the
+    embedded qMRMLSegmentEditorWidget is inserted into this at runtime
+  - finalizeButton        (QPushButton) -- "Preview 3D Result": crop/select/
+    postprocess/mesh the current segmentation
   - progressBar          (QProgressBar) -- shown only while a background step (see
     base_page.WizardPage.run_blocking()) is running, hidden otherwise
   - statusLabel          (QLabel)
@@ -29,25 +71,25 @@ Expected widgets in page_scutum_review.ui:
   - revertToHereButton   (QPushButton) -- clear every later step, keep this segmentation
 
 Optional seed-click calibration (core/threshold_seeds.py): the surgeon can
-click 3 points (air / bone / soft tissue) before running, which pre-fills
-the two sliders below with per-scan-calibrated starting values. This is
-purely a convenience -- the sliders remain the actual source of truth and
-stay manually adjustable either way. See config.py's "seed-based threshold
-calibration" section for why this helps.
+click 3 points (air / bone / soft tissue) before running, which feeds
+"Auto-Calibrate & Segment" a per-scan-calibrated starting bone threshold
+instead of the fixed config default. Purely a convenience -- the embedded
+Threshold effect's own sliders remain the actual source of truth and stay
+manually adjustable either way.
 
-Post-segmentation thin-wall check (core/wall_quality.py): after Run (or
-after a Segment Editor edit is re-baked), the resulting wall is checked
-for suspiciously-thin regions and flagged via wallThicknessWarningLabel if
-found. Advisory only -- never blocks Next. See config.py's "post-
-segmentation wall-thickness warning" section for why no threshold choice
-can fix this failure mode.
+Post-segmentation thin-wall check (core/wall_quality.py): whenever the
+segmentation is finalized, the resulting wall is checked for suspiciously-
+thin regions and flagged via wallThicknessWarningLabel if found. Advisory
+only -- never blocks Next. See config.py's "post-segmentation
+wall-thickness warning" section for why no threshold choice can fix this
+failure mode.
 """
 
 from __future__ import annotations
 import os
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
 from EarReconstructionPlannerLib import wizard_state
-from core import roi_crop, segment_dl, postprocess, mesh_export, io_utils, threshold_seeds, wall_quality
+from core import roi_crop, postprocess, mesh_export, io_utils, threshold_seeds, wall_quality, segment_threshold
 from core.threshold_seeds import SEED_STEPS, ThresholdSeeds
 import config
 
@@ -73,68 +115,56 @@ class ScutumReviewPage(WizardPage):
             self.state.scutum_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
 
         self._setup_calibration_seeds()
+        self._setup_segment_editor()
 
         self.set_tutorial_text(
             "Before running, you can optionally click 'Place Calibration "
             "Point' three times -- once inside the air-filled canal, once "
-            "on bone, once on soft tissue -- to automatically fill in good "
-            "starting values for the two sliders below, tuned to this "
-            "specific scan. This step is optional; the default slider "
-            "values work reasonably well without it. If a point lands in "
-            "the wrong spot, use 'Redo Calibration Points' to start over.\n\n"
-            "This step automatically finds the bone wall of the ear canal "
-            "near the 2 points you placed. The two sliders control how "
-            "sensitive that search is:\n"
-            "- Air threshold: how dark a voxel must be to count as air (the "
-            "hollow part of the canal).\n"
-            "- Bone threshold: how bright a voxel must be to count as bone.\n"
-            "You usually don't need to change these -- click 'Run "
-            "Segmentation' first with the defaults and see what comes out.\n\n"
-            "After running, look at the result in the 3D view (left-drag to "
+            "on bone, once on soft tissue -- so 'Auto-Calibrate & Segment' "
+            "starts from a threshold tuned to this specific scan. This step "
+            "is optional; the plain default works reasonably well without "
+            "it. If a point lands in the wrong spot, use 'Redo Calibration "
+            "Points' to start over.\n\n"
+            "Click 'Auto-Calibrate & Segment' to get a first-pass "
+            "segmentation immediately. Below that is Slicer's own "
+            "segmentation tool, embedded right here: drag the Threshold "
+            "effect's Minimum/Maximum sliders and you'll see the result "
+            "update live, directly on the real scan. If small gaps or "
+            "stray bits remain, switch to the Paint, Erase, Islands, or "
+            "Smoothing effect (the row of buttons above the sliders) to "
+            "touch it up by hand -- click or drag over the volume in a "
+            "slice view.\n\n"
+            "Look at the result in the 3D view as you go (left-drag to "
             "rotate, middle-drag to pan, scroll or right-drag to zoom). The "
             "3D view has its own small toolbar in the top-left corner: the "
             "recenter button (a crosshair/target icon) reframes the camera "
-            "around whatever's currently visible, handy if you've rotated/"
-            "zoomed somewhere confusing. The small R/L/A/P/S/I axis-letter "
-            "widget in the corner of the 3D view lets you click a letter to "
-            "snap the camera to look from exactly that direction, which is "
-            "useful for judging the shape consistently.\n\n"
-            "If it looks wrong (missing wall, too much extra material, or "
-            "the status message says nothing was found), drag a slider to "
-            "adjust and click 'Run Segmentation' again -- you can do this "
-            "as many times as you like.\n\n"
-            "If the result is close but has small gaps or stray bits even "
-            "after adjusting the sliders, click 'Open Segment Editor for "
-            "Manual Touch-Up'. That opens Slicer's own painting tool: pick "
-            "the 'Paint' or 'Erase' effect on the left, adjust the brush "
-            "size, then click or drag over the volume in a slice view to add "
-            "or remove material by hand. Come back to this module (the "
-            "modules dropdown at the top) when you're done.\n\n"
-            "If a message appears after running saying the wall looks very "
-            "thin in places, it means the scan's resolution may not be fine "
-            "enough to reliably show the true wall thickness there. You can "
-            "still continue, but treat that area with extra caution and "
-            "consider a manual double-check."
+            "around whatever's currently visible. The small R/L/A/P/S/I "
+            "axis-letter widget in the corner lets you click a letter to "
+            "snap the camera to look from exactly that direction.\n\n"
+            "When it looks right, click 'Preview 3D Result' to build the "
+            "smoothed, cropped 3D surface the next page will use for "
+            "drawing -- or just click Next, which does the same thing "
+            "automatically.\n\n"
+            "If a message appears after previewing saying the wall looks "
+            "very thin in places, it means the scan's resolution may not "
+            "be fine enough to reliably show the true wall thickness "
+            "there. You can still continue, but treat that area with "
+            "extra caution and consider a manual double-check."
         )
-        self.ui.airThresholdSlider.minimum = config.AIR_THRESHOLD_ADJUST_RANGE[0]
-        self.ui.airThresholdSlider.maximum = config.AIR_THRESHOLD_ADJUST_RANGE[1]
-        self.ui.airThresholdSlider.value = config.DEFAULT_AIR_THRESHOLD
 
-        self.ui.boneThresholdSlider.minimum = config.BONE_THRESHOLD_ADJUST_RANGE[0]
-        self.ui.boneThresholdSlider.maximum = config.BONE_THRESHOLD_ADJUST_RANGE[1]
-        self.ui.boneThresholdSlider.value = config.DEFAULT_BONE_THRESHOLD
-
-        self.ui.runButton.clicked.connect(self._on_run_clicked)
-        self.ui.openSegmentEditorButton.clicked.connect(self._on_open_segment_editor_clicked)
+        self.ui.calibrateButton.clicked.connect(self._on_calibrate_clicked)
+        self.ui.finalizeButton.clicked.connect(self._on_finalize_clicked)
         self.ui.resetPageButton.clicked.connect(self._on_reset_page_clicked)
         self.ui.revertToHereButton.clicked.connect(self._on_revert_to_here_clicked)
         self.ui.placeCalibrationPointButton.clicked.connect(self._on_place_calibration_point_clicked)
         self.ui.redoCalibrationButton.clicked.connect(self._on_redo_calibration_clicked)
-        self.ui.openSegmentEditorButton.setEnabled(self.state.scutum_bone_wall_mesh_path is not None)
         self.ui.wallThicknessWarningLabel.setText("")
         self.ui.wallThicknessWarningLabel.setVisible(False)
         self.ui.progressBar.setVisible(False)
-        self.ui.statusLabel.setText("Adjust the sliders if needed, then click Run.")
+        self.ui.statusLabel.setText(
+            "Click 'Auto-Calibrate & Segment' to get started, or adjust the "
+            "Threshold sliders below directly."
+        )
 
     def _setup_calibration_seeds(self):
         import slicer
@@ -212,37 +242,10 @@ class ScutumReviewPage(WizardPage):
         self._update_calibration_step_display()
 
         if self.state.scutum_threshold_seeds.is_complete():
-            self._run_calibration()
-
-    def _run_calibration(self):
-        import sitkUtils
-
-        if self.state.volume_node is None:
-            self.ui.statusLabel.setText("No scan loaded -- go back and select one first.")
-            return
-
-        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(self.state.volume_node))
-        coarse_cropped = roi_crop.crop_to_landmark_region(sitk_image, self.state.scutum_landmarks)
-
-        try:
-            air_threshold, bone_threshold = threshold_seeds.calibrate_thresholds(
-                coarse_cropped, self.state.scutum_threshold_seeds
+            self.ui.statusLabel.setText(
+                "All calibration points placed. Click 'Auto-Calibrate & "
+                "Segment' to use them."
             )
-        except ValueError as exc:
-            self.ui.statusLabel.setText(str(exc))
-            return
-
-        self.ui.airThresholdSlider.value = air_threshold
-        self.ui.boneThresholdSlider.value = bone_threshold
-
-        warning = self.state.scutum_threshold_seeds.validate() or threshold_seeds.check_seed_plausibility(
-            coarse_cropped, self.state.scutum_threshold_seeds
-        )
-        self.ui.statusLabel.setText(
-            warning
-            or "Calibration points placed -- thresholds below were pre-filled. "
-            "Adjust the sliders if needed, then click Run Segmentation."
-        )
 
     def _on_redo_calibration_clicked(self):
         if self._seed_fiducial_node is not None:
@@ -251,191 +254,333 @@ class ScutumReviewPage(WizardPage):
         self._current_calib_step = 0
         self._update_calibration_step_display()
         self.ui.statusLabel.setText(
-            "Calibration points cleared. Place them again, or adjust the sliders directly."
+            "Calibration points cleared. Place them again, or use "
+            "'Auto-Calibrate & Segment' / the Threshold sliders directly."
         )
 
-    def _check_and_display_wall_thickness(self, bone_wall_sitk_image):
-        warning = wall_quality.check_wall_thickness(bone_wall_sitk_image)
-        self.ui.wallThicknessWarningLabel.setText(warning or "")
-        self.ui.wallThicknessWarningLabel.setVisible(bool(warning))
+    def _setup_segment_editor(self):
+        """Creates (or reuses) the persistent bone-wall segmentation node
+        and embeds a real qMRMLSegmentEditorWidget directly into this
+        page's layout -- the surgeon edits it inline, live, rather than
+        navigating away to Slicer's separate SegmentEditor module. The
+        widget instance itself is created once and cached on `self`
+        (this page controller is itself cached across visits -- see
+        EarReconstructionPlanner.py's _get_or_create_controller()), so
+        re-entering this page just re-points it at the current
+        segmentation node rather than rebuilding it."""
+        import slicer
+        import qt
 
-    def _on_run_clicked(self):
+        existing = self.state.scutum_bone_wall_segmentation_node
+        if existing is not None and slicer.mrmlScene.IsNodePresent(existing):
+            segmentation_node = existing
+        else:
+            segmentation_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLSegmentationNode", "ScutumBoneWallSegmentation"
+            )
+            segmentation_node.CreateDefaultDisplayNodes()
+            self.state.scutum_bone_wall_segmentation_node = segmentation_node
+        if segmentation_node.GetSegmentation().GetNumberOfSegments() == 0:
+            segmentation_node.GetSegmentation().AddEmptySegment("BoneWall")
+
+        # Show the live segmentation (not the finalized drawable model, if
+        # one already exists from a previous visit) while this page is
+        # active -- Slicer auto-generates a real-time 3D closed-surface
+        # representation for a visible segmentation node, which is what
+        # gives the "live visualization while adjusting" experience this
+        # rework is built around.
+        segmentation_node.GetDisplayNode().SetVisibility(True)
+        segmentation_node.GetDisplayNode().SetVisibility3D(True)
+        if self.state.scutum_bone_wall_model_node is not None:
+            self.state.scutum_bone_wall_model_node.GetDisplayNode().SetVisibility(False)
+
+        # Track segmentation content changes so on_leave_next() knows
+        # whether a fresh finalize is actually needed -- see that method's
+        # comment for why this replaces the old "_segmentation_edited"
+        # flag (which only tracked a separate "Open Segment Editor"
+        # excursion; editing is now the primary in-page interaction, so it
+        # needs to be tracked automatically instead).
+        if getattr(self, "_observed_segmentation_node", None) is not segmentation_node:
+            segmentation_node.AddObserver("ModifiedEvent", self._on_segmentation_modified)
+            self._observed_segmentation_node = segmentation_node
+            self._needs_finalize = True
+
+        if getattr(self, "_segment_editor_widget", None) is None:
+            self._segment_editor_widget = slicer.qMRMLSegmentEditorWidget()
+            self._segment_editor_widget.setMRMLScene(slicer.mrmlScene)
+            editor_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentEditorNode")
+            self._segment_editor_widget.setMRMLSegmentEditorNode(editor_node)
+            # Curated effect list -- the full Segment Editor exposes far
+            # more effects than a surgeon needs here. Threshold is the
+            # primary tool this whole rework is built around; Paint/Erase/
+            # Islands/Smoothing cover manual touch-up without overwhelming
+            # a non-Python-savvy surgeon with the rest (matches this
+            # project's "sliders not raw thresholds" usability priority).
+            self._segment_editor_widget.setEffectNameOrder(
+                ["Threshold", "Paint", "Erase", "Islands", "Smoothing"]
+            )
+            self._segment_editor_widget.unorderedEffectsVisible = False
+
+            layout = self.ui.segmentEditorPlaceholder.layout()
+            if layout is None:
+                layout = qt.QVBoxLayout(self.ui.segmentEditorPlaceholder)
+            layout.addWidget(self._segment_editor_widget)
+
+        self._segment_editor_widget.setSegmentationNode(segmentation_node)
+        # Slicer 5.2+ renamed "master volume" to "source volume" -- support
+        # both since this hasn't been runtime-tested against a specific
+        # Slicer version.
+        if hasattr(self._segment_editor_widget, "setSourceVolumeNode"):
+            self._segment_editor_widget.setSourceVolumeNode(self.state.volume_node)
+        else:
+            self._segment_editor_widget.setMasterVolumeNode(self.state.volume_node)
+
+    def _on_segmentation_modified(self, caller, event):
+        self._needs_finalize = True
+
+    def _on_calibrate_clicked(self):
         import sitkUtils
         import slicer
 
         if self.state.volume_node is None:
             self.ui.statusLabel.setText("No scan loaded -- go back and select one first.")
             return
+        if not self.state.scutum_landmarks.is_complete():
+            self.ui.statusLabel.setText(
+                "Ear canal landmarks aren't placed yet -- go back and place them first."
+            )
+            return
 
-        # See page_pinna_review.py's _on_run_clicked() and
-        # base_page.WizardPage.run_blocking()'s docstring for why the heavy
-        # steps below run on a background thread while a progress bar
-        # shows here -- canal segmentation is faster than the pinna
-        # pipeline on a typical scan, but segment_dl.segment() (especially
-        # with sheet enhancement enabled, config.ENABLE_SHEET_ENHANCEMENT --
-        # ~7x slower than plain thresholding, see config.py) and
-        # label_map_to_mesh_subvoxel() can still run long enough for
-        # Slicer's window to look "Not Responding" on a slower scan/machine.
-        self.ui.runButton.setEnabled(False)
+        self.ui.statusLabel.setText("Calibrating threshold...")
+        slicer.app.processEvents()
+
+        # Only used here to sample intensities for calibration -- the
+        # Threshold effect itself operates directly on self.state.volume_node
+        # (the whole loaded scan), not this pulled/cropped copy. See this
+        # file's module docstring for why thresholding no longer needs its
+        # own ROI restriction up front (that happens afterward, in
+        # _finalize_pipeline).
+        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(self.state.volume_node))
+        coarse_cropped = roi_crop.crop_to_landmark_region(sitk_image, self.state.scutum_landmarks)
+
+        if self.state.scutum_threshold_seeds.is_complete():
+            try:
+                _, bone_threshold = threshold_seeds.calibrate_thresholds(
+                    coarse_cropped, self.state.scutum_threshold_seeds
+                )
+            except ValueError as exc:
+                self.ui.statusLabel.setText(str(exc))
+                return
+            source = "your calibration points"
+        else:
+            bone_threshold = config.DEFAULT_BONE_THRESHOLD
+            source = "the default starting value"
+
+        self._apply_threshold(bone_threshold, config.SCUTUM_INTERACTIVE_THRESHOLD_MAX_HU)
+
+        self.ui.statusLabel.setText(
+            f"Segmented using {source} (bone threshold ~{bone_threshold:.0f} HU). "
+            "Drag the Threshold sliders below to adjust live, or use Paint/"
+            "Erase/Islands/Smoothing for manual touch-up. Click 'Preview 3D "
+            "Result' to see the final drawable surface, or just click Next "
+            "when it looks right."
+        )
+
+    def _apply_threshold(self, min_value: float, max_value: float) -> None:
+        """Drives Slicer's built-in Threshold effect programmatically,
+        following the documented Slicer script-repository recipe
+        (effect.setParameter("MinimumThreshold"/"MaximumThreshold", ...)
+        then effect.self().onApply()) -- unconfirmed against this
+        project's real Slicer install, like every other Segment-Editor-API
+        assumption noted in CLAUDE.md's Known Issues."""
+        self._segment_editor_widget.setActiveEffectByName("Threshold")
+        effect = self._segment_editor_widget.activeEffect()
+        if effect is None:
+            return
+        effect.setParameter("MinimumThreshold", str(min_value))
+        effect.setParameter("MaximumThreshold", str(max_value))
+        effect.self().onApply()
+
+    def _check_and_display_wall_thickness(self, bone_wall_sitk_image):
+        warning = wall_quality.check_wall_thickness(bone_wall_sitk_image)
+        self.ui.wallThicknessWarningLabel.setText(warning or "")
+        self.ui.wallThicknessWarningLabel.setVisible(bool(warning))
+
+    def _on_finalize_clicked(self):
+        import sitkUtils
+        import slicer
+
+        self.ui.finalizeButton.setEnabled(False)
         self.ui.progressBar.setVisible(True)
         self.ui.progressBar.setMinimum(0)
-        self.ui.progressBar.setMaximum(5)
+        self.ui.progressBar.setMaximum(6)
         self.ui.progressBar.setValue(0)
         try:
-            self._run_segmentation_pipeline(sitkUtils, slicer)
+            self._finalize_pipeline(sitkUtils, slicer)
         finally:
-            self.ui.runButton.setEnabled(True)
+            self.ui.finalizeButton.setEnabled(True)
             self.ui.progressBar.setVisible(False)
 
-    def _run_segmentation_pipeline(self, sitkUtils, slicer):
-        # Re-running this segmentation invalidates anything built on top of
-        # the old one (a defect outline drawn on the old bone-wall mesh,
-        # the verify approval, the heatmap) -- clear it up front so a
-        # surgeon adjusting thresholds and re-running can never end up
-        # silently carrying forward a now-mismatched downstream result.
+    def _run_finalize(self):
+        """Shared by the 'Preview 3D Result' button and on_leave_next() --
+        see _finalize_pipeline() for the actual steps. Returns (bool, str)
+        matching the WizardPage.on_leave_next() contract."""
+        import sitkUtils
+        import slicer
+
+        self.ui.progressBar.setVisible(True)
+        self.ui.progressBar.setMinimum(0)
+        self.ui.progressBar.setMaximum(6)
+        self.ui.progressBar.setValue(0)
+        try:
+            return self._finalize_pipeline(sitkUtils, slicer)
+        finally:
+            self.ui.progressBar.setVisible(False)
+
+    def _finalize_pipeline(self, sitkUtils, slicer):
+        """Derives the final drawable mesh from whatever is currently in
+        the live segmentation node -- crop to the precise ROI, keep only
+        the component nearest the canal axis, postprocess, mesh. Always
+        re-derives fresh from the segmentation node's current content
+        (never re-processes an already-finalized mesh), so this stays safe
+        against the "unconditional reprocessing erodes an already-good
+        result" failure mode documented in CLAUDE.md's Isolate Patch saga
+        -- the segmentation node itself, not a prior mesh, is the single
+        source of truth here.
+
+        Known tradeoff: keeping only the single connected component
+        nearest the canal axis means a manually-painted addition that
+        isn't connected to the main wall gets discarded. This matches the
+        existing shell-restriction philosophy elsewhere in this pipeline
+        (prevents accidentally keeping unrelated bone, e.g. ossicles or a
+        sliver of adjacent skull, now that thresholding runs across the
+        whole volume instead of a restricted shell) -- if a surgeon needs
+        to keep a deliberately-separate painted region, the Islands effect
+        (in the curated effect list above) is the tool for merging/
+        managing that before clicking Preview/Next.
+        """
         wizard_state.clear_downstream_state(self.state, "scutum_review")
 
         self.ui.wallThicknessWarningLabel.setText("")
         self.ui.wallThicknessWarningLabel.setVisible(False)
-        self.ui.statusLabel.setText("Segmenting bone wall...")
+
+        segmentation_node = self.state.scutum_bone_wall_segmentation_node
+        if segmentation_node is None or segmentation_node.GetSegmentation().GetNumberOfSegments() == 0:
+            message = "Nothing segmented yet -- click 'Auto-Calibrate & Segment' first."
+            self.ui.statusLabel.setText(message)
+            return False, message
+
+        self.ui.statusLabel.setText("Reading current segmentation...")
         slicer.app.processEvents()
 
-        # PullVolumeFromSlicer() returns the image in plain ITK/LPS
-        # convention, but scutum_landmarks were captured in Slicer's own
-        # RAS convention -- flip so every physical-coordinate calculation
-        # below (ROI cropping, axis math) operates in the same space the
-        # landmarks are in. See io_utils.flip_ras_lps's docstring for why
-        # this matters: without it, the ROI ends up mirrored across the
-        # sagittal/coronal planes from where the surgeon actually clicked.
-        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(self.state.volume_node))
-
-        # Cheap rectangular pre-crop around the landmarks BEFORE building
-        # the precise cylinder ROI mask -- build_roi_mask() evaluates every
-        # voxel in whatever image it's given, which is fine on an already-
-        # small volume but would try to allocate an array the size of the
-        # entire scan otherwise. See roi_crop.crop_to_landmark_region's
-        # docstring for details.
-        coarse_cropped = roi_crop.crop_to_landmark_region(
-            sitk_image, self.state.scutum_landmarks
+        # ExportVisibleSegmentsToLabelmapNode/PullVolumeFromSlicer is a
+        # plain image-format conversion, not the per-voxel physical-
+        # coordinate math that caused the real memory blowup documented in
+        # roi_crop.py -- fine to do once at full resolution. The coarse
+        # crop right after keeps everything downstream small, same as
+        # every other pipeline in this project.
+        temp_label_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLabelMapVolumeNode", "ScutumBoneWallExport"
         )
+        slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
+            segmentation_node, temp_label_node, self.state.volume_node
+        )
+        full_label = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(temp_label_node))
+        slicer.mrmlScene.RemoveNode(temp_label_node)
+
+        full_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(self.state.volume_node))
+
+        coarse_label = roi_crop.crop_to_landmark_region(full_label, self.state.scutum_landmarks)
+        coarse_image = roi_crop.crop_to_landmark_region(full_image, self.state.scutum_landmarks)
+        self.ui.progressBar.setValue(1)
 
         self.ui.statusLabel.setText("Building region of interest...")
         try:
             roi_mask = self.run_blocking(
-                lambda: roi_crop.build_roi_mask(coarse_cropped, self.state.scutum_landmarks)
+                lambda: roi_crop.build_roi_mask(coarse_image, self.state.scutum_landmarks)
             )
         except ValueError as exc:
             self.ui.statusLabel.setText(str(exc))
-            return
-        self.ui.progressBar.setValue(1)
+            return False, str(exc)
+        self.ui.progressBar.setValue(2)
 
         def _crop_to_roi_bbox():
             return (
-                roi_crop.crop_to_roi_bounding_box(coarse_cropped, roi_mask),
+                roi_crop.crop_to_roi_bounding_box(coarse_image, roi_mask),
+                roi_crop.crop_to_roi_bounding_box(coarse_label, roi_mask),
                 roi_crop.crop_to_roi_bounding_box(roi_mask, roi_mask),
             )
 
-        cropped_image, cropped_roi_mask = self.run_blocking(
+        cropped_image, cropped_label, cropped_roi_mask = self.run_blocking(
             _crop_to_roi_bbox, status_text="Cropping to region of interest..."
-        )
-        self.ui.progressBar.setValue(2)
-
-        raw_bone_wall, intensity_override_mask = self.run_blocking(
-            lambda: segment_dl.segment(
-                cropped_image,
-                cropped_roi_mask,
-                self.state.scutum_landmarks,
-                air_threshold=self.ui.airThresholdSlider.value,
-                bone_threshold=self.ui.boneThresholdSlider.value,
-            ),
-            status_text="Segmenting bone wall...",
         )
         self.ui.progressBar.setValue(3)
 
-        # Kept alongside the postprocessed result -- mesh_export.
-        # label_map_to_mesh_subvoxel() needs both, to tell which voxels
-        # postprocessing actually changed (see its docstring).
+        def _select_component():
+            import numpy as np
+            import SimpleITK as sitk
+
+            label_array = sitk.GetArrayFromImage(cropped_label).astype(bool)
+            roi_array = sitk.GetArrayFromImage(cropped_roi_mask).astype(bool)
+            restricted = label_array & roi_array
+
+            if not restricted.any():
+                return None
+
+            # Whole-volume thresholding can pick up unrelated bone
+            # elsewhere in the ROI -- keep only the connected piece
+            # closest to the surgeon's canal axis, same trick
+            # segment_threshold.py uses for the air lumen (the
+            # implementation is generic; reused here for the bone-labeled
+            # array instead).
+            labeled_array, num_components = segment_threshold._label_6_connected(restricted)
+            if num_components == 0:
+                return None
+            best_id = segment_threshold._closest_component_to_axis_line(
+                labeled_array, num_components, cropped_image, self.state.scutum_landmarks
+            )
+            selected_array = (labeled_array == best_id).astype(np.uint8)
+            selected = sitk.GetImageFromArray(selected_array)
+            selected.CopyInformation(cropped_image)
+            return selected
+
+        raw_bone_wall = self.run_blocking(_select_component, status_text="Selecting the canal wall...")
+        self.ui.progressBar.setValue(4)
+
+        if raw_bone_wall is None:
+            message = (
+                "No material found inside the region of interest. Go back to "
+                "the Threshold effect and lower the minimum, or paint some "
+                "material in directly."
+            )
+            self.ui.statusLabel.setText(message)
+            return False, message
+
         bone_wall = self.run_blocking(
             lambda: postprocess.run_full_postprocess(raw_bone_wall, close_tunnels=True),
             status_text="Cleaning up segmentation...",
         )
-        self.ui.progressBar.setValue(4)
+        self.ui.progressBar.setValue(5)
         self._check_and_display_wall_thickness(bone_wall)
 
-        # Push into a segmentation node (not a plain labelmap) so it's
-        # something Segment Editor can actually operate on -- Segment
-        # Editor edits vtkMRMLSegmentationNodes, not label map volumes
-        # directly. The labelmap node here is just a throwaway bridge for
-        # the conversion Slicer's segmentations logic expects; it's
-        # removed once the segmentation node owns the data.
-        temp_label_node = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLLabelMapVolumeNode", "ScutumBoneWallTemp"
-        )
-        # bone_wall is RAS-consistent (inherited from the flipped
-        # sitk_image above); flip back to LPS since PushVolumeToSlicer
-        # expects plain ITK convention and converts LPS->RAS itself.
-        sitkUtils.PushVolumeToSlicer(io_utils.flip_ras_lps(bone_wall), temp_label_node)
-
-        if self.state.scutum_bone_wall_segmentation_node is not None:
-            slicer.mrmlScene.RemoveNode(self.state.scutum_bone_wall_segmentation_node)
-        segmentation_node = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLSegmentationNode", "ScutumBoneWallSegmentation"
-        )
-        segmentation_node.CreateDefaultDisplayNodes()
-        slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
-            temp_label_node, segmentation_node
-        )
-        slicer.mrmlScene.RemoveNode(temp_label_node)
-        # Hidden by default -- the exported/smoothed model node below is
-        # what the surgeon sees and draws on in the 3D view. Without this,
-        # the segmentation's own auto-generated 3D surface would sit right
-        # on top of that model as a visually-duplicated, unsmoothed copy.
-        # Segment Editor's own slice-view painting doesn't need this node
-        # visible to work on it.
-        segmentation_node.GetDisplayNode().SetVisibility(False)
-        self.state.scutum_bone_wall_segmentation_node = segmentation_node
-        # This freshly-built segmentation already went through
-        # run_full_postprocess() once, right above -- see
-        # _refresh_mesh_from_segmentation()'s matching comment for why
-        # this flag exists.
-        self._segmentation_edited = False
-
-        # Also export a mesh now -- the draw page (next-but-one) needs an
-        # actual surface to draw on, and re-running mesh export there would
-        # duplicate this work. Uses the still-RAS-consistent `bone_wall`
-        # (not the flipped copy just pushed above) so the exported mesh's
-        # vertices are in RAS and line up correctly when loaded back into
-        # Slicer alongside the volume.
-        #
-        # Uses the sub-voxel extraction (real smoothed intensity near the
-        # boundary, not the already-binarized mask) since this mesh comes
-        # straight from thresholding `cropped_image` at boneThresholdSlider's
-        # value -- there's a real isovalue to extract against. This is NOT
-        # used in _refresh_mesh_from_segmentation() below: after a Segment
-        # Editor hand-edit, the mask boundary is whatever the surgeon
-        # painted, with no single threshold it corresponds to, so that path
-        # correctly keeps using plain label_map_to_mesh().
+        # Plain marching cubes, not the sub-voxel variant -- this
+        # segmentation may include manual Paint/Erase touch-ups on top of
+        # the threshold, so there's no longer a single isovalue the whole
+        # boundary corresponds to (see this file's module docstring).
         try:
             mesh = self.run_blocking(
-                lambda: mesh_export.label_map_to_mesh_subvoxel(
-                    cropped_image,
-                    bone_wall,
-                    raw_bone_wall,
-                    self.ui.boneThresholdSlider.value,
-                    intensity_override_mask=intensity_override_mask,
-                ),
+                lambda: mesh_export.label_map_to_mesh(bone_wall),
                 status_text="Building 3D surface mesh...",
             )
         except mesh_export.EmptySegmentationError:
-            self.ui.openSegmentEditorButton.setEnabled(False)
-            self.ui.statusLabel.setText(
-                "No bone wall found with these settings. Try lowering the "
-                "bone threshold or adjusting the air threshold, or go back "
-                "and double-check the landmark placement. (The empty "
-                "segmentation is still visible in the slice views.)"
+            message = (
+                "No bone wall found after cleanup. Try lowering the threshold "
+                "minimum or painting in more material, or go back and "
+                "double-check the landmark placement."
             )
-            return
-        self.ui.progressBar.setValue(5)
+            self.ui.statusLabel.setText(message)
+            return False, message
+        self.ui.progressBar.setValue(6)
 
         mesh_path = os.path.join(
             self.state.working_dir or slicer.app.temporaryPath, "scutum_bone_wall.stl"
@@ -447,161 +592,44 @@ class ScutumReviewPage(WizardPage):
             slicer.mrmlScene.RemoveNode(self.state.scutum_bone_wall_model_node)
         self.state.scutum_bone_wall_model_node = slicer.util.loadModel(mesh_path)
 
-        # Hide the landmark points now that the model exists -- they've
-        # served their purpose, and otherwise sit right on top of the mesh
-        # and get in the way of clicking to draw the outline on the next
-        # page. Same reasoning for the calibration seed points, if any were
-        # placed.
+        # Hide the live segmentation now that the finalized drawable model
+        # is showing the same thing -- avoids visually duplicating it in
+        # the 3D view.
+        segmentation_node.GetDisplayNode().SetVisibility(False)
+
         if self.state.scutum_landmarks_fiducial_node is not None:
             self.state.scutum_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
         if self.state.scutum_threshold_seeds_fiducial_node is not None:
             self.state.scutum_threshold_seeds_fiducial_node.GetDisplayNode().SetVisibility(False)
 
-        # Recenter the 3D view on the new model and orient the camera to
-        # look from the correct side for this ear (self.state.ear_side) --
-        # see base_page.WizardPage.recenter_3d_view() for why this can't
-        # just always look from the Right.
         self.recenter_3d_view()
 
-        self.ui.openSegmentEditorButton.setEnabled(True)
-        # Explicit, unmissable-in-the-UI confirmation of whether sheet
-        # enhancement actually ran on this click -- added after real-Slicer
-        # testing showed no visible change across several tuning rounds,
-        # so it was no longer safe to just assume the intended code path
-        # was the one actually executing. See core/segment_threshold.py's
-        # matching Python-console log line for the full diagnostic detail
-        # (gamma_scale, per-response statistics, etc).
-        sheetness_status = (
-            f"Sheet enhancement: ON (gamma_scale={config.SHEETNESS_GAMMA_AUTO_SCALE})"
-            if config.ENABLE_SHEET_ENHANCEMENT
-            else "Sheet enhancement: OFF"
-        )
+        self._needs_finalize = False
         self.ui.statusLabel.setText(
-            "Segmentation complete. Review it in the 3D view, adjust sliders "
-            "and re-run if needed, or open Segment Editor for manual touch-ups.\n"
-            f"[{sheetness_status}]"
+            "3D surface ready. Review it in the 3D view -- go back to the "
+            "Threshold/Paint/Erase tools above and click 'Preview 3D Result' "
+            "again if you want to adjust it further, or click Next to continue."
         )
-
-    def _on_open_segment_editor_clicked(self):
-        import slicer
-
-        # Mark the segmentation as possibly touched, so
-        # _refresh_mesh_from_segmentation() knows to re-postprocess it --
-        # see that method's comment for why this matters.
-        self._segmentation_edited = True
-
-        slicer.util.selectModule("SegmentEditor")
-        # Hide the drawing model and show the segmentation in its place --
-        # otherwise the two would overlap in the 3D view while editing.
-        if self.state.scutum_bone_wall_model_node is not None:
-            self.state.scutum_bone_wall_model_node.GetDisplayNode().SetVisibility(False)
-        segmentation_display_node = self.state.scutum_bone_wall_segmentation_node.GetDisplayNode()
-        segmentation_display_node.SetVisibility(True)
-        segmentation_display_node.SetVisibility3D(True)
-        editor_widget = slicer.modules.segmenteditor.widgetRepresentation().self().editor
-        editor_widget.setSegmentationNode(self.state.scutum_bone_wall_segmentation_node)
-        # Slicer 5.2+ renamed "master volume" to "source volume" -- support
-        # both since this hasn't been runtime-tested against a specific
-        # Slicer version.
-        if hasattr(editor_widget, "setSourceVolumeNode"):
-            editor_widget.setSourceVolumeNode(self.state.volume_node)
-        else:
-            editor_widget.setMasterVolumeNode(self.state.volume_node)
-
-    def _refresh_mesh_from_segmentation(self):
-        """Re-bakes the drawn-on mesh from the segmentation node's current
-        contents, to reflect manual Segment Editor edits. Only called (see
-        on_leave_next()) if self._segmentation_edited is True -- i.e. the
-        surgeon actually opened Segment Editor since this segmentation was
-        last (re)built. Skipped entirely otherwise: see the matching
-        comment in page_pinna_review.py's version of this method -- even
-        without reapplying postprocessing, routing an *unedited*
-        segmentation back through ExportVisibleSegmentsToLabelmapNode ->
-        PullVolumeFromSlicer -> marching cubes isn't guaranteed to
-        reproduce the exact mesh already built (and already reviewed) in
-        _on_run_clicked(), and confirmed on a real scan (2026-07-27, pinna
-        stage) that this round trip can erode real thin anatomy for no
-        benefit when nothing actually changed. Same risk applies here in
-        principle. If Segment Editor WAS used, the freshly hand-edited
-        content hasn't been postprocessed at all yet, so re-deriving and
-        postprocessing once here is still correct and necessary."""
-        import slicer
-        import sitkUtils
-
-        segmentation_node = self.state.scutum_bone_wall_segmentation_node
-        if segmentation_node is None:
-            return True, ""
-
-        temp_label_node = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLLabelMapVolumeNode", "ScutumBoneWallEdited"
-        )
-        slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
-            segmentation_node, temp_label_node
-        )
-        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(temp_label_node))
-        slicer.mrmlScene.RemoveNode(temp_label_node)
-
-        # See _on_run_clicked()/run_blocking()'s docstring in base_page.py
-        # for why these run on a background thread while a progress bar
-        # shows here -- this same postprocess+meshing round trip runs
-        # whenever the surgeon clicks Next after touching up in Segment
-        # Editor.
-        self.ui.progressBar.setVisible(True)
-        self.ui.progressBar.setMinimum(0)
-        self.ui.progressBar.setMaximum(2)
-        self.ui.progressBar.setValue(0)
-        try:
-            sitk_image = self.run_blocking(
-                lambda: postprocess.run_full_postprocess(sitk_image, close_tunnels=True),
-                status_text="Cleaning up your edited segmentation...",
-            )
-            self.ui.progressBar.setValue(1)
-            self._check_and_display_wall_thickness(sitk_image)
-
-            try:
-                mesh = self.run_blocking(
-                    lambda: mesh_export.label_map_to_mesh(sitk_image),
-                    status_text="Building 3D surface mesh...",
-                )
-            except mesh_export.EmptySegmentationError:
-                return False, (
-                    "The segmentation is empty after your Segment Editor edits. "
-                    "Go back to Segment Editor and add material back, or "
-                    "re-run the automatic segmentation."
-                )
-            self.ui.progressBar.setValue(2)
-        finally:
-            self.ui.progressBar.setVisible(False)
-
-        mesh_export.export_mesh(mesh, self.state.scutum_bone_wall_mesh_path)
-        if self.state.scutum_bone_wall_model_node is not None:
-            slicer.mrmlScene.RemoveNode(self.state.scutum_bone_wall_model_node)
-        self.state.scutum_bone_wall_model_node = slicer.util.loadModel(
-            self.state.scutum_bone_wall_mesh_path
-        )
-        self.state.scutum_bone_wall_model_node.GetDisplayNode().SetVisibility(True)
-        # Hide the segmentation again now that the refreshed model node is
-        # showing the same thing -- keeps it from visually duplicating the
-        # drawing model on the next page.
-        segmentation_node.GetDisplayNode().SetVisibility(False)
         return True, ""
 
     def _on_reset_page_clicked(self):
         # clear_page_state already resets scutum_threshold_seeds/
-        # scutum_threshold_seeds_fiducial_node to defaults (they're owned
-        # by "scutum_review" -- see wizard_state.PAGE_OWNED_FIELDS) and
-        # removes the seed fiducial node from the scene entirely. Re-run
-        # the same setup on_enter() uses so a fresh node exists if the
-        # surgeon places calibration points again -- self._seed_fiducial_node
-        # would otherwise be left pointing at a now-deleted node.
+        # scutum_threshold_seeds_fiducial_node/scutum_bone_wall_segmentation_node
+        # to defaults (they're owned by "scutum_review" -- see
+        # wizard_state.PAGE_OWNED_FIELDS) and removes their MRML nodes from
+        # the scene entirely. Re-run the same setup on_enter() uses so a
+        # fresh segmentation node/fiducial node exists for the surgeon to
+        # use again.
         wizard_state.clear_page_state(self.state, "scutum_review")
+        self._observed_segmentation_node = None
+        self._needs_finalize = True
         self._setup_calibration_seeds()
-        self.ui.airThresholdSlider.value = config.DEFAULT_AIR_THRESHOLD
-        self.ui.boneThresholdSlider.value = config.DEFAULT_BONE_THRESHOLD
-        self.ui.openSegmentEditorButton.setEnabled(False)
+        self._setup_segment_editor()
         self.ui.wallThicknessWarningLabel.setText("")
         self.ui.wallThicknessWarningLabel.setVisible(False)
-        self.ui.statusLabel.setText("Segmentation cleared. Adjust the sliders if needed, then click Run.")
+        self.ui.statusLabel.setText(
+            "Segmentation cleared. Click 'Auto-Calibrate & Segment' to start again."
+        )
 
     def _on_revert_to_here_clicked(self):
         import slicer
@@ -618,13 +646,28 @@ class ScutumReviewPage(WizardPage):
             "Later steps cleared. Go to Next when ready to redo them."
         )
 
+    def on_leave_back(self):
+        self._deactivate_segment_editor()
+
     def on_leave_next(self):
-        if self.state.scutum_bone_wall_mesh_path is None:
-            return False, "Please run the segmentation before continuing."
-        # Only re-derive the mesh from the segmentation if Segment Editor
-        # was actually used -- see _refresh_mesh_from_segmentation's
-        # docstring for why doing this unconditionally is both pointless
-        # and risky when nothing was actually edited.
-        if getattr(self, "_segmentation_edited", False):
-            return self._refresh_mesh_from_segmentation()
+        self._deactivate_segment_editor()
+        # Skip re-finalizing if nothing has changed in the segmentation
+        # since the last successful finalize -- see _setup_segment_editor's
+        # ModifiedEvent observer. Always finalizes at least once (a fresh
+        # controller/page has no mesh path yet), and always re-finalizes
+        # after any Threshold/Paint/Erase/Islands/Smoothing change.
+        if self.state.scutum_bone_wall_mesh_path is not None and not getattr(self, "_needs_finalize", True):
+            return True, ""
+        ok, message = self._run_finalize()
+        if not ok:
+            return False, message or "Please finish segmenting before continuing."
         return True, ""
+
+    def _deactivate_segment_editor(self):
+        """Standard Slicer module-exit convention for an embedded Segment
+        Editor widget -- deactivating the active effect releases any
+        interaction-event observers it holds on the slice/3D views, so
+        they don't linger while a different wizard page is showing."""
+        widget = getattr(self, "_segment_editor_widget", None)
+        if widget is not None:
+            widget.setActiveEffectByName(None)

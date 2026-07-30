@@ -44,7 +44,7 @@
    <item>
     <widget class="QLabel" name="calibrationInstructionLabel">
      <property name="text">
-      <string>Optional: click 3 points (air, bone, soft tissue) to auto-fill the thresholds below.</string>
+      <string>Optional: click 3 points (air, bone, soft tissue) to auto-fill the starting threshold.</string>
      </property>
      <property name="wordWrap">
       <bool>true</bool>
@@ -66,44 +66,55 @@
     </widget>
    </item>
    <item>
-    <widget class="QLabel" name="label1">
+    <widget class="QPushButton" name="calibrateButton">
      <property name="text">
-      <string>Air threshold</string>
+      <string>Auto-Calibrate &amp; Segment</string>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+      </font>
      </property>
     </widget>
    </item>
    <item>
-    <widget class="ctkSliderWidget" name="airThresholdSlider">
-     <property name="decimals">
-      <number>0</number>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QLabel" name="label2">
+    <widget class="QLabel" name="segmentEditorLabel">
      <property name="text">
-      <string>Bone threshold</string>
+      <string>Adjust the threshold live below, or use Paint/Erase/Islands/Smoothing for manual touch-up:</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
      </property>
     </widget>
    </item>
    <item>
-    <widget class="ctkSliderWidget" name="boneThresholdSlider">
-     <property name="decimals">
-      <number>0</number>
+    <widget class="QWidget" name="segmentEditorPlaceholder" native="true">
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>450</height>
+      </size>
      </property>
+     <layout class="QVBoxLayout" name="segmentEditorPlaceholderLayout">
+      <property name="leftMargin">
+       <number>0</number>
+      </property>
+      <property name="topMargin">
+       <number>0</number>
+      </property>
+      <property name="rightMargin">
+       <number>0</number>
+      </property>
+      <property name="bottomMargin">
+       <number>0</number>
+      </property>
+     </layout>
     </widget>
    </item>
    <item>
-    <widget class="QPushButton" name="runButton">
+    <widget class="QPushButton" name="finalizeButton">
      <property name="text">
-      <string>Run Segmentation</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QPushButton" name="openSegmentEditorButton">
-     <property name="text">
-      <string>Open Segment Editor for Manual Touch-Up</string>
+      <string>Preview 3D Result</string>
      </property>
     </widget>
    </item>
@@ -182,13 +193,6 @@
    </item>
   </layout>
  </widget>
- <customwidgets>
-  <customwidget>
-   <class>ctkSliderWidget</class>
-   <extends>QWidget</extends>
-   <header>ctkSliderWidget.h</header>
-  </customwidget>
- </customwidgets>
  <resources/>
  <connections/>
 </ui>

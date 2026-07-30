@@ -123,6 +123,16 @@ DEFAULT_BONE_THRESHOLD = 100
 # implausible values.
 BONE_THRESHOLD_ADJUST_RANGE = (-200, 2000)
 
+# Upper cap (Hounsfield-Units) used only as the "Maximum" value when
+# page_scutum_review.py's "Auto-Calibrate & Segment" button applies a
+# calibrated starting threshold via Slicer's own embedded Segment Editor
+# Threshold effect (see that page's module docstring for the interactive-
+# threshold rework). Deliberately high so the initial 1-click segmentation
+# never silently excludes real dense cortical bone above the calibrated
+# minimum -- the surgeon can still narrow it from the effect's own Maximum
+# slider afterward for a specific case.
+SCUTUM_INTERACTIVE_THRESHOLD_MAX_HU = 3000
+
 # Expected thickness (in mm) of the bony ear canal wall. This defines how
 # far outward from the air-lumen scaffold we look for bone. Generous on
 # purpose -- it only needs to comfortably contain the true wall thickness,

@@ -48,6 +48,19 @@ don't assume "confirmed working end-to-end" still covers these three
 pages' current code without checking whether anything's been touched
 since 07-28/29.
 
+**`page_scutum_review.py` was substantially rewritten again, same day
+(2026-07-30), superseding the above for that page specifically** — see
+"Interactive Segment Editor threshold rework" below. The old slider+Run
+threshold pipeline was replaced with an embedded, live
+`qMRMLSegmentEditorWidget` (Slicer's own Threshold/Paint/Erase/Islands/
+Smoothing effects, used directly in-page). **First real-Slicer test
+(2026-07-30, same day): core operations confirmed good** — Thomas
+reported the actual segmentation is noticeably more accurate than the old
+automated pipeline, and the level of automation (one-click calibrate,
+live adjust) feels right. **Some interface fixes still needed — not yet
+specified.** Next session: ask Thomas what specifically about the
+interface needs fixing before doing anything else here; don't guess.
+
 **Not yet exercised in real Slicer:** Verify page; Curvature page's Qt
 widgets (progress streaming, results table, heatmap vertex-color
 display, and the new progress-bar parsing added 2026-07-30 -- see "Pinna
@@ -838,6 +851,132 @@ Not yet real-Slicer tested.
 
 ---
 
+## Interactive Segment Editor threshold rework (2026-07-30)
+
+Large architecture change to `page_scutum_review.py`, replacing the custom
+SimpleITK threshold pipeline (two plain sliders -> `segment_dl.segment()` ->
+`segment_threshold.segment_bone_wall()`, with a separate "Open Segment
+Editor" button that navigated away to Slicer's SegmentEditor module for
+manual touch-up) with a real `qMRMLSegmentEditorWidget` embedded directly
+in the page.
+
+**Motivation**: after the multi-round sheetness/CurvatureFlow struggle
+documented in "Improving Canal Segmentation" below (four real-scan A/B
+rounds, none of which fixed the thin-wall/scutum-malleus-fusion
+complaints), Thomas reported that Slicer's own interactive Threshold
+effect -- live preview as you drag, directly against the real data --
+was consistently more accurate than the automated pipeline could manage.
+Rather than keep tuning constants against a low-resolution generalization
+problem no amount of calibration seemed to solve (see that section's
+closing "Lesson"), this rework puts a human in the loop for the actual
+threshold decision, using Slicer's own mature, well-tested tool instead
+of reimplementing it.
+
+**New flow**:
+1. **"Auto-Calibrate & Segment" (one click)**: computes a starting bone
+   threshold -- from the existing optional 3-point seed calibration
+   (`core/threshold_seeds.py`) if placed, else `config.DEFAULT_BONE_THRESHOLD`
+   -- and applies it via the Threshold effect (`effect.setParameter
+   ("MinimumThreshold"/"MaximumThreshold", ...)`, `effect.self().onApply()`
+   -- the documented Slicer script-repository recipe) to the **whole
+   loaded volume**, not a shell/ROI restriction. This directly matches
+   Thomas's own proposed design ("segment the whole volume, then crop
+   afterward using the ROI") -- Threshold is fast native VTK/ITK code even
+   over a full CT, unlike the SimpleITK/scipy pipeline steps that needed
+   `run_blocking()`'s background-thread treatment (see "Pinna segmentation
+   performance" above). A visible segmentation node auto-generates a
+   real-time 3D closed-surface representation in Slicer, so the surgeon
+   sees a live 3D result immediately -- no custom mesh pipeline needed
+   just to preview.
+2. **Live manual adjustment**: the embedded widget stays interactive
+   afterward. Dragging the Threshold effect's own Minimum/Maximum sliders
+   re-previews instantly against the real volume (Slicer's own built-in
+   behavior, not custom code). A curated effect list (`setEffectNameOrder
+   (["Threshold", "Paint", "Erase", "Islands", "Smoothing"])`,
+   `unorderedEffectsVisible = False`) keeps the toolbar simple rather than
+   exposing Segment Editor's full effect set, matching this project's
+   "sliders not raw thresholds" usability priority -- Paint/Erase/Islands/
+   Smoothing cover manual touch-up inline, replacing the old separate
+   "Open Segment Editor" button/page-navigation entirely.
+3. **"Preview 3D Result" (or Next)**: finalizes -- pulls the segmentation
+   node's current content (`ExportVisibleSegmentsToLabelmapNode`), coarse-
+   crops to the landmark region, builds the precise cylinder ROI
+   (`core/roi_crop.py`, unchanged), and keeps only the connected component
+   nearest the canal axis (`segment_threshold._closest_component_to_axis_line`
+   / `_label_6_connected`, reused as-is -- the function was already generic
+   despite being written for the air-lumen case). This step exists because
+   whole-volume thresholding can pick up unrelated bone elsewhere in the
+   ROI (ossicles, a sliver of adjacent skull) now that there's no shell
+   restriction. Then the existing `postprocess.run_full_postprocess(...,
+   close_tunnels=True)` and a mesh export, same as before.
+
+**Known tradeoffs, deliberate**:
+- **Nearest-component selection can discard a disconnected manual paint
+  addition.** If a surgeon paints material that isn't touching the main
+  wall, finalize keeps only the component nearest the canal axis and
+  drops the rest. Matches this pipeline's existing shell-restriction
+  philosophy elsewhere (prevents accidentally keeping unrelated bone) --
+  the Islands effect (in the curated list) is the tool for managing a
+  genuinely separate painted region before finalizing.
+- **Sub-voxel mesh extraction (`mesh_export.label_map_to_mesh_subvoxel`)
+  is no longer used here.** It only makes sense when a mask comes from a
+  single known threshold value with nothing else touching it -- once
+  Paint/Erase edits can sit on top of the initial threshold, there's no
+  single isovalue left to extract against. Falls back to plain
+  `label_map_to_mesh()`, same as this page already did for a hand-edited
+  segmentation before this rework. A real (if modest, per that feature's
+  own original ~15-20% RMS boundary-error claim) precision loss, accepted
+  in exchange for the interactive-threshold accuracy gain motivating this
+  whole change.
+- **`segment_dl.py`/`segment_threshold.py` (including sheetness/
+  CurvatureFlow) are no longer called by this page**, but were
+  deliberately left in place, not deleted -- `segment_dl.py`'s Stage
+  A/Stage B fallback structure remains valid architecture for a
+  hypothetical future trained model, and nothing else in the codebase
+  currently depends on it being wired into the UI. If Stage B ever gets
+  trained, it will need a new call site (this page no longer has one).
+- **Downstream-invalidation timing changed**: the old page cleared
+  downstream state (drawn outline, verify, heatmap) on every "Run" click.
+  The new page has no equivalent single "run" moment (editing happens
+  continuously via the live widget), so it instead clears downstream
+  state at the start of every **finalize** (Preview 3D Result / Next), and
+  tracks whether a finalize is actually needed via a `ModifiedEvent`
+  observer on the segmentation node (`_needs_finalize`, set True on any
+  Threshold/Paint/Erase/Islands/Smoothing change) so clicking Next twice
+  in a row without touching anything in between doesn't needlessly
+  re-run the pipeline. This is NOT the same risk pattern as the Isolate
+  Patch saga's "unconditional reprocessing eroded an already-good mesh"
+  bug (see "Key lessons" below) -- finalize always derives fresh from the
+  live segmentation node (the actual source of truth), never re-processes
+  an already-finalized mesh.
+
+**First real-Slicer test (2026-07-30, same day): core operations
+confirmed good.** Thomas reported the segmentation this produces is
+noticeably more accurate than the old automated threshold pipeline, and
+that the automation level (one-click calibrate, then live adjust) is
+where he wants it -- i.e. the central premise of this rework (a human in
+the loop, using Slicer's own mature Threshold effect, beats fighting the
+generalization problem sheetness/CurvatureFlow tuning kept hitting) is
+validated on a real scan, not just synthetically/by design intent. This
+also serves as the first real confirmation that the previously-unconfirmed
+API surface actually works: embedding `slicer.qMRMLSegmentEditorWidget()`
+in this page's own `.ui` layout, `setEffectNameOrder`/
+`unorderedEffectsVisible`, and driving the Threshold effect via
+`effect.setParameter(...)`/`effect.self().onApply()` all function in
+practice, not just per-docs.
+
+**Still open: unspecified interface fixes.** Thomas said "there are some
+fixes to make for the interface" before signing off for the day, without
+saying what -- **next session must ask what specifically, before touching
+this page again.** Don't guess at UI complaints (button placement, sizing
+of the embedded widget's minimum-height=450 frame, wording, the
+calibration-seed workflow feeling redundant now that Auto-Calibrate
+exists, progress bar behavior, something about the curated effect list,
+etc. are all plausible but unconfirmed candidates -- get the actual list
+from Thomas first).
+
+---
+
 ## Improving Canal Segmentation
 
 Multi-session push to improve `segment_threshold.py` quality, motivated by
@@ -1439,6 +1578,15 @@ don't.
    `slicer.app.processEvents()` (scratchpad, not committed), NOT yet
    against Slicer's real Qt/VTK event loop. If "Not Responding" still
    appears after this fix, that's the first thing to re-examine.
+5. (2026-07-30) `page_scutum_review.py`'s embedded `qMRMLSegmentEditorWidget`
+   -- see "Interactive Segment Editor threshold rework": instantiating the
+   widget class directly and inserting it into a scripted module's own
+   `.ui` layout (rather than reusing the SegmentEditor module's singleton
+   instance), `setEffectNameOrder`/`unorderedEffectsVisible` to curate the
+   effect list, and driving the Threshold effect via `effect.setParameter
+   ("MinimumThreshold"/"MaximumThreshold", ...)` + `effect.self().onApply()`
+   are all unconfirmed against this project's real Slicer install. This is
+   the single biggest untested surface in the codebase right now.
 
 ---
 
