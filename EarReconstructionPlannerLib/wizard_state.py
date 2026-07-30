@@ -78,6 +78,7 @@ class WizardState:
     heatmap_output_path: Optional[str] = None  # pinna_heatmap.ply
     heatmap_model_node = None  # vtkMRMLModelNode, removed+reloaded on re-run
     ranked_sites_csv_path: Optional[str] = None  # top_harvest_sites.csv
+    harvest_site_markup_node = None  # vtkMRMLMarkupsFiducialNode, one labeled point per ranked candidate, individually hidden/shown by the results table's Locate buttons
 
     # --- Misc ---
     working_dir: Optional[str] = None  # scratch folder for intermediate files, set on Setup page
@@ -107,6 +108,7 @@ PAGE_ORDER = [
     ("scutum_draw", "page_scutum_draw.ui", "ScutumDrawPage"),
     ("verify", "page_verify.ui", "VerifyPage"),
     ("curvature", "page_curvature.ui", "CurvaturePage"),
+    ("complete", "page_complete.ui", "CompletePage"),
 ]
 
 # Which WizardState fields each page is responsible for populating. This is
@@ -134,7 +136,12 @@ PAGE_OWNED_FIELDS = {
     ],
     "scutum_draw": ["scutum_defect_mesh_path", "scutum_defect_model_node"],
     "verify": ["surgeon_approved_scutum", "surgeon_approved_pinna"],
-    "curvature": ["heatmap_output_path", "heatmap_model_node", "ranked_sites_csv_path"],
+    "curvature": [
+        "heatmap_output_path",
+        "heatmap_model_node",
+        "ranked_sites_csv_path",
+        "harvest_site_markup_node",
+    ],
 }
 
 # Factories for what an owned field resets to. Any field not listed here

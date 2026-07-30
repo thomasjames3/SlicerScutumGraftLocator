@@ -78,39 +78,28 @@ def build_roi_mask(
     axis_length = np.linalg.norm(axis_vec)
     axis_unit = axis_vec / axis_length
 
-    size = reference_image.GetSize()
-    spacing = reference_image.GetSpacing()
-    origin = np.array(reference_image.GetOrigin())
-    direction = np.array(reference_image.GetDirection()).reshape(3, 3)
-
-    # Build a grid of physical-space coordinates for every voxel. For a
-    # typical cropped-region volume this is a manageable amount of memory;
-    # if this ever gets called on a full uncropped scan, resample/crop to
-    # a coarse bounding box first.
-    idx_grid = np.indices(size[::-1]).reshape(3, -1).T[:, ::-1]  # (N, 3) ijk
-    physical_coords = origin + (idx_grid * spacing) @ direction.T
-
     radius = diameter_mm / 2.0
 
-    # Signed distance along the axis, measured from canal_opening -- used
-    # both for the cylinder's perpendicular distance and to bound the two
-    # ends (0 = canal_opening, axis_length = near_eardrum).
-    vec_from_start = physical_coords - canal_axis_start
-    along_axis = vec_from_start @ axis_unit
-    perp_vec = vec_from_start - np.outer(along_axis, axis_unit)
-    perp_dist = np.linalg.norm(perp_vec, axis=1)
+    def inside_test(physical_coords: np.ndarray) -> np.ndarray:
+        # Signed distance along the axis, measured from canal_opening --
+        # used both for the cylinder's perpendicular distance and to bound
+        # the two ends (0 = canal_opening, axis_length = near_eardrum).
+        vec_from_start = physical_coords - canal_axis_start
+        along_axis = vec_from_start @ axis_unit
+        perp_vec = vec_from_start - np.outer(along_axis, axis_unit)
+        perp_dist = np.linalg.norm(perp_vec, axis=1)
 
-    inside_cylinder = perp_dist <= radius
+        inside_cylinder = perp_dist <= radius
+        # Bounding planes, perpendicular to the axis, each extended
+        # axial_margin_mm past its landmark -- no surgeon-supplied
+        # direction involved, so there's no "wrong side" possible.
+        outer_side = along_axis >= -axial_margin_mm
+        inner_side = along_axis <= axis_length + axial_margin_mm
+        return inside_cylinder & outer_side & inner_side
 
-    # Bounding planes, perpendicular to the axis, each extended
-    # axial_margin_mm past its landmark -- no surgeon-supplied direction
-    # involved, so there's no "wrong side" possible.
-    outer_side = along_axis >= -axial_margin_mm
-    inner_side = along_axis <= axis_length + axial_margin_mm
+    mask_array = _build_mask_by_slices(reference_image, inside_test)
 
-    inside_roi = inside_cylinder & outer_side & inner_side
-
-    if not inside_roi.any():
+    if not mask_array.any():
         raise ValueError(
             "No voxels found in the region defined by these landmarks -- "
             "the ROI is empty. Double-check that 'canal opening' and 'near "
@@ -118,10 +107,55 @@ def build_roi_mask(
             "volume) and aren't identical points."
         )
 
-    mask_array = inside_roi.reshape(size[::-1]).astype(np.uint8)
     mask_image = sitk.GetImageFromArray(mask_array)
     mask_image.CopyInformation(reference_image)
     return mask_image
+
+
+def _build_mask_by_slices(reference_image: sitk.Image, inside_test) -> np.ndarray:
+    """
+    Shared helper for build_roi_mask()/build_spherical_roi_mask(): evaluates
+    `inside_test(physical_coords)` (an (N, 3) array of physical-space points
+    -> an (N,) bool array) one z-slice at a time instead of materializing a
+    single (nx*ny*nz, 3) array for the whole volume.
+
+    Both callers used to build that full array up front. On a typical
+    cropped-region volume at the ~0.3-0.5mm spacing this was originally
+    tested against, that's a manageable size -- but on a real scan with
+    much finer native spacing (confirmed: 0.173x0.173x0.2mm on one of
+    Thomas's scans), the *voxel count* of the same physical-size crop box
+    scales as 1/spacing^3, so the same box can balloon to 100M+ voxels,
+    meaning several GB each for idx_grid/physical_coords/along_axis/etc --
+    almost certainly the dominant cause of a "really slow" pinna
+    segmentation on that scan, worse than any morphological-filter cost.
+    Looping over z keeps peak memory to O(nx*ny) (one slice) regardless of
+    nz, at the cost of a Python loop over nz iterations -- negligible next
+    to the per-slice vectorized numpy work. Output is mathematically
+    identical to the old whole-volume computation (same physical-coordinate
+    math, still handles oblique direction cosines via the full 3x3
+    direction matrix).
+    """
+    nx, ny, nz = reference_image.GetSize()
+    spacing = np.array(reference_image.GetSpacing())
+    origin = np.array(reference_image.GetOrigin())
+    direction = np.array(reference_image.GetDirection()).reshape(3, 3)
+
+    ii, jj = np.meshgrid(np.arange(nx), np.arange(ny), indexing="xy")  # (ny, nx)
+    # Physical-coordinate contribution of the x/y indices for one slice --
+    # computed once and reused for every z, since it doesn't depend on z.
+    xy_phys = (
+        origin
+        + ii[..., None] * (spacing[0] * direction[:, 0])
+        + jj[..., None] * (spacing[1] * direction[:, 1])
+    )  # (ny, nx, 3)
+    z_axis_vec = spacing[2] * direction[:, 2]  # (3,)
+
+    mask_array = np.zeros((nz, ny, nx), dtype=np.uint8)
+    for k in range(nz):
+        slice_phys = (xy_phys + k * z_axis_vec).reshape(-1, 3)
+        mask_array[k] = inside_test(slice_phys).reshape(ny, nx)
+
+    return mask_array
 
 
 def crop_to_roi_bounding_box(
@@ -277,18 +311,14 @@ def build_spherical_roi_mask(
     """
     center = np.array(center_point)
 
-    size = reference_image.GetSize()
-    spacing = reference_image.GetSpacing()
-    origin = np.array(reference_image.GetOrigin())
-    direction = np.array(reference_image.GetDirection()).reshape(3, 3)
+    def inside_test(physical_coords: np.ndarray) -> np.ndarray:
+        dist_from_center = np.linalg.norm(physical_coords - center, axis=1)
+        return dist_from_center <= radius_mm
 
-    idx_grid = np.indices(size[::-1]).reshape(3, -1).T[:, ::-1]  # (N, 3) ijk
-    physical_coords = origin + (idx_grid * spacing) @ direction.T
-
-    dist_from_center = np.linalg.norm(physical_coords - center, axis=1)
-    inside_sphere = dist_from_center <= radius_mm
-
-    mask_array = inside_sphere.reshape(size[::-1]).astype(np.uint8)
+    # See _build_mask_by_slices()'s docstring -- avoids materializing a
+    # full (nx*ny*nz, 3) coordinate array, which is what made this blow up
+    # in memory/time on a real scan with fine native spacing.
+    mask_array = _build_mask_by_slices(reference_image, inside_test)
     mask_image = sitk.GetImageFromArray(mask_array)
     mask_image.CopyInformation(reference_image)
     return mask_image

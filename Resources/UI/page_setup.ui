@@ -4,6 +4,19 @@
  <widget class="QWidget" name="page_setup">
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
+    <widget class="QLabel" name="titleLabel">
+     <property name="text">
+      <string>Welcome</string>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+       <pointsize>12</pointsize>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="modeGroupLabel">
      <property name="text">
       <string>How would you like to use this wizard?</string>

@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>page_complete</class>
+ <widget class="QWidget" name="page_complete">
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <item>
+    <widget class="QLabel" name="titleLabel">
+     <property name="text">
+      <string>Completed</string>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+       <pointsize>12</pointsize>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="tutorialLabel">
+     <property name="text">
+      <string></string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+     <property name="visible">
+      <bool>false</bool>
+     </property>
+     <property name="font">
+      <font>
+       <italic>true</italic>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="completionLabel">
+     <property name="text">
+      <string>Planning complete. Download whichever files you'd like to keep.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QCheckBox" name="downloadHeatmapCheckBox">
+     <property name="text">
+      <string>Pinna heatmap (pinna_heatmap.ply)</string>
+     </property>
+     <property name="checked">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QCheckBox" name="downloadScutumDefectCheckBox">
+     <property name="text">
+      <string>Scutum defect mesh (scutum_defect.stl)</string>
+     </property>
+     <property name="checked">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QCheckBox" name="downloadPinnaIsolatedCheckBox">
+     <property name="text">
+      <string>Isolated pinna mesh (pinna_isolated.stl)</string>
+     </property>
+     <property name="checked">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QCheckBox" name="downloadScutumBoneWallCheckBox">
+     <property name="text">
+      <string>Scutum bone wall mesh (scutum_bone_wall.stl)</string>
+     </property>
+     <property name="checked">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="downloadDestinationLayout">
+     <item>
+      <widget class="QLineEdit" name="downloadDestinationLineEdit">
+       <property name="readOnly">
+        <bool>true</bool>
+       </property>
+       <property name="placeholderText">
+        <string>Choose a download destination folder...</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="browseDestinationButton">
+       <property name="text">
+        <string>Browse...</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QPushButton" name="downloadButton">
+     <property name="text">
+      <string>Download Selected Files</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="downloadStatusLabel">
+     <property name="text">
+      <string></string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <spacer name="verticalSpacer">
+     <property name="orientation">
+      <enum>Qt::Vertical</enum>
+     </property>
+    </spacer>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

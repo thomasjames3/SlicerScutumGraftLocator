@@ -85,6 +85,7 @@ def label_map_to_mesh_subvoxel(
     raw_threshold_mask: sitk.Image,
     threshold_value: float,
     band_radius_mm: float = SUBVOXEL_MESH_BAND_MM,
+    intensity_override_mask: sitk.Image = None,
 ) -> trimesh.Trimesh:
     """
     Like label_map_to_mesh(), but extracts the surface from the underlying
@@ -164,6 +165,27 @@ def label_map_to_mesh_subvoxel(
         How far from the mask boundary (on both sides) to trust the real
         smoothed intensity before blending toward the safety clamp. See
         config.SUBVOXEL_MESH_BAND_MM for tuning guidance.
+    intensity_override_mask : sitk.Image, optional
+        Same geometry as `label_image`. Marks voxels where
+        core/sheetness.py's Hessian-eigenvalue shape analysis overrode the
+        pure intensity>threshold_value decision (config.
+        ENABLE_SHEET_ENHANCEMENT) -- see
+        segment_threshold.segment_bone_wall()'s docstring. This is a
+        SEPARATE category from postprocessing changes: `raw_threshold_mask`
+        already tells this function where postprocessing changed
+        something, but a sheetness override happens BEFORE postprocessing
+        even runs, so `postprocess_unchanged` alone can't see it. Left as
+        None (the default), a bright-sheetness-boosted thin-wall voxel
+        would have its true intensity blended in even though that
+        intensity never actually crossed `threshold_value` -- silently
+        losing the material sheetness added, since marching_cubes finds no
+        real isovalue crossing there. Symmetrically, a dark-sheetness-
+        vetoed gap voxel would have its true (above-threshold) intensity
+        trusted near the boundary -- silently placing a surface back
+        across the gap sheetness existed to preserve. Wherever this mask
+        is True, `weight` is hard-clamped to 1.0 exactly like
+        `postprocess_unchanged`'s existing gate, so the blend can never
+        undo a sheetness decision either.
     """
     mask_array = sitk.GetArrayFromImage(label_image).astype(bool)  # (z, y, x)
 
@@ -199,6 +221,9 @@ def label_map_to_mesh_subvoxel(
     ) - ndimage.distance_transform_edt(~mask_array, sampling=sampling_zyx)
     weight = np.clip(np.abs(signed_dist_mm) / band_radius_mm, 0.0, 1.0)
     weight = np.where(postprocess_unchanged, weight, 1.0)
+    if intensity_override_mask is not None:
+        override_array = sitk.GetArrayFromImage(intensity_override_mask).astype(bool)
+        weight = np.where(override_array, 1.0, weight)
     clamp_target = np.where(
         signed_dist_mm > 0,
         threshold_value + SUBVOXEL_MESH_SAFETY_MARGIN_HU,

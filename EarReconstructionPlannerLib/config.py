@@ -149,6 +149,203 @@ CONNECTED_COMPONENT_CONNECTIVITY = 1  # scipy.ndimage.label(structure=...) uses 
 # near_eardrum-proximity guess -- see git history for the removed code.
 
 # ---------------------------------------------------------------------------
+# Hessian-eigenvalue sheet/plate enhancement (core/sheetness.py)
+# ---------------------------------------------------------------------------
+#
+# Attacks two failure modes plain intensity thresholding can't fix even
+# after the CurvatureFlow smoothing swap above: (1) a genuinely thin true
+# bone wall partial-volumes below bone_threshold and is missed outright --
+# the wall's local SHAPE (a thin high-intensity plate) is still present in
+# the smoothed field even though its intensity value is gone; (2) the thin
+# true air gap between the scutum and malleus still gets blurred above
+# bone_threshold in the extreme 1-voxel-wide case even by CurvatureFlow
+# (confirmed on a real scan -- see CLAUDE.md's "Still open" note) -- the
+# gap's local shape (a thin low-intensity septum between denser tissue) is
+# likewise still detectable, and used here to veto a bone classification
+# even where blurred intensity crept above threshold. A multiscale
+# Hessian-eigenvalue-ratio "sheetness" measure, in the same family as
+# Frangi-style vessel/plate enhancement filters used elsewhere in medical
+# imaging for thin anatomical structures.
+
+# Dev-only kill switch: False = pure intensity thresholding (pre-sheetness
+# behavior), no code changes needed to revert. Set back to True (2026-07-29)
+# to test the new self-calibrating noise-gate design (SHEETNESS_GAMMA_
+# AUTO_SCALE) -- see CLAUDE.md's "Ear-canal/temporal-bone segmentation
+# research" section: this passed a cross-scale synthetic portability test
+# the three previous fixed-gamma attempts never did, but is still
+# unconfirmed on a real scan. Flip back to False if it still doesn't help.
+ENABLE_SHEET_ENHANCEMENT = True
+
+# Gaussian-derivative sigma sheetness is evaluated at, expressed as
+# MULTIPLES OF THE SCAN'S OWN NATIVE VOXEL SPACING (max dimension) rather
+# than a fixed absolute mm list -- see segment_threshold.segment_bone_wall()
+# for where this gets converted to actual mm scales per call
+# (scale_mm = multiplier * max(cropped_image.GetSpacing())). This matters
+# because page_dicom_load.py deliberately does NOT resample scans to
+# TARGET_VOXEL_SPACING_MM (0.3mm) -- the live pipeline runs on each scan's
+# own native spacing, which varies case to case (confirmed: 0.5mm on one
+# real scan Thomas tested, as fine as 0.25mm on others). A FIXED absolute-
+# mm scale set (the original design, e.g. 0.3/0.6/1.2mm) becomes
+# increasingly sub-voxel (sigma_voxels < 1) on coarser native spacing --
+# a poorly-conditioned, noise-AMPLIFYING regime for a Gaussian-derivative
+# filter, not just a "slightly less precise" one. Confirmed directly: a
+# synthetic noise stress test that gamma=15-20 fully suppressed at 0.3mm
+# spacing needed gamma=100+ to suppress at 0.5mm spacing with the SAME
+# absolute scales -- i.e. the earlier gamma calibration silently stopped
+# transferring the moment native spacing changed, without any error or
+# warning. Multipliers chosen so sigma_voxels = multiplier *
+# max(spacing)/spacing[i] >= multiplier in every axis regardless of a
+# scan's actual (possibly anisotropic) spacing -- i.e. never sub-voxel,
+# by construction. NEEDS FURTHER VALIDATION: only tested at 0.3mm and
+# 0.5mm native spacing so far. SHEETNESS_GAMMA_AUTO_SCALE below replaces
+# what used to be a fixed gamma value coupled to these specific
+# multipliers -- being self-calibrating, it SHOULD be far less coupled to
+# this choice than the old fixed gamma was, but that itself is unproven;
+# re-verify together if a scan with very different (e.g. 0.25mm, or >1mm)
+# spacing shows problems.
+SHEET_ENHANCEMENT_SCALE_MULTIPLIERS = (1.2, 2.4, 4.0)
+
+# Eigenvalue-ratio discriminant constants (see core/sheetness.py's
+# _sheet_response) -- alpha controls how strictly sheet-like (vs
+# tube-like) the geometry must look; beta controls how strictly planar
+# (vs blob-like). Left at the commonly-used starting default (0.5 each) --
+# NEEDS SYNTHETIC VALIDATION on the analytic sheet/tube/blob test.
+SHEETNESS_ALPHA = 0.5
+SHEETNESS_BETA = 0.5
+
+# Background/noise suppression constant -- keeps the filter from
+# hallucinating sheet structure in flat, noisy regions with no real
+# structure. REDESIGNED 2026-07-29 (was a fixed absolute
+# SHEETNESS_NOISE_SUPPRESSION_GAMMA, first 18.0 then 100.0) after THREE
+# rounds of real-scan A/B each found the previous fixed value silently
+# stopped working the moment scan characteristics (native spacing, then
+# HU scale) changed, with no error or warning -- a fixed absolute
+# noise-gate constant fundamentally can't be scan-independent, since a
+# Gaussian-derivative filter's raw response magnitude depends on the
+# scan's own spacing and intensity/contrast scale.
+#
+# Adapted from the published Krcah et al. bone-sheetness filter (used for
+# femur segmentation, 0.98 Dice, explicitly designed for "invariance to
+# density calibration" -- see
+# https://github.com/ypauchard/ITK-KrcahSheetnessImageFilter,
+# AutomaticSheetnessParameterEstimationImageFilter/
+# KrcahSheetnessFeatureGenerator): instead of a fixed number, the actual
+# noise-gate value is now computed automatically at call time, per scale,
+# as SHEETNESS_GAMMA_AUTO_SCALE * median(S) -- where S is this module's
+# own structure-strength term (see core/sheetness.py's _sheet_response).
+# Two design choices matter here, both found by direct testing rather
+# than assumed:
+#   1. MEDIAN, not mean. A first version used mean(S) over the whole
+#      cropped ROI and found it barely gated anything at all, regardless
+#      of this scale factor's value -- the mean gets dragged toward
+#      whatever fraction of the crop is plain empty background, which can
+#      wash the statistic down to near-meaningless. Median is far more
+#      robust to that.
+#   2. Restricted to `calibration_mask` (segment_threshold.py passes its
+#      `shell_array`), not the whole array -- the statistic should
+#      reflect the region the bone/no-bone decision is actually made in.
+# Since a scan with more noise, coarser spacing, or higher intensity
+# contrast will itself have a higher median(S) in that region, the
+# resulting noise-gate value scales up or down automatically with the
+# scan, instead of needing a fresh hand-picked constant every time. 2.0
+# is validated on one synthetic reconstruction of Thomas's real scan
+# (0.5mm spacing, bone_threshold=760): full gap-veto separation, full
+# noise suppression back to the no-sheetness baseline, AND near-total
+# thin-wall recall (99.75%, better than any fixed-gamma value found in
+# earlier rounds) all held simultaneously at this value. NEEDS REAL-SCAN
+# VALIDATION -- still only tested on synthetic data; if this under- or
+# over-suppresses noise on a real scan, retune this ratio, but first
+# re-check whether the self-calibration mechanism itself transfers before
+# assuming it needs a different value per scan (that would defeat its
+# purpose).
+SHEETNESS_GAMMA_AUTO_SCALE = 2.0
+
+# Minimum bright-sheetness response (0-1) to OR-boost a voxel into the
+# bone classification despite smoothed intensity below bone_threshold --
+# targets thin-wall dropout. Validated in the same pipeline-level test as
+# gamma above: at 0.5 (this default), a deliberately 1-voxel-thin wall
+# region's recall went from 84.6% (no sheetness) to 97-100% (with
+# sheetness, gamma in the validated [15,20] window), with no measurable
+# drop in the full-thickness "normal" wall region's own recall (~98% in
+# both cases). NEEDS REAL-SCAN VALIDATION.
+BRIGHT_SHEETNESS_THRESHOLD = 0.5
+
+# Minimum dark-sheetness response (0-1) to AND-veto a voxel out of the
+# bone classification despite smoothed intensity above bone_threshold --
+# targets the scutum/malleus gap-bridging failure. Lowered from an
+# initial 0.5 guess: the pipeline-level test found 0.5 only reduced the
+# gap's false-bone fraction from 98% to 50% -- a real improvement but not
+# enough to actually separate the two sides (still 1 connected component,
+# i.e. still bridged). 0.1 achieved a full, clean topological separation
+# (2 connected components) in that same test, with gamma in the [15,20]
+# window above and BRIGHT_SHEETNESS_THRESHOLD=0.5. Also requires feeding
+# sheetness the RAW (pre-CurvatureFlow) intensity rather than the
+# CurvatureFlow-smoothed field -- see segment_threshold.segment_bone_wall()'s
+# comment on this: the same test found the gap veto never achieved true
+# separation on the smoothed field at ANY threshold tried, only on the
+# raw field. NEEDS REAL-SCAN VALIDATION.
+DARK_SHEETNESS_THRESHOLD = 0.1
+
+# Intensity floor/ceiling gating the sheetness OR-boost/AND-veto -- added
+# after real-Slicer testing (2026-07-29) reported "large areas of soft
+# tissue" being misclassified as bone, worse than plain thresholding
+# alone. Root cause: bright_sheetness's OR-boost above had NO floor on
+# absolute intensity -- any voxel with a strong enough local sheet-like
+# SHAPE got promoted to bone regardless of how far its actual HU value
+# was from anything bone-plausible. Real soft tissue is full of genuine
+# thin, locally-flat anatomical interfaces (fascial planes, muscle septa,
+# vessel walls, organ capsules) that are geometrically indistinguishable
+# from a partial-volumed bone wall in pure Hessian-eigenvalue shape terms
+# -- no amount of SHEETNESS_GAMMA_AUTO_SCALE retuning can fix this,
+# since it's not a noise problem, it's that shape alone genuinely cannot
+# tell "thin bone" from "thin fascia" without also looking at intensity.
+# These two constants make that check explicit and load-bearing: a voxel
+# can only be OR-boosted into bone if its own intensity is already within
+# BRIGHT_SHEETNESS_INTENSITY_MARGIN_HU of bone_threshold (i.e. plausibly a
+# partial-volumed wall, not generic soft tissue), and only AND-vetoed out
+# of bone if its intensity is within DARK_SHEETNESS_INTENSITY_MARGIN_HU
+# above bone_threshold (plausibly a blurred air/soft-tissue gap, not
+# unrelated dense bone elsewhere). This is a hard, categorical guarantee
+# (any voxel further than the margin from bone_threshold can NEVER be
+# touched by sheetness, regardless of shape response), not a statistical
+# one like gamma -- deliberately chosen over further gamma tuning because
+# repeated synthetic attempts to reproduce the reported failure (noisy
+# tissue at the decision boundary, periodic low-contrast fascia septa, a
+# clean sharp tissue-tissue step, and a noisy version of that same step,
+# all at intensities far from bone_threshold) all stayed at 0% false
+# positive even under the CURRENT gamma=18 -- meaning whatever real CT
+# characteristic is actually triggering this wasn't reproduced by any of
+# these synthetic models, so this fix does not rely on having correctly
+# modeled the real mechanism, only on the categorical intensity-plausibility
+# argument above.
+#
+# BRIGHT_SHEETNESS_INTENSITY_MARGIN_HU widened 150->300 (2026-07-29) after
+# Thomas's seed calibration on a real scan gave bone_threshold=760 (well
+# above the 100 this was first picked against) with real cortical bone
+# reading 1000-1400 -- at the old 150 margin, a wall dimmed by real
+# CurvatureFlow blur (which may pull a thin wall down further than this
+# feature's own synthetic model showed, since that model was calibrated
+# at a different absolute scale/spacing -- see SHEETNESS_NOISE_
+# SUPPRESSION_GAMMA's comment for the spacing side of this same lesson)
+# could plausibly fall outside eligibility even though it's genuinely
+# bone, not soft tissue. 300 keeps the eligible floor (bone_threshold-300)
+# comfortably above ordinary soft tissue's typical range (well below 0 HU
+# for fat, rarely above ~80 HU for muscle/gland) while giving real
+# partial-volume blur more room than the original guess. NEEDS REAL-SCAN
+# VALIDATION -- if soft tissue is still getting promoted, tighten this;
+# if thin walls are still missing, this may need to go even higher (there
+# is no clean synthetic way to pin this down further without knowing how
+# far this specific scan's CurvatureFlow pass actually pulls a genuine
+# thin wall's intensity down, which isn't something Thomas has reported
+# yet).
+BRIGHT_SHEETNESS_INTENSITY_MARGIN_HU = 300.0
+# Unchanged -- no evidence this side needs adjustment: the reported
+# scutum/malleus gap's raw HU (-1100) sits so far below any plausible
+# bone_threshold+margin ceiling that this was never the binding
+# constraint on that failure.
+DARK_SHEETNESS_INTENSITY_MARGIN_HU = 150.0
+
+# ---------------------------------------------------------------------------
 # Stage A: seed-based threshold calibration (optional convenience)
 # ---------------------------------------------------------------------------
 #
@@ -432,6 +629,10 @@ PINNA_CANAL_CROP_MARGIN_MM = 2.0
 # wrong on the other. Tune independently if needed.
 SCUTUM_DRAW_POINT_SIZE_MM = 0.3
 PINNA_DRAW_POINT_SIZE_MM = 2.0
+
+# Harvest-site locator points on the curvature page (page_curvature.py).
+# Started at 3.0 but Thomas found that too large on the heatmap -- halved.
+HARVEST_SITE_POINT_SIZE_MM = 1.5
 
 # ---------------------------------------------------------------------------
 # Curvature comparison (core/curvature/ -- ported from the standalone

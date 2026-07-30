@@ -303,7 +303,7 @@ class ScutumReviewPage(WizardPage):
         cropped_image = roi_crop.crop_to_roi_bounding_box(coarse_cropped, roi_mask)
         cropped_roi_mask = roi_crop.crop_to_roi_bounding_box(roi_mask, roi_mask)
 
-        raw_bone_wall = segment_dl.segment(
+        raw_bone_wall, intensity_override_mask = segment_dl.segment(
             cropped_image,
             cropped_roi_mask,
             self.state.scutum_landmarks,
@@ -371,7 +371,11 @@ class ScutumReviewPage(WizardPage):
         # correctly keeps using plain label_map_to_mesh().
         try:
             mesh = mesh_export.label_map_to_mesh_subvoxel(
-                cropped_image, bone_wall, raw_bone_wall, self.ui.boneThresholdSlider.value
+                cropped_image,
+                bone_wall,
+                raw_bone_wall,
+                self.ui.boneThresholdSlider.value,
+                intensity_override_mask=intensity_override_mask,
             )
         except mesh_export.EmptySegmentationError:
             self.ui.openSegmentEditorButton.setEnabled(False)
@@ -410,9 +414,22 @@ class ScutumReviewPage(WizardPage):
         self.recenter_3d_view()
 
         self.ui.openSegmentEditorButton.setEnabled(True)
+        # Explicit, unmissable-in-the-UI confirmation of whether sheet
+        # enhancement actually ran on this click -- added after real-Slicer
+        # testing showed no visible change across several tuning rounds,
+        # so it was no longer safe to just assume the intended code path
+        # was the one actually executing. See core/segment_threshold.py's
+        # matching Python-console log line for the full diagnostic detail
+        # (gamma_scale, per-response statistics, etc).
+        sheetness_status = (
+            f"Sheet enhancement: ON (gamma_scale={config.SHEETNESS_GAMMA_AUTO_SCALE})"
+            if config.ENABLE_SHEET_ENHANCEMENT
+            else "Sheet enhancement: OFF"
+        )
         self.ui.statusLabel.setText(
             "Segmentation complete. Review it in the 3D view, adjust sliders "
-            "and re-run if needed, or open Segment Editor for manual touch-ups."
+            "and re-run if needed, or open Segment Editor for manual touch-ups.\n"
+            f"[{sheetness_status}]"
         )
 
     def _on_open_segment_editor_clicked(self):

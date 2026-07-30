@@ -25,8 +25,11 @@ still import and use this module without errors.
 NOTE for whoever implements _run_model(): the pipeline's output is the bony
 wall of the ear canal, not the air-filled lumen (see segment_threshold.py
 for the reasoning). Whatever Stage B model gets trained here should be
-trained on bone-wall labels, and _run_model() must return a bone-wall label
-map, so it stays a drop-in swap for segment_threshold.segment_bone_wall().
+trained on bone-wall labels, and _run_model() must return a
+(bone-wall label map, None) tuple, so it stays a drop-in swap for
+segment_threshold.segment_bone_wall() -- see this module's segment()
+docstring for why the second element exists (it's Stage-A-specific, so
+Stage B always returns None there).
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ def segment(
     landmarks: EarCanalLandmarks,
     air_threshold: float = None,
     bone_threshold: float = None,
-) -> sitk.Image:
+) -> tuple:
     """
     Main entry point used by the Slicer UI. Tries the trained model first;
     falls back to the bone-wall threshold method
@@ -64,6 +67,17 @@ def segment(
     Parameters mirror segment_threshold.segment_bone_wall -- see that file
     for details. `air_threshold`/`bone_threshold` are only used by the
     Stage A fallback.
+
+    Returns
+    -------
+    tuple[sitk.Image, sitk.Image | None]
+        (bone_wall_mask, intensity_override_mask) -- forwarded directly
+        from segment_threshold.segment_bone_wall(). intensity_override_mask
+        is only ever non-None via the Stage A path (config.ENABLE_SHEET_
+        ENHANCEMENT); Stage B always yields None there. Callers must pass
+        intensity_override_mask through to
+        mesh_export.label_map_to_mesh_subvoxel() -- see that function's
+        docstring.
     """
     predictor = _get_predictor()
 
@@ -150,10 +164,13 @@ def _load_model(model_dir: str):
     )
 
 
-def _run_model(predictor, cropped_image: sitk.Image, roi_mask: sitk.Image) -> sitk.Image:
+def _run_model(predictor, cropped_image: sitk.Image, roi_mask: sitk.Image) -> tuple:
     """
     TODO: run inference with `predictor` on `cropped_image`, restricted to
-    `roi_mask`, and return a UInt8 label image with the same geometry as
-    cropped_image. Left as a stub alongside _load_model above.
+    `roi_mask`, and return (label_image, None) -- a UInt8 label image with
+    the same geometry as cropped_image, plus None for the
+    intensity_override_mask slot (sheetness enhancement is Stage-A-only;
+    see segment()'s docstring). Left as a stub alongside _load_model
+    above.
     """
     raise NotImplementedError

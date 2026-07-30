@@ -173,8 +173,8 @@ class EarReconstructionPlannerWidget(ScriptedLoadableModuleWidget):
         if self._current_index + 1 < len(self._page_meta):
             self._show_page(self._current_index + 1, direction=1)
         # else: this was the final page ("Finish") -- nothing further to do,
-        # the curvature page's own button already handled running the
-        # comparison and loading the result.
+        # the Complete page's own Download button already handled saving
+        # whichever result files the surgeon wanted.
 
     def cleanup(self):
         pass

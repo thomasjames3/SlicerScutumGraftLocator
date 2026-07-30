@@ -4,6 +4,19 @@
  <widget class="QWidget" name="page_dicom_load">
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
+    <widget class="QLabel" name="titleLabel">
+     <property name="text">
+      <string>Select Scan</string>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+       <pointsize>12</pointsize>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="instructionLabel">
      <property name="text">
       <string>Load your patient's DICOM scan as usual, using Slicer's DICOM module. Once it's loaded, select it below and click "Use this scan".</string>

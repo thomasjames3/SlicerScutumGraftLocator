@@ -1,51 +1,58 @@
 """
 page_curvature.py
 ====================
-Page 9 (final): run the curvature comparison against the two approved
-meshes, load the resulting heatmap mesh into the 3D view, and let the
-surgeon download whichever result files they want.
+Page 9: run the curvature comparison against the two approved meshes,
+load the resulting heatmap mesh into the 3D view, and show the ranked
+harvest-site candidates. Downloading result files is the *next* page's
+job (page_complete.py) -- this page used to have its own "Download
+results" section, but that's been split out into a dedicated final
+"Complete" page so every mesh the wizard produces (not just the two
+curvature inputs) has one common download step, instead of scattering a
+download section on whichever page happened to produce each file.
 
 See curvature_integration.py for how this actually runs the comparison
 (in-process, via core/curvature/pipeline.py -- no separate Python install,
 venv, or subprocess; no Slicer/Qt dependency in that module at all). This
 page is the Qt-facing half: it streams the comparison's progress into
-progressTextEdit as it runs (so a run that takes a couple of minutes on a
-dense mesh doesn't look like Slicer has frozen), then loads the heatmap
-model and shows the ranked harvest-site candidates in a table once it's
-done.
+statusLabel as it runs (so a run that takes a couple of minutes on a
+dense mesh doesn't look like Slicer has frozen -- an earlier version used
+a separate scrolling log box for this, but that read like a raw Python
+terminal, which isn't something a surgeon needs to see), then loads the
+heatmap model and shows the ranked harvest-site candidates in a table
+once it's done.
 
-This is the wizard's final page, so instead of the generic shared
-"Finish" button (which used to just validate that a run had completed and
-then do nothing further -- there's no next page to advance to), the main
-module hides that shared button entirely here (see is_final_page() usage
-in EarReconstructionPlanner.py's _show_page()) in favor of the download
-section below, which is this page's actual completion action.
+Each results-table row has a "Locate" button that drops a labeled Markups
+point ("1", "2", ...) on the heatmap mesh at that candidate's exact
+vertex, so the surgeon can find it in the 3D view without having to
+eyeball X/Y/Z coordinates -- click again to hide it. All candidate points
+live in one `state.harvest_site_markup_node` (one control point per row,
+index-aligned with the table), created hidden; only per-point visibility
+toggles, mirroring the button clicks -- see _populate_results_table()/
+_on_locate_toggled().
+
+Not the wizard's final page anymore (see page_complete.py) -- "Next"
+here behaves like every other page's, advancing to the Complete page's
+download step.
 
 Expected widgets in page_curvature.ui:
   - tutorialLabel                (QLabel) -- extra guidance, shown only in tutorial mode
   - runButton                    (QPushButton)
-  - statusLabel                  (QLabel)
-  - progressTextEdit             (QPlainTextEdit, read-only) -- live comparison progress
-  - resultsTableWidget           (QTableWidget) -- ranked harvest site candidates
+  - statusLabel                  (QLabel) -- also shows live progress while a run is in flight
+  - resultsTableWidget           (QTableWidget) -- ranked harvest site candidates, each row has a Locate button in the last column
   - openOutputFolderButton       (QPushButton) -- opens the scratch output/ folder
-  - downloadHeatmapCheckBox      (QCheckBox)
-  - downloadScutumDefectCheckBox (QCheckBox)
-  - downloadDestinationLineEdit  (QLineEdit, read-only) -- chosen destination folder
-  - browseDestinationButton      (QPushButton)
-  - downloadButton               (QPushButton)
-  - downloadStatusLabel          (QLabel)
 """
 
 from __future__ import annotations
 import logging
 import os
-import shutil
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
 from EarReconstructionPlannerLib import curvature_integration
+import config
 
 logger = logging.getLogger(__name__)
 
-_TABLE_HEADERS = ["Rank", "Coarse Score", "Chamfer (mm)", "Hausdorff (mm)", "X", "Y", "Z"]
+_TABLE_HEADERS = ["Rank", "Coarse Score", "Chamfer (mm)", "Hausdorff (mm)", "X", "Y", "Z", "Locate"]
+_LOCATE_COLUMN = len(_TABLE_HEADERS) - 1
 
 
 class CurvaturePage(WizardPage):
@@ -62,34 +69,43 @@ class CurvaturePage(WizardPage):
         # makes every call after the first a no-op while a run is in
         # progress, regardless of how many times the signal is connected.
         self._running = False
-        self._download_destination_dir = None
 
     def on_enter(self):
         self.set_tutorial_text(
-            "This final step compares the two meshes you approved and "
-            "scores every spot on the pinna as a possible cartilage graft "
-            "harvest site. Click 'Run Curvature Comparison' -- it can take "
-            "anywhere from a few seconds to a couple of minutes, and the "
-            "log box below will keep updating so you know it's still "
-            "working.\n\n"
+            "This step compares the two meshes you approved and scores "
+            "every spot on the pinna as a possible cartilage graft harvest "
+            "site. Click 'Run Curvature Comparison' -- it can take anywhere "
+            "from a few seconds to a couple of minutes, and the status line "
+            "above will keep updating so you know it's still working.\n\n"
             "When it finishes, the pinna re-loads in the 3D view colored "
             "like a heatmap: green means a better match to the defect's "
             "shape, red means a worse one (use left-drag/scroll/middle-drag "
             "as usual to rotate/zoom/pan and inspect it from different "
             "angles). The blue-highlighted patches are the 3 best harvest "
             "sites, shaped to match the actual defect's footprint (not just "
-            "a circle) -- these are worth looking at first. The table above "
+            "a circle) -- these are worth looking at first. The table below "
             "lists the top-ranked candidate sites with their scores and 3D "
-            "coordinates, best first.\n\n"
-            "Use the 'Download results' section at the bottom to save the "
-            "heatmap and/or the scutum defect mesh file to a folder of your "
-            "choice -- tick the files you want, click 'Browse...' to pick a "
-            "destination, then 'Download Selected Files'."
+            "coordinates, best first -- click a row's 'Show Point' button to "
+            "drop a labeled marker on the mesh at that exact spot, and click "
+            "it again ('Hide Point') to remove it.\n\n"
+            "What 'Chamfer' and 'Hausdorff' mean: both come from actually "
+            "fitting the candidate patch against the defect's shape (after "
+            "finding the best alignment between them), not just the coarse "
+            "similarity score. 'Chamfer (mm)' is the AVERAGE mismatch "
+            "across the whole patch once aligned -- lower means the site's "
+            "overall shape more closely follows the defect's contour, so "
+            "this is the main number to rank sites by. 'Hausdorff (mm)' is "
+            "the single WORST mismatch anywhere on the patch -- a low "
+            "Chamfer paired with a high Hausdorff usually means the site "
+            "fits well on average but has one problem spot (e.g. a corner "
+            "that pokes out or falls short), which is worth checking "
+            "directly in the 3D view before settling on that site over a "
+            "close second choice.\n\n"
+            "Click Next when you're ready to download the heatmap and/or "
+            "any of the meshes generated along the way."
         )
         self.ui.runButton.clicked.connect(self._on_run_clicked)
         self.ui.openOutputFolderButton.clicked.connect(self._on_open_output_folder_clicked)
-        self.ui.browseDestinationButton.clicked.connect(self._on_browse_destination_clicked)
-        self.ui.downloadButton.clicked.connect(self._on_download_clicked)
 
         self.ui.resultsTableWidget.setColumnCount(len(_TABLE_HEADERS))
         self.ui.resultsTableWidget.setHorizontalHeaderLabels(_TABLE_HEADERS)
@@ -112,7 +128,7 @@ class CurvaturePage(WizardPage):
     def _on_progress_line(self, line: str):
         import slicer
         if line:
-            self.ui.progressTextEdit.appendPlainText(line)
+            self.ui.statusLabel.setText(line)
         # Pump the Qt event loop on every callback tick (including the
         # empty-string heartbeat ticks curvature_integration sends during
         # silent stretches) so the UI stays responsive and visibly alive
@@ -127,7 +143,6 @@ class CurvaturePage(WizardPage):
         import slicer
 
         self.ui.runButton.setEnabled(False)
-        self.ui.progressTextEdit.clear()
         self.ui.resultsTableWidget.setRowCount(0)
         self.ui.statusLabel.setText("Running curvature comparison...")
         slicer.app.processEvents()
@@ -159,6 +174,26 @@ class CurvaturePage(WizardPage):
         # pinna review pages (see base_page.WizardPage.recenter_3d_view()).
         self.recenter_3d_view()
 
+        # Fresh markup node for this run's Locate points, same
+        # remove-then-recreate convention as heatmap_model_node above --
+        # otherwise a second run would leave the first run's points
+        # orphaned in the scene alongside the new ones.
+        if self.state.harvest_site_markup_node is not None:
+            slicer.mrmlScene.RemoveNode(self.state.harvest_site_markup_node)
+        harvest_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLMarkupsFiducialNode", "HarvestSiteCandidates"
+        )
+        harvest_node.SetLocked(True)
+        harvest_node.CreateDefaultDisplayNodes()
+        self.set_absolute_point_size(harvest_node, config.HARVEST_SITE_POINT_SIZE_MM)
+        display_node = harvest_node.GetDisplayNode()
+        if display_node is not None:
+            # Magenta stands out against the heatmap's red/yellow/green
+            # scoring colors and its blue top-site fill/black outline.
+            display_node.SetColor(1.0, 0.0, 1.0)
+            display_node.SetSelectedColor(1.0, 0.0, 1.0)
+        self.state.harvest_site_markup_node = harvest_node
+
         csv_path = curvature_integration.get_ranked_candidates_csv_path(output_dir)
         self.state.ranked_sites_csv_path = csv_path
         rows = curvature_integration.read_ranked_candidates(csv_path)
@@ -171,12 +206,12 @@ class CurvaturePage(WizardPage):
             self.ui.statusLabel.setText(
                 f"Done. Best match: rank 1 (coarse score {_format_float(best['coarse_score'])}, "
                 f"chamfer distance {_format_float(best['chamfer_distance'])} mm). "
-                "Heatmap loaded in the 3D view -- green is a better match, red is worse."
+                "Heatmap loaded in the 3D view -- green is a better match, red is worse. "
+                "Use each row's Locate button to mark a candidate on the mesh."
             )
         else:
             self.ui.statusLabel.setText(
-                "Done, but no ranked candidates were found in the results -- "
-                "check the progress log above."
+                "Done, but no ranked candidates were found in the results."
             )
 
         self.ui.runButton.setEnabled(True)
@@ -207,10 +242,29 @@ class CurvaturePage(WizardPage):
             logger.exception("Couldn't enable vertex-color display on the heatmap model")
 
     def _populate_results_table(self, rows):
+        """Fills the table AND, in the same pass, adds one hidden Markups
+        control point per row to state.harvest_site_markup_node (row index
+        == control point index, kept 1:1 so _on_locate_toggled() can find
+        a row's point by row_index alone). Points start hidden so the
+        heatmap isn't cluttered with all of them at once -- the surgeon
+        opts in per candidate via each row's Locate button.
+
+        The point position is read directly from the already-loaded
+        heatmap model's polydata (GetPoint(vertex_id)) rather than
+        re-parsing the CSV's x/y/z strings -- same underlying numbers
+        (both trace back to the same pinna mesh vertex array), but this
+        guarantees the point lands exactly on the rendered mesh's own
+        vertex rather than depending on a text round-trip.
+        """
         import qt
+        import vtk
 
         table = self.ui.resultsTableWidget
         table.setRowCount(len(rows))
+
+        harvest_node = self.state.harvest_site_markup_node
+        poly_data = self.state.heatmap_model_node.GetPolyData() if self.state.heatmap_model_node else None
+
         for row_index, row in enumerate(rows):
             values = [
                 row.get("rank", ""),
@@ -223,7 +277,31 @@ class CurvaturePage(WizardPage):
             ]
             for col_index, value in enumerate(values):
                 table.setItem(row_index, col_index, qt.QTableWidgetItem(str(value)))
+
+            if harvest_node is not None and poly_data is not None and row.get("vertex_id", "") != "":
+                point = poly_data.GetPoint(int(row["vertex_id"]))
+                rank_label = str(row.get("rank", row_index + 1))
+                harvest_node.AddControlPointWorld(vtk.vtkVector3d(*point), rank_label)
+                harvest_node.SetNthControlPointVisibility(row_index, False)
+
+            locate_button = qt.QPushButton("Show Point")
+            locate_button.clicked.connect(lambda checked=False, i=row_index: self._on_locate_toggled(i))
+            table.setCellWidget(row_index, _LOCATE_COLUMN, locate_button)
+
         table.resizeColumnsToContents()
+
+    def _on_locate_toggled(self, row_index):
+        """Show/hide harvest_site_markup_node's row_index'th control point
+        (the button's text is kept in sync as the single source of truth
+        for what "toggled" means, rather than tracking a separate bool)."""
+        harvest_node = self.state.harvest_site_markup_node
+        button = self.ui.resultsTableWidget.cellWidget(row_index, _LOCATE_COLUMN)
+        if harvest_node is None or row_index >= harvest_node.GetNumberOfControlPoints():
+            return
+        now_visible = not harvest_node.GetNthControlPointVisibility(row_index)
+        harvest_node.SetNthControlPointVisibility(row_index, now_visible)
+        if button is not None:
+            button.setText("Hide Point" if now_visible else "Show Point")
 
     def _on_open_output_folder_clicked(self):
         import qt
@@ -231,53 +309,6 @@ class CurvaturePage(WizardPage):
         folder = os.path.join(self._output_dir(), "output")
         if os.path.isdir(folder):
             qt.QDesktopServices.openUrl(qt.QUrl.fromLocalFile(folder))
-
-    def _on_browse_destination_clicked(self):
-        import qt
-
-        chosen = qt.QFileDialog.getExistingDirectory(
-            None, "Choose Download Destination", self._download_destination_dir or ""
-        )
-        if chosen:
-            self._download_destination_dir = chosen
-            self.ui.downloadDestinationLineEdit.setText(chosen)
-
-    def _on_download_clicked(self):
-        want_heatmap = self.ui.downloadHeatmapCheckBox.isChecked()
-        want_scutum_defect = self.ui.downloadScutumDefectCheckBox.isChecked()
-
-        if not want_heatmap and not want_scutum_defect:
-            self.ui.downloadStatusLabel.setText("Select at least one file to download.")
-            return
-        if not self._download_destination_dir:
-            self.ui.downloadStatusLabel.setText("Choose a download destination folder first.")
-            return
-
-        to_copy = []
-        if want_heatmap:
-            if self.state.heatmap_output_path is None:
-                self.ui.downloadStatusLabel.setText(
-                    "Run the curvature comparison before downloading the heatmap."
-                )
-                return
-            to_copy.append(self.state.heatmap_output_path)
-        if want_scutum_defect:
-            if self.state.scutum_defect_mesh_path is None:
-                self.ui.downloadStatusLabel.setText(
-                    "The scutum defect mesh isn't available -- go back and isolate it first."
-                )
-                return
-            to_copy.append(self.state.scutum_defect_mesh_path)
-
-        for src_path in to_copy:
-            shutil.copy2(src_path, self._download_destination_dir)
-
-        self.ui.downloadStatusLabel.setText(
-            f"Downloaded {len(to_copy)} file(s) to {self._download_destination_dir}."
-        )
-
-    def is_final_page(self) -> bool:
-        return True
 
 
 def _format_float(value_str, decimals=3) -> str:

@@ -8,6 +8,7 @@ logic, and you only have to improve/debug it in one place.
 """
 
 from __future__ import annotations
+import time
 import numpy as np
 import SimpleITK as sitk
 from scipy import ndimage
@@ -107,9 +108,24 @@ def run_full_postprocess(label_image: sitk.Image, close_tunnels: bool = False) -
     explicitly (page_scutum_review.py) since that structure is genuinely
     tube/tunnel-shaped and unaffected by this fix.
     """
+    # TEMPORARY TIMING INSTRUMENTATION (2026-07-29, see CLAUDE.md "Pinna
+    # segmentation performance") -- see matching note in
+    # segment_pinna_threshold.segment_pinna_region. Remove once the
+    # remaining Stage A slowness is tracked down.
+    _t0 = time.time()
     result = remove_small_specks(label_image)
+    print(f"[pinna timing] remove_small_specks: {time.time() - _t0:.2f}s")
+
+    _t0 = time.time()
     result = fill_holes(result)
+    print(f"[pinna timing] fill_holes: {time.time() - _t0:.2f}s")
+
     if close_tunnels:
+        _t0 = time.time()
         result = close_small_tunnels(result)
+        print(f"[pinna timing] close_small_tunnels: {time.time() - _t0:.2f}s")
+
+    _t0 = time.time()
     result = smooth_boundary(result)
+    print(f"[pinna timing] smooth_boundary: {time.time() - _t0:.2f}s")
     return result

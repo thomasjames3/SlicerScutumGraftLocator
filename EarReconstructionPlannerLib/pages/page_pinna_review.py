@@ -23,6 +23,7 @@ Expected widgets in page_pinna_review.ui:
 
 from __future__ import annotations
 import os
+import time
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
 from EarReconstructionPlannerLib import wizard_state
 from core import roi_crop, segment_pinna_threshold, postprocess, mesh_export, io_utils
@@ -109,31 +110,53 @@ class PinnaReviewPage(WizardPage):
         print(f"[pinna diag] volume physical corners (RAS mm): {tuple(_origin)} to {tuple(_corner_far)}")
         print(f"[pinna diag] volume size/spacing: {tuple(_size)} / {tuple(_spacing)}")
 
+        # TEMPORARY TIMING INSTRUMENTATION (2026-07-29, see CLAUDE.md
+        # "Pinna segmentation performance") -- the roi_crop grid-building
+        # fix helped but Stage A is still slow on fine-native-spacing
+        # scans. These prints (Slicer Python console) give a full
+        # stage-by-stage breakdown so the next slowness report can be
+        # diagnosed from real numbers instead of another guess. Remove
+        # once the remaining bottleneck is found and addressed.
+        _t_total = time.time()
+
         # Same coarse pre-crop fix as the scutum review page -- see
         # roi_crop.crop_to_point_region's docstring for why this has to
         # happen before build_spherical_roi_mask() on a real, full-
         # resolution scan.
+        _t0 = time.time()
         coarse_cropped = roi_crop.crop_to_point_region(
             sitk_image,
             self.state.pinna_landmarks.ear_center,
             radius_mm=config.PINNA_ROI_RADIUS_MM,
         )
+        print(f"[pinna timing] coarse crop: {time.time() - _t0:.2f}s (size {coarse_cropped.GetSize()})")
 
+        _t0 = time.time()
         roi_mask = roi_crop.build_spherical_roi_mask(
             coarse_cropped,
             self.state.pinna_landmarks.ear_center,
             radius_mm=config.PINNA_ROI_RADIUS_MM,
         )
+        print(f"[pinna timing] build_spherical_roi_mask: {time.time() - _t0:.2f}s")
+
+        _t0 = time.time()
         cropped_image = roi_crop.crop_to_roi_bounding_box(coarse_cropped, roi_mask)
         cropped_roi_mask = roi_crop.crop_to_roi_bounding_box(roi_mask, roi_mask)
+        print(f"[pinna timing] crop to ROI bounding box: {time.time() - _t0:.2f}s (size {cropped_image.GetSize()})")
 
+        _t0 = time.time()
         region_mask = segment_pinna_threshold.segment_pinna_region(
             cropped_image,
             cropped_roi_mask,
             self.state.pinna_landmarks,
             threshold=self.ui.skinThresholdSlider.value,
         )
+        print(f"[pinna timing] segment_pinna_region TOTAL: {time.time() - _t0:.2f}s")
+
+        _t0 = time.time()
         region_mask = postprocess.run_full_postprocess(region_mask)
+        print(f"[pinna timing] postprocess TOTAL: {time.time() - _t0:.2f}s")
+        print(f"[pinna timing] Stage A grand total: {time.time() - _t_total:.2f}s")
 
         # Push into a segmentation node (not a plain labelmap) so it's
         # something Segment Editor can actually operate on -- see the
@@ -141,6 +164,7 @@ class PinnaReviewPage(WizardPage):
         # node here is just a throwaway bridge for the conversion Slicer's
         # segmentations logic expects; it's removed once the segmentation
         # node owns the data.
+        _t0 = time.time()
         temp_label_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLLabelMapVolumeNode", "PinnaRegionTemp"
         )
@@ -148,6 +172,7 @@ class PinnaReviewPage(WizardPage):
         # PushVolumeToSlicer expects plain ITK convention (see
         # page_scutum_review.py for the matching comment).
         sitkUtils.PushVolumeToSlicer(io_utils.flip_ras_lps(region_mask), temp_label_node)
+        print(f"[pinna timing] push labelmap to Slicer: {time.time() - _t0:.2f}s")
 
         if self.state.pinna_region_segmentation_node is not None:
             slicer.mrmlScene.RemoveNode(self.state.pinna_region_segmentation_node)
@@ -155,9 +180,11 @@ class PinnaReviewPage(WizardPage):
             "vtkMRMLSegmentationNode", "PinnaRegionSegmentation"
         )
         segmentation_node.CreateDefaultDisplayNodes()
+        _t0 = time.time()
         slicer.modules.segmentations.logic().ImportLabelmapToSegmentationNode(
             temp_label_node, segmentation_node
         )
+        print(f"[pinna timing] ImportLabelmapToSegmentationNode: {time.time() - _t0:.2f}s")
         slicer.mrmlScene.RemoveNode(temp_label_node)
         # Hidden by default -- see the matching comment in
         # page_scutum_review.py for why (avoids visually duplicating the
@@ -172,16 +199,22 @@ class PinnaReviewPage(WizardPage):
 
         # Uses the still-RAS-consistent `region_mask` so the exported
         # mesh's vertices line up correctly when loaded back into Slicer.
+        _t0 = time.time()
         mesh = mesh_export.label_map_to_mesh(region_mask)
+        print(f"[pinna timing] label_map_to_mesh: {time.time() - _t0:.2f}s")
         mesh_path = os.path.join(
             self.state.working_dir or slicer.app.temporaryPath, "pinna_region.stl"
         )
+        _t0 = time.time()
         mesh_export.export_mesh(mesh, mesh_path)
+        print(f"[pinna timing] export_mesh: {time.time() - _t0:.2f}s")
         self.state.pinna_region_mesh_path = mesh_path
 
         if self.state.pinna_region_model_node is not None:
             slicer.mrmlScene.RemoveNode(self.state.pinna_region_model_node)
+        _t0 = time.time()
         self.state.pinna_region_model_node = slicer.util.loadModel(mesh_path)
+        print(f"[pinna timing] loadModel: {time.time() - _t0:.2f}s")
 
         # Hide the ear-center landmark now that the model exists -- same
         # reasoning as page_scutum_review.py.

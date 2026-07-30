@@ -4,6 +4,19 @@
  <widget class="QWidget" name="page_scutum_review">
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
+    <widget class="QLabel" name="titleLabel">
+     <property name="text">
+      <string>Temporal Bone Canal Segmentation</string>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+       <pointsize>12</pointsize>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="tutorialLabel">
      <property name="text">
       <string></string>

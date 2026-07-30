@@ -4,6 +4,19 @@
  <widget class="QWidget" name="page_scutum_landmarks">
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
+    <widget class="QLabel" name="titleLabel">
+     <property name="text">
+      <string>Ear Canal Reference Points</string>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+       <pointsize>12</pointsize>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="stepProgressLabel">
      <property name="text">
       <string>1 of 2</string>

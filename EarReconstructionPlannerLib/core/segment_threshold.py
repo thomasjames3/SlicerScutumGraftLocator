@@ -24,10 +24,12 @@ canal lumen directly; we extend it with a bone-wall shell step on top).
 """
 
 from __future__ import annotations
+import logging
 import numpy as np
 import SimpleITK as sitk
 from scipy import ndimage
 
+import config
 from config import (
     DEFAULT_AIR_THRESHOLD,
     DEFAULT_BONE_THRESHOLD,
@@ -36,6 +38,9 @@ from config import (
 )
 from core.landmarks import EarCanalLandmarks
 from core.smoothing import smooth_for_thresholding
+from core import sheetness
+
+logger = logging.getLogger(__name__)
 
 
 def segment_bone_wall(
@@ -45,7 +50,7 @@ def segment_bone_wall(
     air_threshold: float = DEFAULT_AIR_THRESHOLD,
     bone_threshold: float = DEFAULT_BONE_THRESHOLD,
     wall_thickness_mm: float = BONE_WALL_THICKNESS_MM,
-) -> sitk.Image:
+) -> tuple:
     """
     Segment the bony wall of the ear canal within the cropped ROI. This is
     the function the rest of the pipeline (postprocess.py, mesh_export.py)
@@ -61,6 +66,15 @@ def segment_bone_wall(
          across the whole ROI) is what prevents the segmentation from
          grabbing unrelated bone elsewhere in the ROI, like the mastoid or
          ossicles.
+      4. If config.ENABLE_SHEET_ENHANCEMENT is True, that per-voxel bone
+         decision is refined using core/sheetness.py's Hessian-eigenvalue
+         shape analysis: a voxel below bone_threshold can still be
+         OR-boosted into the wall if it looks like a thin bright plate
+         (recovers thin-wall dropout that no threshold value can fix), and
+         a voxel above bone_threshold can be AND-vetoed out if it looks
+         like a thin dark septum (targets the scutum/malleus air-gap
+         fusion). See config.py's "Hessian-eigenvalue sheet/plate
+         enhancement" section for the full motivation and tuning guidance.
 
     Parameters
     ----------
@@ -88,9 +102,23 @@ def segment_bone_wall(
 
     Returns
     -------
-    sitk.Image
-        A UInt8 label image (same geometry as cropped_image), 1 = bone
-        wall, 0 = everything else (including the air lumen itself).
+    tuple[sitk.Image, sitk.Image | None]
+        (bone_wall_mask, intensity_override_mask).
+        bone_wall_mask: a UInt8 label image (same geometry as
+        cropped_image), 1 = bone wall, 0 = everything else (including the
+        air lumen itself) -- this is the same value this function always
+        returned, and is what callers should keep passing onward as
+        `raw_threshold_mask`/`raw_bone_wall` to postprocess.py and
+        mesh_export.py exactly as before.
+        intensity_override_mask: None when config.ENABLE_SHEET_ENHANCEMENT
+        is False (today's default). When True, a binary mask (same
+        geometry) marking every voxel where sheetness changed the
+        classification from what pure intensity thresholding alone would
+        have given. Callers MUST pass this through to
+        mesh_export.label_map_to_mesh_subvoxel()'s new
+        `intensity_override_mask` kwarg -- see that function's docstring
+        for why the sub-voxel blend would otherwise silently undo exactly
+        what sheetness is meant to fix.
     """
     air_mask = _segment_air_lumen(cropped_image, roi_mask, landmarks, air_threshold)
 
@@ -101,7 +129,7 @@ def segment_bone_wall(
         # try adjusting the slider or re-checking your landmarks."
         empty = sitk.Image(cropped_image.GetSize(), sitk.sitkUInt8)
         empty.CopyInformation(cropped_image)
-        return empty
+        return empty, None
 
     spacing = cropped_image.GetSpacing()
     # Dilation radius in voxels, per axis, so the physical dilation stays
@@ -122,11 +150,126 @@ def segment_bone_wall(
     # Bone = above threshold, restricted to the thin shell around the
     # lumen. This is what keeps the result to "just the canal wall" rather
     # than any other bone structure that happens to sit inside the ROI.
-    bone_wall_array = (smoothed_array > bone_threshold) & shell_array
+    intensity_bone_array = smoothed_array > bone_threshold
+
+    if config.ENABLE_SHEET_ENHANCEMENT:
+        spacing_zyx = (spacing[2], spacing[1], spacing[0])
+        # Sheetness runs on the RAW (pre-CurvatureFlow) intensity, not
+        # smoothed_array -- see config.py's "Hessian-eigenvalue sheet/
+        # plate enhancement" section. A pipeline-level synthetic test
+        # found the dark-sheetness gap veto never achieved true
+        # topological separation on the CurvatureFlow-smoothed field at
+        # any threshold tried, but did on the raw field (CurvatureFlow's
+        # edge-preserving diffusion, while good for the plain intensity
+        # threshold above, blunts the local Hessian signature the veto
+        # depends on). The intensity decision itself (intensity_bone_array
+        # above) still correctly uses smoothed_array, unchanged.
+        raw_array = sitk.GetArrayFromImage(cropped_image)
+        # Scales computed relative to THIS scan's own native voxel spacing
+        # (see config.SHEET_ENHANCEMENT_SCALE_MULTIPLIERS) rather than a
+        # fixed absolute-mm list -- page_dicom_load.py deliberately does
+        # NOT resample to a common isotropic spacing, so native spacing
+        # varies scan to scan (confirmed 0.5mm vs 0.25mm on two of
+        # Thomas's real scans). Using max(spacing) keeps sigma_voxels >=
+        # each multiplier in every axis regardless of how coarse (or
+        # anisotropic) a given scan's native spacing is -- a fixed mm
+        # scale becomes sub-voxel (noise-amplifying, not just imprecise)
+        # on coarser scans, which is what broke gamma calibration the
+        # first time this was tried against a real 0.5mm scan.
+        scales_mm = tuple(m * max(spacing) for m in config.SHEET_ENHANCEMENT_SCALE_MULTIPLIERS)
+        # calibration_mask=shell_array: the self-calibrating noise gate
+        # (config.SHEETNESS_GAMMA_AUTO_SCALE) measures its statistic only
+        # within the shell -- the region the bone/no-bone decision is
+        # actually made in -- not the whole crop, which is mostly empty
+        # background/air that would otherwise wash out the calibration.
+        bright = sheetness.bright_sheetness(raw_array, spacing_zyx, scales_mm, calibration_mask=shell_array)
+        dark = sheetness.dark_sheetness(raw_array, spacing_zyx, scales_mm, calibration_mask=shell_array)
+        # Diagnostic log, printed every time sheet enhancement actually
+        # runs -- visible in Slicer's Python console (View > Python
+        # Console). Added after real-Slicer testing showed no visible
+        # change across several rounds of tuning, to make it possible to
+        # directly confirm this code path is executing (and with what
+        # actual values) rather than guessing from the visual result
+        # alone. shell_voxel_count==0 would mean the self-calibrating
+        # gamma has nothing to calibrate against (median of an empty
+        # array is nan, which would silently make every bright/dark
+        # comparison False below, i.e. sheetness would have NO effect at
+        # all) -- if that's ever 0 here, that's the bug, not the filter
+        # itself.
+        logger.info(
+            "sheetness enhancement running: shell_voxel_count=%d scales_mm=%s "
+            "gamma_scale=%s bright_thresh=%s dark_thresh=%s bright_margin=%s "
+            "dark_margin=%s | bright_response max=%.4f frac>thresh=%.4f | "
+            "dark_response max=%.4f frac>thresh=%.4f",
+            int(shell_array.sum()), scales_mm, config.SHEETNESS_GAMMA_AUTO_SCALE,
+            config.BRIGHT_SHEETNESS_THRESHOLD, config.DARK_SHEETNESS_THRESHOLD,
+            config.BRIGHT_SHEETNESS_INTENSITY_MARGIN_HU, config.DARK_SHEETNESS_INTENSITY_MARGIN_HU,
+            float(bright.max()) if bright.size else float("nan"),
+            float((bright > config.BRIGHT_SHEETNESS_THRESHOLD).mean()) if bright.size else float("nan"),
+            float(dark.max()) if dark.size else float("nan"),
+            float((dark > config.DARK_SHEETNESS_THRESHOLD).mean()) if dark.size else float("nan"),
+        )
+        # Intensity floor/ceiling on the boost/veto -- see config.py's
+        # BRIGHT_/DARK_SHEETNESS_INTENSITY_MARGIN_HU. Real soft tissue is
+        # full of genuine thin sheet-like anatomy (fascia, muscle septa,
+        # vessel walls) that looks exactly like a partial-volumed bone
+        # wall in pure Hessian-eigenvalue shape terms -- shape alone can't
+        # tell them apart, so a voxel can only be OR-boosted if its own
+        # intensity is already plausibly bone-adjacent, and only
+        # AND-vetoed if it's plausibly a blurred air/soft-tissue gap, not
+        # just because its shape happens to score high.
+        #
+        # The bright boost's eligibility check uses smoothed_array (the
+        # same field the primary threshold decision uses): a genuinely
+        # thin wall's SMOOTHED intensity dips just under bone_threshold,
+        # so gating on proximity to threshold in that same field is the
+        # right comparison. The dark veto's eligibility check MUST instead
+        # use raw_array (the field sheetness's own shape detection uses),
+        # not smoothed_array -- gating on smoothed_array here re-creates
+        # exactly the failure the veto exists to fix: a real gap between
+        # two solid bone blocks gets blurred *up* by CurvatureFlow toward
+        # (and past) bone_threshold, which is precisely why the veto is
+        # needed. A first version of this gate used smoothed_array for
+        # both and broke the gap veto entirely (verified via a synthetic
+        # test: gap false-bone fraction jumped back from 0% to 94%, since
+        # the blurred gap's smoothed intensity climbed well past any
+        # reasonable margin above threshold) -- raw_array reflects the
+        # gap's true, unblurred value (deeply below bone_threshold),
+        # correctly staying eligible for the veto regardless of how far
+        # CurvatureFlow smoothing pulled the smoothed value up.
+        bright_intensity_eligible = smoothed_array > (
+            bone_threshold - config.BRIGHT_SHEETNESS_INTENSITY_MARGIN_HU
+        )
+        dark_intensity_eligible = raw_array < (
+            bone_threshold + config.DARK_SHEETNESS_INTENSITY_MARGIN_HU
+        )
+        combined_array = (
+            (
+                intensity_bone_array
+                | (bright_intensity_eligible & (bright > config.BRIGHT_SHEETNESS_THRESHOLD))
+            )
+            & ~(dark_intensity_eligible & (dark > config.DARK_SHEETNESS_THRESHOLD))
+        )
+    else:
+        combined_array = intensity_bone_array
+
+    bone_wall_array = combined_array & shell_array
+
+    if config.ENABLE_SHEET_ENHANCEMENT:
+        # Restricted to shell_array (like bone_wall_array itself) so this
+        # only flags voxels that actually differ within the final exported
+        # mask -- a voxel sheetness would have overridden outside the
+        # shell is irrelevant, since shell_array already excludes it from
+        # bone_wall_array either way.
+        override_array = bone_wall_array != (intensity_bone_array & shell_array)
+        override_mask = sitk.GetImageFromArray(override_array.astype(np.uint8))
+        override_mask.CopyInformation(cropped_image)
+    else:
+        override_mask = None
 
     bone_wall_mask = sitk.GetImageFromArray(bone_wall_array.astype(np.uint8))
     bone_wall_mask.CopyInformation(cropped_image)
-    return bone_wall_mask
+    return bone_wall_mask, override_mask
 
 
 def _segment_air_lumen(

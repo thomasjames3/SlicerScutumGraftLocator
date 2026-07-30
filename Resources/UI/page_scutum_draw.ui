@@ -4,6 +4,19 @@
  <widget class="QWidget" name="page_scutum_draw">
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
+    <widget class="QLabel" name="titleLabel">
+     <property name="text">
+      <string>Desired Scutum Defect Isolation</string>
+     </property>
+     <property name="font">
+      <font>
+       <bold>true</bold>
+       <pointsize>12</pointsize>
+      </font>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="instructionLabel">
      <property name="text">
       <string></string>

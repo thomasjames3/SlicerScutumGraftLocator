@@ -18,6 +18,7 @@ boundary.
 """
 
 from __future__ import annotations
+import time
 import numpy as np
 import SimpleITK as sitk
 from scipy import ndimage
@@ -75,12 +76,25 @@ def segment_pinna_region(
         A UInt8 label image (same geometry as cropped_image), 1 = skin
         surface region, 0 = everything else (mainly surrounding air).
     """
+    # TEMPORARY TIMING INSTRUMENTATION (2026-07-29, see CLAUDE.md "Pinna
+    # segmentation performance") -- the roi_crop grid-building fix helped
+    # but Thomas reports Stage A is still quite slow on this scan's fine
+    # native spacing. cropped_image here is the ROI sphere's bounding BOX
+    # (not just the sphere), which at this resolution is itself tens of
+    # millions of voxels -- every step below runs a full pass over it.
+    # These prints (Slicer Python console) exist purely to find out which
+    # step actually dominates before guessing at another fix. Remove once
+    # the next bottleneck is identified and addressed.
+    _t0 = time.time()
     smoothed = sitk.SmoothingRecursiveGaussian(
         cropped_image, sigma=GAUSSIAN_SMOOTHING_SIGMA_MM
     )
+    print(f"[pinna timing] Gaussian smoothing: {time.time() - _t0:.2f}s (image size {cropped_image.GetSize()})")
 
+    _t0 = time.time()
     smoothed_array = sitk.GetArrayFromImage(smoothed)
     roi_array = sitk.GetArrayFromImage(roi_mask).astype(bool)
+    print(f"[pinna timing] array conversion: {time.time() - _t0:.2f}s")
 
     # TEMPORARY DIAGNOSTICS (see Known Issues #7 in CLAUDE.md) -- prints to
     # the Slicer Python console (View > Python console) so an
@@ -107,11 +121,15 @@ def segment_pinna_region(
     # pick up unrelated tissue (e.g. the opposite side of the head, or an
     # arm/shoulder if the scan's field of view includes it) far from the
     # ear.
+    _t0 = time.time()
     above_threshold = (smoothed_array > threshold) & roi_array
     print(f"[pinna diag] voxels above threshold within ROI: {int(above_threshold.sum())}")
+    print(f"[pinna timing] thresholding: {time.time() - _t0:.2f}s")
 
+    _t0 = time.time()
     labeled_array, num_components = _label_6_connected(above_threshold)
     print(f"[pinna diag] connected components found: {num_components}")
+    print(f"[pinna timing] connected-component labeling: {time.time() - _t0:.2f}s")
 
     if num_components == 0:
         # Nothing found -- return an empty label map rather than raising,
@@ -121,9 +139,11 @@ def segment_pinna_region(
         empty.CopyInformation(cropped_image)
         return empty
 
+    _t0 = time.time()
     best_component_id = _closest_component_to_point(
         labeled_array, num_components, cropped_image, landmarks.ear_center
     )
+    print(f"[pinna timing] component selection: {time.time() - _t0:.2f}s")
 
     region_mask_array = (labeled_array == best_component_id).astype(np.uint8)
     print(f"[pinna diag] selected component voxel count: {int(region_mask_array.sum())}")
@@ -131,7 +151,9 @@ def segment_pinna_region(
     region_mask = sitk.GetImageFromArray(region_mask_array)
     region_mask.CopyInformation(cropped_image)
 
+    _t0 = time.time()
     region_mask = _remove_boundary_spike(region_mask, cropped_image, landmarks.ear_center)
+    print(f"[pinna timing] spike removal (opening): {time.time() - _t0:.2f}s")
     return region_mask
 
 
@@ -164,6 +186,26 @@ def _remove_boundary_spike(
     bug -- see page_pinna_review.py's `_refresh_mesh_from_segmentation()`
     and its `_segmentation_edited` guard -- not something this function
     needs to solve.
+
+    NOTE (2026-07-29): tried switching this to a distance-transform-based
+    Euclidean opening (erode via "distance to background >= radius", dilate
+    via "distance to the eroded set <= radius"), reasoning that SimpleITK's
+    ball structuring element ought to scale with kernel *volume* and get
+    disproportionately expensive at the [9, 9, 8]-voxel radius this scan's
+    fine native spacing (0.173x0.173x0.2mm) produces (vs. [3, 3, 3] on a
+    coarser ~0.5mm scan). Benchmarked both directly before shipping (per
+    this project's synthetic-test-first practice) at that exact radius
+    across increasing voxel counts -- the EDT version was NOT faster, it
+    was 3-4x SLOWER at real-scan-sized arrays (e.g. 14.1s vs 4.7s at 27M
+    voxels) and scaled worse with array size, not better. SimpleITK's
+    BinaryMorphologicalOpening (confirmed still using its default Ball
+    kernel, which also beat the Box kernel in the same benchmark) is
+    already well-optimized here. Reverted -- kept as a documented dead end
+    so this isn't re-attempted blind next time pinna segmentation is slow.
+    The real fix for that (see roi_crop._build_mask_by_slices) was in the
+    ROI-mask grid construction, which -- unlike this filter -- really was
+    materializing multi-gigabyte throwaway arrays at this scan's
+    resolution.
     """
     spacing = reference_image.GetSpacing()
     radius_vox = [max(1, int(round(PINNA_SPIKE_REMOVAL_RADIUS_MM / s))) for s in spacing]
