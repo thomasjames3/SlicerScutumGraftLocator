@@ -18,6 +18,8 @@ Expected widgets in page_pinna_review.ui:
   - openSegmentEditorButton  (QPushButton)
   - resetPageButton           (QPushButton) -- clear this page's own segmentation
   - revertToHereButton        (QPushButton) -- clear every later step, keep this segmentation
+  - progressBar               (QProgressBar) -- shown only while a background step (see
+    base_page.WizardPage.run_blocking()) is running, hidden otherwise
   - statusLabel               (QLabel)
 """
 
@@ -68,6 +70,7 @@ class PinnaReviewPage(WizardPage):
         self.ui.resetPageButton.clicked.connect(self._on_reset_page_clicked)
         self.ui.revertToHereButton.clicked.connect(self._on_revert_to_here_clicked)
         self.ui.openSegmentEditorButton.setEnabled(self.state.pinna_region_mesh_path is not None)
+        self.ui.progressBar.setVisible(False)
         self.ui.statusLabel.setText("Adjust the slider if needed, then click Run.")
 
     def _on_run_clicked(self):
@@ -85,6 +88,32 @@ class PinnaReviewPage(WizardPage):
         # unconditionally, before the new segmentation is built.
         wizard_state.clear_downstream_state(self.state, "pinna_review")
 
+        # Steps below run on a background thread via self.run_blocking() --
+        # see that method's docstring in base_page.py. In short: several of
+        # these single calls (segment_pinna_region, postprocess, especially
+        # label_map_to_mesh's marching_cubes) run 5-20+ seconds each on a
+        # real scan, and calling them directly on this (main) thread blocks
+        # Slicer's event loop for that whole duration -- long enough that
+        # Windows flags the app "Not Responding", which Thomas reported
+        # surgeons could easily mistake for an actual crash. Running each
+        # step on a background thread while this thread keeps pumping
+        # slicer.app.processEvents() keeps the window visibly alive and
+        # responsive throughout, and the progress bar below gives real
+        # (if coarse -- one tick per named pipeline stage, not fine-grained
+        # within a stage) confirmation that work is still happening. This
+        # does not make the underlying computation any faster.
+        self.ui.runButton.setEnabled(False)
+        self.ui.progressBar.setVisible(True)
+        self.ui.progressBar.setMinimum(0)
+        self.ui.progressBar.setMaximum(7)
+        self.ui.progressBar.setValue(0)
+        try:
+            self._run_segmentation_pipeline(sitkUtils, slicer)
+        finally:
+            self.ui.runButton.setEnabled(True)
+            self.ui.progressBar.setVisible(False)
+
+    def _run_segmentation_pipeline(self, sitkUtils, slicer):
         self.ui.statusLabel.setText("Segmenting skin surface near the ear...")
         slicer.app.processEvents()
 
@@ -132,30 +161,59 @@ class PinnaReviewPage(WizardPage):
         print(f"[pinna timing] coarse crop: {time.time() - _t0:.2f}s (size {coarse_cropped.GetSize()})")
 
         _t0 = time.time()
-        roi_mask = roi_crop.build_spherical_roi_mask(
-            coarse_cropped,
-            self.state.pinna_landmarks.ear_center,
-            radius_mm=config.PINNA_ROI_RADIUS_MM,
+        roi_mask = self.run_blocking(
+            lambda: roi_crop.build_spherical_roi_mask(
+                coarse_cropped,
+                self.state.pinna_landmarks.ear_center,
+                radius_mm=config.PINNA_ROI_RADIUS_MM,
+            ),
+            status_text="Building region of interest...",
         )
+        self.ui.progressBar.setValue(1)
         print(f"[pinna timing] build_spherical_roi_mask: {time.time() - _t0:.2f}s")
 
         _t0 = time.time()
-        cropped_image = roi_crop.crop_to_roi_bounding_box(coarse_cropped, roi_mask)
-        cropped_roi_mask = roi_crop.crop_to_roi_bounding_box(roi_mask, roi_mask)
+
+        def _crop_to_roi_bbox():
+            return (
+                roi_crop.crop_to_roi_bounding_box(coarse_cropped, roi_mask),
+                roi_crop.crop_to_roi_bounding_box(roi_mask, roi_mask),
+            )
+
+        cropped_image, cropped_roi_mask = self.run_blocking(
+            _crop_to_roi_bbox, status_text="Cropping to region of interest..."
+        )
+        self.ui.progressBar.setValue(2)
         print(f"[pinna timing] crop to ROI bounding box: {time.time() - _t0:.2f}s (size {cropped_image.GetSize()})")
 
         _t0 = time.time()
-        region_mask = segment_pinna_threshold.segment_pinna_region(
-            cropped_image,
-            cropped_roi_mask,
-            self.state.pinna_landmarks,
-            threshold=self.ui.skinThresholdSlider.value,
+        region_mask = self.run_blocking(
+            lambda: segment_pinna_threshold.segment_pinna_region(
+                cropped_image,
+                cropped_roi_mask,
+                self.state.pinna_landmarks,
+                threshold=self.ui.skinThresholdSlider.value,
+            ),
+            status_text="Segmenting skin surface...",
         )
+        self.ui.progressBar.setValue(3)
         print(f"[pinna timing] segment_pinna_region TOTAL: {time.time() - _t0:.2f}s")
 
         _t0 = time.time()
-        region_mask = postprocess.run_full_postprocess(region_mask)
+        region_mask = self.run_blocking(
+            lambda: postprocess.run_full_postprocess(region_mask),
+            status_text="Cleaning up segmentation...",
+        )
+        self.ui.progressBar.setValue(4)
         print(f"[pinna timing] postprocess TOTAL: {time.time() - _t0:.2f}s")
+
+        _t0 = time.time()
+        region_mask = self.run_blocking(
+            lambda: roi_crop.crop_to_own_bounding_box(region_mask, config.PINNA_TIGHT_CROP_MARGIN_MM),
+            status_text="Cropping to tight bounding box...",
+        )
+        self.ui.progressBar.setValue(5)
+        print(f"[pinna timing] crop_to_own_bounding_box: {time.time() - _t0:.2f}s (size {region_mask.GetSize()})")
         print(f"[pinna timing] Stage A grand total: {time.time() - _t_total:.2f}s")
 
         # Push into a segmentation node (not a plain labelmap) so it's
@@ -200,8 +258,20 @@ class PinnaReviewPage(WizardPage):
         # Uses the still-RAS-consistent `region_mask` so the exported
         # mesh's vertices line up correctly when loaded back into Slicer.
         _t0 = time.time()
-        mesh = mesh_export.label_map_to_mesh(region_mask)
-        print(f"[pinna timing] label_map_to_mesh: {time.time() - _t0:.2f}s")
+        mesh = self.run_blocking(
+            lambda: mesh_export.label_map_to_mesh(region_mask),
+            status_text="Building 3D surface mesh...",
+        )
+        self.ui.progressBar.setValue(6)
+        print(f"[pinna timing] label_map_to_mesh: {time.time() - _t0:.2f}s ({len(mesh.vertices)} verts, {len(mesh.faces)} faces)")
+
+        _t0 = time.time()
+        mesh = self.run_blocking(
+            lambda: mesh_export.decimate_to_target_resolution(mesh),
+            status_text="Simplifying mesh...",
+        )
+        self.ui.progressBar.setValue(7)
+        print(f"[pinna timing] decimate_to_target_resolution: {time.time() - _t0:.2f}s ({len(mesh.vertices)} verts, {len(mesh.faces)} faces)")
         mesh_path = os.path.join(
             self.state.working_dir or slicer.app.temporaryPath, "pinna_region.stl"
         )
@@ -296,16 +366,48 @@ class PinnaReviewPage(WizardPage):
         )
         sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(temp_label_node))
         slicer.mrmlScene.RemoveNode(temp_label_node)
-        sitk_image = postprocess.run_full_postprocess(sitk_image)
 
+        # See _on_run_clicked()/run_blocking()'s docstring in base_page.py
+        # for why these run on a background thread while a progress bar
+        # shows here -- this same postprocess+meshing round trip runs
+        # whenever the surgeon clicks Next after touching up in Segment
+        # Editor, so it deserves the same "don't look frozen" treatment as
+        # the Run button's own pipeline.
+        self.ui.progressBar.setVisible(True)
+        self.ui.progressBar.setMinimum(0)
+        self.ui.progressBar.setMaximum(4)
+        self.ui.progressBar.setValue(0)
         try:
-            mesh = mesh_export.label_map_to_mesh(sitk_image)
-        except mesh_export.EmptySegmentationError:
-            return False, (
-                "The segmentation is empty after your Segment Editor edits. "
-                "Go back to Segment Editor and add material back, or "
-                "re-run the automatic segmentation."
+            sitk_image = self.run_blocking(
+                lambda: postprocess.run_full_postprocess(sitk_image),
+                status_text="Cleaning up your edited segmentation...",
             )
+            self.ui.progressBar.setValue(1)
+            sitk_image = self.run_blocking(
+                lambda: roi_crop.crop_to_own_bounding_box(sitk_image, config.PINNA_TIGHT_CROP_MARGIN_MM),
+                status_text="Cropping to tight bounding box...",
+            )
+            self.ui.progressBar.setValue(2)
+
+            try:
+                mesh = self.run_blocking(
+                    lambda: mesh_export.label_map_to_mesh(sitk_image),
+                    status_text="Building 3D surface mesh...",
+                )
+            except mesh_export.EmptySegmentationError:
+                return False, (
+                    "The segmentation is empty after your Segment Editor edits. "
+                    "Go back to Segment Editor and add material back, or "
+                    "re-run the automatic segmentation."
+                )
+            self.ui.progressBar.setValue(3)
+            mesh = self.run_blocking(
+                lambda: mesh_export.decimate_to_target_resolution(mesh),
+                status_text="Simplifying mesh...",
+            )
+            self.ui.progressBar.setValue(4)
+        finally:
+            self.ui.progressBar.setVisible(False)
 
         mesh_export.export_mesh(mesh, self.state.pinna_region_mesh_path)
         if self.state.pinna_region_model_node is not None:

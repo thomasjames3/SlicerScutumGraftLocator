@@ -36,6 +36,8 @@ Expected widgets in page_pinna_draw.ui:
   - isolateButton           (QPushButton)
   - resetPageButton         (QPushButton) -- clear this page's outline/patch
   - revertToHereButton      (QPushButton) -- clear every later step, keep this patch
+  - progressBar             (QProgressBar) -- shown only while a background step (see
+    base_page.WizardPage.run_blocking()) is running, hidden otherwise
   - statusLabel             (QLabel)
 """
 
@@ -44,7 +46,7 @@ import os
 import numpy as np
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
 from EarReconstructionPlannerLib import wizard_state
-from core import mesh_isolate, mesh_export, postprocess, io_utils
+from core import mesh_isolate, mesh_export, postprocess, io_utils, roi_crop
 import config
 
 # Reused in on_enter() and _on_reset_page_clicked() so the tutorial text
@@ -100,6 +102,7 @@ class PinnaDrawPage(WizardPage):
         self.ui.markSeedButton.setEnabled(False)
         self.ui.markCanalOpeningButton.setEnabled(False)
         self.ui.isolateButton.setEnabled(False)
+        self.ui.progressBar.setVisible(False)
         self.ui.statusLabel.setText(
             "Click 'Start Outline', then trace around the pinna (usually "
             "just the outer face, along the helix) on the skin surface in "
@@ -241,7 +244,6 @@ class PinnaDrawPage(WizardPage):
 
     def _on_isolate_clicked(self):
         import slicer
-        import trimesh
 
         if self._curve_node is None or self._seed_point is None or self._canal_point is None:
             self.ui.statusLabel.setText(
@@ -249,6 +251,50 @@ class PinnaDrawPage(WizardPage):
                 "opening first."
             )
             return
+
+        # Steps below run on a background thread via self.run_blocking() --
+        # see that method's docstring in base_page.py and the matching
+        # comment in page_pinna_review.py's _on_run_clicked(). In short:
+        # isolate_surface_patch() alone runs ~5-6 seconds on a real scan
+        # (confirmed via [isolate timing] instrumentation), and the
+        # LoopDoesNotSeparateError fallback path below can run a further
+        # ~30+ seconds (a full postprocess+remesh round trip) -- both long
+        # enough to make Slicer's window look "Not Responding" if run
+        # directly on this (main) thread. self._progress_step tracks
+        # progress across both this method and _build_fallback_mesh() (the
+        # fallback path only runs if the first isolate attempt fails, so
+        # the total step count -- and progressBar's max -- isn't known
+        # upfront; bumped up if/when the fallback path actually triggers).
+        self.ui.isolateButton.setEnabled(False)
+        self.ui.progressBar.setVisible(True)
+        self.ui.progressBar.setMinimum(0)
+        self.ui.progressBar.setMaximum(3)
+        self.ui.progressBar.setValue(0)
+        self._progress_step = 0
+        self._progress_max = 3
+        try:
+            self._run_isolate_pipeline()
+        finally:
+            self.ui.isolateButton.setEnabled(True)
+            self.ui.progressBar.setVisible(False)
+
+    def _advance_progress(self, label):
+        # Tracks the max as a plain Python attribute (self._progress_max)
+        # rather than reading it back from the Qt widget -- this pipeline's
+        # real step count isn't known upfront (the LoopDoesNotSeparateError
+        # fallback path below adds steps only if it actually triggers), so
+        # the bar's max is bumped up here whenever more steps turn out to
+        # be needed than originally set.
+        self._progress_step += 1
+        if self._progress_step > self._progress_max:
+            self._progress_max = self._progress_step
+            self.ui.progressBar.setMaximum(self._progress_max)
+        self.ui.progressBar.setValue(self._progress_step)
+        self.ui.statusLabel.setText(label)
+
+    def _run_isolate_pipeline(self):
+        import slicer
+        import trimesh
 
         self.ui.statusLabel.setText("Isolating pinna patch...")
         slicer.app.processEvents()
@@ -287,7 +333,8 @@ class PinnaDrawPage(WizardPage):
             f"(at index {_max_gap_idx}{'=wrap-around/auto-close' if _max_gap_idx == len(_all_gaps) - 1 else ''})"
         )
 
-        mesh = trimesh.load(self.state.pinna_region_mesh_path)
+        self._advance_progress("Loading pinna mesh...")
+        mesh = self.run_blocking(lambda: trimesh.load(self.state.pinna_region_mesh_path))
         # The STL file on disk is LPS-numbered (see mesh_export.export_mesh's
         # docstring for why) -- flip back to RAS so mesh.vertices matches
         # curve_points/self._seed_point/self._canal_point, which are always
@@ -312,15 +359,20 @@ class PinnaDrawPage(WizardPage):
         # remaining a genus-raising tunnel -- isolate_surface_patch's
         # vertex-removal flood fill doesn't care about open boundaries at
         # all, only about handles.
+        self._advance_progress("Cropping toward the ear canal...")
         try:
-            mesh = self._crop_toward_canal_if_possible(mesh)
+            mesh = self.run_blocking(lambda: self._crop_toward_canal_if_possible(mesh))
         except ValueError as e:
             self.ui.statusLabel.setText(str(e))
             return
 
+        def _snap_and_isolate(m):
+            loop_indices = mesh_isolate.snap_points_to_vertices(m, curve_points)
+            return mesh_isolate.isolate_surface_patch(m, loop_indices, self._seed_point)
+
+        self._advance_progress("Isolating the drawn patch...")
         try:
-            loop_indices = mesh_isolate.snap_points_to_vertices(mesh, curve_points)
-            patch = mesh_isolate.isolate_surface_patch(mesh, loop_indices, self._seed_point)
+            patch = self.run_blocking(lambda: _snap_and_isolate(mesh))
         except mesh_isolate.LoopDoesNotSeparateError as e:
             # Confirmed on a real scan (2026-07-27) that a perfectly-drawn,
             # densely-sampled, non-self-intersecting loop can still fail to
@@ -351,11 +403,12 @@ class PinnaDrawPage(WizardPage):
             try:
                 # Crop the fallback mesh too, same reasoning as the
                 # primary attempt above.
-                fallback_mesh = self._crop_toward_canal_if_possible(fallback_mesh)
-                loop_indices = mesh_isolate.snap_points_to_vertices(fallback_mesh, curve_points)
-                patch = mesh_isolate.isolate_surface_patch(
-                    fallback_mesh, loop_indices, self._seed_point
+                self._advance_progress("Cropping fallback mesh toward the ear canal...")
+                fallback_mesh = self.run_blocking(
+                    lambda: self._crop_toward_canal_if_possible(fallback_mesh)
                 )
+                self._advance_progress("Retrying isolation...")
+                patch = self.run_blocking(lambda: _snap_and_isolate(fallback_mesh))
             except ValueError:
                 # The fallback didn't help either -- report the original
                 # error, since it's the more informative one (mentions the
@@ -479,16 +532,34 @@ class PinnaDrawPage(WizardPage):
         # here, to recover a working isolate result, that tradeoff is
         # worth it: an isolate failure blocks the whole wizard, while this
         # fallback mesh is discarded immediately after use.
-        sitk_image = postprocess.run_full_postprocess(sitk_image, close_tunnels=True)
+        #
+        # This whole method is only reached from _run_isolate_pipeline()'s
+        # LoopDoesNotSeparateError handler, which already put the page into
+        # background-thread/progress-bar mode -- see self._advance_progress()
+        # and run_blocking() (base_page.py) for why each of these steps
+        # (each individually multi-second on a real scan, same cost as
+        # page_pinna_review.py's own postprocess/meshing pipeline) runs on
+        # a background thread here too, rather than blocking this thread
+        # directly.
+        self._advance_progress("Cleaning up segmentation...")
+        sitk_image = self.run_blocking(
+            lambda: postprocess.run_full_postprocess(sitk_image, close_tunnels=True)
+        )
+        self._advance_progress("Cropping to tight bounding box...")
+        sitk_image = self.run_blocking(
+            lambda: roi_crop.crop_to_own_bounding_box(sitk_image, config.PINNA_TIGHT_CROP_MARGIN_MM)
+        )
 
+        self._advance_progress("Building 3D surface mesh...")
         try:
-            mesh = mesh_export.label_map_to_mesh(sitk_image)
+            mesh = self.run_blocking(lambda: mesh_export.label_map_to_mesh(sitk_image))
         except mesh_export.EmptySegmentationError:
             return None
 
         if len(mesh.vertices) == 0:
             return None
-        return mesh
+        self._advance_progress("Simplifying mesh...")
+        return self.run_blocking(lambda: mesh_export.decimate_to_target_resolution(mesh))
 
     def _on_reset_page_clicked(self):
         import slicer

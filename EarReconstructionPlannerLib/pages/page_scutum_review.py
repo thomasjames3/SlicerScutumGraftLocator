@@ -21,6 +21,8 @@ Expected widgets in page_scutum_review.ui:
   - boneThresholdSlider  (QSlider or ctkSliderWidget)
   - runButton            (QPushButton)
   - openSegmentEditorButton (QPushButton)
+  - progressBar          (QProgressBar) -- shown only while a background step (see
+    base_page.WizardPage.run_blocking()) is running, hidden otherwise
   - statusLabel          (QLabel)
   - wallThicknessWarningLabel (QLabel) -- advisory-only, shown if the segmented wall looks too thin to trust
   - resetPageButton      (QPushButton) -- clear this page's own segmentation
@@ -131,6 +133,7 @@ class ScutumReviewPage(WizardPage):
         self.ui.openSegmentEditorButton.setEnabled(self.state.scutum_bone_wall_mesh_path is not None)
         self.ui.wallThicknessWarningLabel.setText("")
         self.ui.wallThicknessWarningLabel.setVisible(False)
+        self.ui.progressBar.setVisible(False)
         self.ui.statusLabel.setText("Adjust the sliders if needed, then click Run.")
 
     def _setup_calibration_seeds(self):
@@ -264,6 +267,27 @@ class ScutumReviewPage(WizardPage):
             self.ui.statusLabel.setText("No scan loaded -- go back and select one first.")
             return
 
+        # See page_pinna_review.py's _on_run_clicked() and
+        # base_page.WizardPage.run_blocking()'s docstring for why the heavy
+        # steps below run on a background thread while a progress bar
+        # shows here -- canal segmentation is faster than the pinna
+        # pipeline on a typical scan, but segment_dl.segment() (especially
+        # with sheet enhancement enabled, config.ENABLE_SHEET_ENHANCEMENT --
+        # ~7x slower than plain thresholding, see config.py) and
+        # label_map_to_mesh_subvoxel() can still run long enough for
+        # Slicer's window to look "Not Responding" on a slower scan/machine.
+        self.ui.runButton.setEnabled(False)
+        self.ui.progressBar.setVisible(True)
+        self.ui.progressBar.setMinimum(0)
+        self.ui.progressBar.setMaximum(5)
+        self.ui.progressBar.setValue(0)
+        try:
+            self._run_segmentation_pipeline(sitkUtils, slicer)
+        finally:
+            self.ui.runButton.setEnabled(True)
+            self.ui.progressBar.setVisible(False)
+
+    def _run_segmentation_pipeline(self, sitkUtils, slicer):
         # Re-running this segmentation invalidates anything built on top of
         # the old one (a defect outline drawn on the old bone-wall mesh,
         # the verify approval, the heatmap) -- clear it up front so a
@@ -295,25 +319,47 @@ class ScutumReviewPage(WizardPage):
             sitk_image, self.state.scutum_landmarks
         )
 
+        self.ui.statusLabel.setText("Building region of interest...")
         try:
-            roi_mask = roi_crop.build_roi_mask(coarse_cropped, self.state.scutum_landmarks)
+            roi_mask = self.run_blocking(
+                lambda: roi_crop.build_roi_mask(coarse_cropped, self.state.scutum_landmarks)
+            )
         except ValueError as exc:
             self.ui.statusLabel.setText(str(exc))
             return
-        cropped_image = roi_crop.crop_to_roi_bounding_box(coarse_cropped, roi_mask)
-        cropped_roi_mask = roi_crop.crop_to_roi_bounding_box(roi_mask, roi_mask)
+        self.ui.progressBar.setValue(1)
 
-        raw_bone_wall, intensity_override_mask = segment_dl.segment(
-            cropped_image,
-            cropped_roi_mask,
-            self.state.scutum_landmarks,
-            air_threshold=self.ui.airThresholdSlider.value,
-            bone_threshold=self.ui.boneThresholdSlider.value,
+        def _crop_to_roi_bbox():
+            return (
+                roi_crop.crop_to_roi_bounding_box(coarse_cropped, roi_mask),
+                roi_crop.crop_to_roi_bounding_box(roi_mask, roi_mask),
+            )
+
+        cropped_image, cropped_roi_mask = self.run_blocking(
+            _crop_to_roi_bbox, status_text="Cropping to region of interest..."
         )
+        self.ui.progressBar.setValue(2)
+
+        raw_bone_wall, intensity_override_mask = self.run_blocking(
+            lambda: segment_dl.segment(
+                cropped_image,
+                cropped_roi_mask,
+                self.state.scutum_landmarks,
+                air_threshold=self.ui.airThresholdSlider.value,
+                bone_threshold=self.ui.boneThresholdSlider.value,
+            ),
+            status_text="Segmenting bone wall...",
+        )
+        self.ui.progressBar.setValue(3)
+
         # Kept alongside the postprocessed result -- mesh_export.
         # label_map_to_mesh_subvoxel() needs both, to tell which voxels
         # postprocessing actually changed (see its docstring).
-        bone_wall = postprocess.run_full_postprocess(raw_bone_wall, close_tunnels=True)
+        bone_wall = self.run_blocking(
+            lambda: postprocess.run_full_postprocess(raw_bone_wall, close_tunnels=True),
+            status_text="Cleaning up segmentation...",
+        )
+        self.ui.progressBar.setValue(4)
         self._check_and_display_wall_thickness(bone_wall)
 
         # Push into a segmentation node (not a plain labelmap) so it's
@@ -370,12 +416,15 @@ class ScutumReviewPage(WizardPage):
         # painted, with no single threshold it corresponds to, so that path
         # correctly keeps using plain label_map_to_mesh().
         try:
-            mesh = mesh_export.label_map_to_mesh_subvoxel(
-                cropped_image,
-                bone_wall,
-                raw_bone_wall,
-                self.ui.boneThresholdSlider.value,
-                intensity_override_mask=intensity_override_mask,
+            mesh = self.run_blocking(
+                lambda: mesh_export.label_map_to_mesh_subvoxel(
+                    cropped_image,
+                    bone_wall,
+                    raw_bone_wall,
+                    self.ui.boneThresholdSlider.value,
+                    intensity_override_mask=intensity_override_mask,
+                ),
+                status_text="Building 3D surface mesh...",
             )
         except mesh_export.EmptySegmentationError:
             self.ui.openSegmentEditorButton.setEnabled(False)
@@ -386,6 +435,7 @@ class ScutumReviewPage(WizardPage):
                 "segmentation is still visible in the slice views.)"
             )
             return
+        self.ui.progressBar.setValue(5)
 
         mesh_path = os.path.join(
             self.state.working_dir or slicer.app.temporaryPath, "scutum_bone_wall.stl"
@@ -490,17 +540,38 @@ class ScutumReviewPage(WizardPage):
         )
         sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(temp_label_node))
         slicer.mrmlScene.RemoveNode(temp_label_node)
-        sitk_image = postprocess.run_full_postprocess(sitk_image, close_tunnels=True)
-        self._check_and_display_wall_thickness(sitk_image)
 
+        # See _on_run_clicked()/run_blocking()'s docstring in base_page.py
+        # for why these run on a background thread while a progress bar
+        # shows here -- this same postprocess+meshing round trip runs
+        # whenever the surgeon clicks Next after touching up in Segment
+        # Editor.
+        self.ui.progressBar.setVisible(True)
+        self.ui.progressBar.setMinimum(0)
+        self.ui.progressBar.setMaximum(2)
+        self.ui.progressBar.setValue(0)
         try:
-            mesh = mesh_export.label_map_to_mesh(sitk_image)
-        except mesh_export.EmptySegmentationError:
-            return False, (
-                "The segmentation is empty after your Segment Editor edits. "
-                "Go back to Segment Editor and add material back, or "
-                "re-run the automatic segmentation."
+            sitk_image = self.run_blocking(
+                lambda: postprocess.run_full_postprocess(sitk_image, close_tunnels=True),
+                status_text="Cleaning up your edited segmentation...",
             )
+            self.ui.progressBar.setValue(1)
+            self._check_and_display_wall_thickness(sitk_image)
+
+            try:
+                mesh = self.run_blocking(
+                    lambda: mesh_export.label_map_to_mesh(sitk_image),
+                    status_text="Building 3D surface mesh...",
+                )
+            except mesh_export.EmptySegmentationError:
+                return False, (
+                    "The segmentation is empty after your Segment Editor edits. "
+                    "Go back to Segment Editor and add material back, or "
+                    "re-run the automatic segmentation."
+                )
+            self.ui.progressBar.setValue(2)
+        finally:
+            self.ui.progressBar.setVisible(False)
 
         mesh_export.export_mesh(mesh, self.state.scutum_bone_wall_mesh_path)
         if self.state.scutum_bone_wall_model_node is not None:

@@ -33,13 +33,27 @@ coordinates, one-time dependency install, plain-language instructions.
 ## Current status
 
 Entire scutum and pinna pipelines confirmed working end-to-end in real
-Slicer: DICOM load → scutum landmarks → pinna landmarks/review/draw →
-scutum review/draw → (Verify, Curvature not yet runtime-tested).
+Slicer as of 2026-07-28/29: DICOM load → scutum landmarks → pinna
+landmarks/review/draw → scutum review/draw → (Verify, Curvature not yet
+runtime-tested). **That confirmation predates a substantial round of
+2026-07-30 changes to the pinna review/draw and scutum review pages**
+(see "Pinna segmentation performance" and "Pinna UI responsiveness fix"
+below) — mesh decimation, a component-selection bug fix, a tight-bbox
+crop, and background-thread + progress-bar wiring in
+`page_pinna_review.py`/`page_pinna_draw.py`/`page_scutum_review.py`. Each
+piece was validated individually (synthetic tests, and Thomas re-running
+Stage A/isolate specifically to confirm timing), but the full pages
+haven't had a fresh end-to-end real-Slicer pass since all of it landed —
+don't assume "confirmed working end-to-end" still covers these three
+pages' current code without checking whether anything's been touched
+since 07-28/29.
 
 **Not yet exercised in real Slicer:** Verify page; Curvature page's Qt
 widgets (progress streaming, results table, heatmap vertex-color
-display). The curvature *algorithm* itself (in-process port) is verified
-against synthetic meshes, just not the Slicer-side UI plumbing around it.
+display, and the new progress-bar parsing added 2026-07-30 -- see "Pinna
+UI responsiveness fix"). The curvature *algorithm* itself (in-process
+port) is verified against synthetic meshes, just not the Slicer-side UI
+plumbing around it.
 
 **Open bug:** "Reset All Points" button on scutum landmarks page —
 reported broken early, never actually debugged. First place to look if
@@ -191,6 +205,23 @@ EarReconstructionPlanner/
   `SetAndObserveSurfaceConstraintNode` alone — that only registers the
   node, doesn't constrain placement). Mark seed point → Isolate Patch →
   `mesh_isolate` → export → load as new model.
+- **Scutum outline ruler (2026-07-30, `page_scutum_draw.py`)**: a
+  `toggleRulerButton` ("Show Ruler"/"Hide Ruler") creates a 2-point
+  `vtkMRMLMarkupsLineNode` the surgeon can place on the bone-wall surface
+  as a physical scale reference while tracing the defect outline —
+  Slicer's own line-markup distance label does the measurement, no custom
+  math needed. First click creates the node and enters Place mode for its
+  2 points (persistence 1, same as the outline curve — Slicer exits Place
+  mode on its own once both points are placed); later clicks just toggle
+  the existing line's visibility rather than recreating it, so a
+  measurement isn't lost while decluttering the view. Colored
+  `config.SCUTUM_RULER_COLOR` (blue) specifically so it can't be confused
+  with the outline curve's own default Markups color (yellow/green) —
+  the outline itself was deliberately left untouched (no explicit color
+  set) to avoid changing its established look. Auto-hidden (not removed)
+  once Isolate Patch succeeds, matching how the outline curve and seed
+  point are also hidden at that point. **Confirmed working in real
+  Slicer (2026-07-30)** — Thomas reported the ruler works.
 - **Verify page**: two explicit approval checkboxes, deliberate manual
   gate before the final comparison.
 - **Tutorial mode**: `WizardState.tutorial_mode`, set once on Setup, read
@@ -198,6 +229,19 @@ EarReconstructionPlanner/
   (tutorial-only) skipped in Normal mode via `wizard_state.SKIP_PAGE_IF`
   (a plain state predicate checked in `_show_page()`, so skip-checking
   never forces an early controller import).
+- **Restart Slicer button (Setup page, 2026-07-30)**: freshly
+  `pip_install`'d packages (especially ones with compiled/binary
+  components, e.g. `fast-simplification`) aren't always reliable to use
+  immediately in the same already-running Slicer process — Windows in
+  particular can't always safely replace/re-initialize a DLL that's
+  already loaded. `page_setup.py`'s `restartSlicerButton` calls
+  `slicer.util.restart()` (with a confirm dialog first, since it closes
+  the whole app) and is only ever shown when `_refresh_status()` finds
+  missing packages — i.e. hidden again on a later launch once everything
+  installed successfully in a prior, properly-restarted session, so a
+  returning surgeon on an already-set-up Slicer never sees an unexplained
+  restart option. Safe to offer unconditionally when shown, since Setup
+  is page 0 — no DICOM/landmarks/segmentation state exists yet to lose.
 
 ---
 
@@ -349,6 +393,448 @@ and found backwards. **Next session: ask Thomas to run segmentation once
 more on this same slow scan and paste the full `[pinna timing]` block**
 before proposing any fix -- that will show exactly which of the ~9 steps
 actually dominates, rather than guessing again.
+
+**Root cause found for BOTH the Stage A slowness and the draw/isolate-step
+slowness (2026-07-30), without needing the `[pinna timing]` console output
+above** -- Thomas separately reported the draw/isolate step (page_pinna_draw.py
+-> core/mesh_isolate.py) is also slow on this same fine-spacing scan, which
+pointed at a shared cause rather than two unrelated bottlenecks: **nothing in
+this pipeline ever decimates/downsamples the mesh** --
+`mesh_export.label_map_to_mesh()`/`label_map_to_mesh_subvoxel()` run
+`skimage.measure.marching_cubes` with no `step_size` (defaults to 1, the
+finest possible), and no simplification step follows. marching_cubes'
+vertex count scales with (surface area)/(native spacing)^2. The ear canal's
+ROI (a thin tube around 2 landmarks) has a small surface area regardless of
+spacing, so its mesh stays small even at fine native resolution -- but
+`PINNA_ROI_RADIUS_MM`'s 45mm sphere covers a much larger patch of skin, so
+at fine native spacing (this scan's 0.173x0.173x0.2mm) the pinna mesh
+balloons into the hundreds of thousands of vertices. That bloated mesh then
+hits `core/mesh_isolate.py`'s `isolate_surface_patch()`, which builds a full
+`networkx.Graph` (`mesh.vertex_adjacency_graph`) over every vertex before
+doing anything else, plus a plain-Python `for i in range(len(mesh.vertices))`
+loop and a `np.vectorize` call in `_submesh_from_vertices()` -- all three
+scale with vertex count but with heavy per-element (Python-level) cost, so
+they get disproportionately slow exactly when the mesh is large. This is
+why canal stays fast (small mesh regardless of spacing) while pinna
+segmentation-to-mesh AND drawing/isolation both slow down together on a
+fine-spacing scan (same root cause, two places it shows up).
+
+**Fix shipped: `mesh_export.decimate_to_target_resolution()`** (quadric-
+error decimation via `trimesh.simplify_quadric_decimation()`, which wraps
+the new `fast-simplification` dependency -- added to
+`dependencies.py`'s `REQUIRED_PACKAGES`). Chosen over the two alternatives
+discussed with Thomas -- capping `marching_cubes`' own `step_size`, or only
+rewriting `mesh_isolate.py`'s networkx flood-fill onto `scipy.sparse` (no
+resolution change at all, but doesn't address Stage A meshing time and is
+higher-risk given `mesh_isolate.py`'s "8-round Isolate Patch saga" history)
+-- because Thomas explicitly wanted whichever approach preserves shape
+accuracy best: unlike `step_size` (which uniformly discards resolution
+everywhere), quadric decimation preferentially keeps detail in
+high-curvature areas (the helix) and removes it from flat ones (cheek/scalp
+skin), for a given final vertex count.
+
+Applied ONLY to the pinna pipeline -- three call sites
+(`page_pinna_review.py`'s `_on_run_clicked()` and
+`_refresh_mesh_from_segmentation()`, `page_pinna_draw.py`'s
+`_build_fallback_mesh()`) -- immediately after `label_map_to_mesh()`, before
+export/display/drawing, so the STL written to disk, the model node loaded
+into Slicer, and the mesh the surgeon's curve gets constrained to are all
+already decimated. Deliberately NOT applied to
+`label_map_to_mesh_subvoxel()` or any scutum call site: that function's
+whole purpose is sub-voxel boundary precision for the bone-wall mesh (see
+"Sub-voxel mesh extraction" above), and decimating afterward would blur
+exactly the improvement it exists to add -- also unnecessary, since the
+canal mesh was never the slow one. Target density
+(`PINNA_MESH_TARGET_EDGE_MM` in config.py) is set equal to
+`TARGET_VOXEL_SPACING_MM` (0.3mm) -- not because that resampling actually
+happens (it deliberately doesn't, see above), but because that's the
+density scale the rest of this pipeline (mesh_isolate.py, draw-step point
+sizes) was implicitly built and tested around on past scans that happened
+to be near that native spacing. The function no-ops (returns the mesh
+unchanged) whenever the mesh is already at or coarser than the target, so a
+coarse-native-spacing scan's pinna mesh is untouched by this change.
+
+**Synthetic validation (scratchpad, not committed)**: built the same bumpy
+blob shape at 0.5mm and 0.173mm native spacing, ran real marching_cubes on
+both. Confirmed the diagnosis directly -- the 0.173mm mesh had **8.4x** as
+many faces as the 0.5mm mesh for the "same" shape. Decimating the fine mesh
+down to `PINNA_MESH_TARGET_EDGE_MM` brought it to a comparable order of
+magnitude to the coarse mesh's own face count (not identical -- the
+target-face-count estimate is a geometric approximation based on total
+surface area, expected to be in the right ballpark rather than exact).
+Shape accuracy check (nearest-surface distance from every original fine-mesh
+vertex to the decimated mesh) came back effectively 0.0mm -- expected,
+since quadric decimation only removes/reconnects vertices, it doesn't move
+the ones it keeps. As a proxy for the real `mesh_isolate.py` cost (without
+needing a full Slicer session), timing `mesh.vertex_adjacency_graph`
+construction (the same networkx call `isolate_surface_patch()` makes) on
+the full-res vs. decimated fine mesh dropped from 4.3s to 1.4s from
+decimation alone, before even considering the other savings from the
+smaller mesh flowing through the rest of `mesh_isolate.py`'s Python-loop and
+`np.vectorize` steps too.
+
+**Not yet real-Slicer tested.** This should measurably speed up both pinna
+Stage A (smaller mesh at the marching_cubes/export/loadModel/postprocess
+steps that already had `[pinna timing]` instrumentation from the prior
+session -- worth checking that output once more now, since the decimation
+step will show up as a new line and the downstream steps' own times should
+also drop from the smaller mesh flowing through them) and the draw/isolate
+step, but the actual real-scan magnitude is unconfirmed -- consistent with
+this project's repeated lesson that synthetic tests validate the mechanism,
+not the real-scan outcome (see [[feedback_synthetic_tests_limits]]). If
+Thomas reports the pinna's visible shape looks noticeably blockier/less
+detailed after this change (unlikely at this target density given the
+above, but worth ruling in/out explicitly), `PINNA_MESH_TARGET_EDGE_MM` is
+the one knob to lower. The `mesh_isolate.py` networkx-to-scipy.sparse
+rewrite discussed with Thomas as an alternative/follow-up was NOT done this
+session -- still on the table as a further speedup if decimation alone
+doesn't fully resolve the draw/isolate step's slowness.
+
+**Second real-Slicer timing confirmed (2026-07-30, after the round-1
+component-selection fix shipped)**: Thomas re-ran the same scan.
+Stage A grand total dropped 45.41s -> 37.83s. `component selection`
+dropped 12.91s -> 7.30s (the round-1 fix -- real, but far short of the
+57.7x a synthetic test had predicted; see the "Fixed" note below for why,
+and for round 3's much better fix). Isolate step also re-measured: TOTAL
+5.00s (down slightly from 5.70s, consistent with the isolated mesh being
+about the same size: 141,726 vertices this time vs. 155,816 before).
+`barrier_graph subgraph + remove_nodes_from` (2.89s) is still the single
+biggest isolate-internal cost, same "local radius covered the entire
+mesh" situation as before (141,726 of 141,726 vertices within range) --
+still not yet fixed, still low priority relative to Stage A.
+
+**Real-Slicer timing confirmed (2026-07-30, same day): decimation IS
+working correctly, but Stage A's slowness is dominated by steps decimation
+can never touch.** Thomas ran a real scan (0.214844x0.214844x0.3125mm
+spacing -- moderately fine, not as extreme as the 0.173mm case above) and
+pasted the full `[pinna timing]`/`[isolate diag]`/`[isolate timing]` console
+block (the newly-added isolate-step timing, see below). Findings:
+- `label_map_to_mesh`: 503,296 verts/1,006,078 faces -> `decimate_to_target_
+  resolution`: 260,031 verts/519,877 faces (1.67s). Decimation worked
+  exactly as designed -- but only ~2x reduction here, not the 8.4x seen in
+  the synthetic test, because this scan's native spacing is only
+  moderately finer than `PINNA_MESH_TARGET_EDGE_MM` (0.3mm), unlike the
+  more extreme 0.173mm case in Thomas's original slowness report -- less
+  headroom to decimate down to by design (the function correctly never
+  over-decimates below native detail).
+- Stage A grand total: 45.41s. The three biggest line items --
+  `component selection` (12.91s), `smooth_boundary` (15.61s), and
+  `label_map_to_mesh`'s marching_cubes itself (19.82s) -- are ALL either
+  bugs unrelated to mesh size, or costs that happen at the VOXEL level,
+  before or during meshing. Decimation only ever shrinks the mesh AFTER
+  marching_cubes runs, so it structurally cannot speed up marching_cubes'
+  own cost, nor any postprocess step that runs before it. This is why
+  Thomas "hasn't noticed any difference in speed" for Stage A -- decimation
+  was never going to fix Stage A at all, only the isolate/draw step.
+- Isolate/draw step: newly added `[isolate timing]` instrumentation (this
+  function previously only had diagnostic prints, no actual timing) showed
+  `isolate_surface_patch` TOTAL = 5.70s, with `vertex_adjacency_graph
+  build` (1.44s) and `barrier_graph subgraph + remove_nodes_from` (3.32s,
+  the single biggest line here) as the two real costs. Notably, "local
+  search radius: 54.7mm, 155816 vertices within range" == the mesh's ENTIRE
+  vertex count -- meaning the "restrict flood-fill to a local neighborhood"
+  optimization (added during the 8-round Isolate Patch saga) wasn't
+  actually restricting anything in this case, so `graph.subgraph(nearby_set)`
+  paid the cost of copying the WHOLE graph for no narrowing benefit. Not
+  yet fixed -- flagged here as a small follow-up if isolate is still felt
+  to be slow after other fixes land, not yet prioritized since 5.7s is
+  already a small fraction of the ~45s total.
+
+**Fixed (2026-07-30): `_closest_component_to_point()`'s full-array EDT
+fallback -- confirmed real bug, not just theoretical. Took TWO rounds to
+get right, and the first round's synthetic test was misleading.** The
+12.91s "component selection" line above is `segment_pinna_threshold.
+_closest_component_to_point()`: when the ear-center landmark's own voxel
+isn't itself part of any labeled component (common -- lands a hair below
+threshold), it fell back to `scipy.ndimage.distance_transform_edt(labeled_
+array == 0, return_indices=True)` over the WHOLE ~41.5M-voxel array, to
+answer a single-point nearest-neighbor query.
+
+Round 1: replaced with a `cKDTree` built from every foreground voxel's own
+coordinates. A synthetic test (small, SPARSE foreground -- a few small
+blobs in mostly-empty space) showed a 57.7x speedup and looked airtight.
+Real-Slicer re-test only showed 12.91s -> 7.30s (~1.8x) -- a real
+improvement, but nowhere near the synthetic prediction. Root cause: real
+scans are NOT sparse here -- Thomas's log showed ~12.9M of ~41.5M voxels
+(31%) as foreground across 22 components. Building a cKDTree over that
+many points isn't free either; round 1's synthetic test just didn't match
+real foreground density, so it didn't catch this -- another instance of
+this project's repeated lesson (see [[feedback_synthetic_tests_limits]]),
+this time on a synthetic test that was too EASY rather than one that
+missed a real-world failure mode.
+
+Round 2 (tried, REJECTED): a "growing local search box" around the query
+point (small EDT on an expanding local crop, on the theory that the
+landmark is always close to real tissue). Directly measured to sometimes
+be WORSE than the original full-array EDT (10.14s vs. 9.62s baseline, on
+a realistic-density synthetic array) when the query point happened to sit
+in a gap between components -- the small boxes found nothing, wasting
+time before falling back to the full-array approach anyway. Locality is
+not guaranteed, so this approach was abandoned rather than shipped.
+
+Round 3 (shipped): the key insight is that for a query point OUTSIDE
+every component, the nearest foreground voxel can NEVER be a component's
+INTERIOR voxel -- only SURFACE voxels (foreground adjacent to at least
+one background voxel, via one `scipy.ndimage.binary_erosion` + XOR) can
+ever be the true answer. For solid blob-shaped components, surface voxel
+count scales with (volume)^(2/3), not volume -- confirmed via synthetic
+test at realistic ~20-30% foreground density (22 components): surface
+voxels were only ~7.7% of total foreground voxels. Building the cKDTree
+over just those instead: **~10x faster than the original full-array EDT
+(12.65s -> 0.82s + 0.44s one-time surface extraction), ~5.5x faster than
+round 1's all-foreground cKDTree**, verified identical results across 10
+random trials, no locality gamble (unlike round 2, never slower than
+baseline in any trial tested). This is what's actually in
+`segment_pinna_threshold.py` now.
+
+**CONFIRMED on a real re-test (2026-07-30, third real run)**: `component
+selection` dropped **7.30s -> 0.99s**, matching the synthetic prediction
+almost exactly. This bug is fully closed out. `segment_pinna_region`
+TOTAL dropped 13.52s -> 8.31s; Stage A grand total 37.83s -> 35.22s (a
+smaller net drop than component-selection's own savings alone would
+suggest, since `smooth_boundary` 18.13s and `label_map_to_mesh` 23.64s
+both ran slightly higher this time than in the prior run -- most likely
+ordinary system variance between runs, not a regression). The only two
+large remaining costs are now clearly `smooth_boundary` and
+`label_map_to_mesh`'s marching_cubes, both voxel-array-size-bound (see
+the tight-bounding-box crop, shipped immediately after this fix in the
+same session -- next paragraph).
+
+**Shipped (2026-07-30): tight-bounding-box crop, the "Next fix on the
+table" from before.** `roi_crop.crop_to_own_bounding_box(label_image,
+margin_mm)` -- crops a label image down to its OWN foreground's bounding
+box (plus `PINNA_TIGHT_CROP_MARGIN_MM` = 15mm, chosen generously to cover
+both `smooth_boundary()`'s 1-voxel-per-iteration morphological reach AND
+leave the surgeon real headroom to paint missed material back in via
+Segment Editor on the same pushed volume -- NOT just a few mm for
+processing safety alone). Applied at all 3 pinna call sites, right after
+`postprocess.run_full_postprocess()` and before both the Slicer
+segmentation-node push and `mesh_export.label_map_to_mesh()` (same 3
+sites decimation was added to: `page_pinna_review.py`'s
+`_on_run_clicked()`/`_refresh_mesh_from_segmentation()`,
+`page_pinna_draw.py`'s `_build_fallback_mesh()`).
+
+**Correctness verified first (per this project's RAS/LPS bug history) --
+critical, and confirmed clean**: built a synthetic label image, ran
+`mesh_export.label_map_to_mesh()` on both the full array and the
+cropped-via-`crop_to_own_bounding_box()` array, and compared vertex
+positions in physical (RAS mm) space via nearest-surface distance in
+BOTH directions. Result: **0.000000mm difference, in two different
+synthetic geometries** (an oversized blob, and a more realistic
+hemisphere-shaped one) -- `sitk.RegionOfInterest`'s origin bookkeeping
+(used internally) is correctly transparent to marching_cubes' physical
+vertex placement. Safe to ship.
+
+**Speedup magnitude -- honest, and smaller than component selection's
+fix, verified with repeated trials after a misleading single-run
+result**: a first synthetic geometry (an oversized blob nearly filling
+its own box) showed almost no reduction -- unrealistic, since real
+segmented tissue is a meaningfully smaller fraction of the coarse ROI
+crop. A second, more realistic geometry (a hemisphere-shaped blob within
+the ROI sphere's own bounding box, modeling that the ear_center landmark
+sits roughly ON the skin surface, so the sphere is roughly half air /
+half tissue) showed the crop reducing voxel count to 66.6% of the
+original (the 15mm margin eats into what would otherwise be closer to
+50%). A single marching_cubes trial at that geometry misleadingly showed
+NO speedup (0.86x, i.e. slightly slower) -- pure run-to-run timing noise
+on this machine (marching_cubes' own timing varied by several seconds
+across otherwise-identical real Slicer runs earlier this session too).
+Averaging `smooth_boundary` alone over 3 repeats gave a clean signal:
+**20.89s -> 14.29s, a real 1.46x speedup**, closely matching the 1/0.666
+= 1.50x the voxel-count reduction alone would predict. Lesson: don't
+trust a single timing sample near the scale of this system's run-to-run
+noise -- average over repeats before concluding an optimization did
+nothing.
+
+**Real-Slicer result (2026-07-30, same day): the hemisphere assumption was
+WRONG -- negligible real benefit, though still correct/harmless.** Thomas
+re-ran the same scan. `crop_to_own_bounding_box` reported (380,436,258) ->
+(371,436,258) -- only the X dimension shrank, by 9 voxels (~2.4%); Y and Z
+were completely unchanged. `smooth_boundary` (15.65s) and `label_map_to_mesh`
+(19.75s) came back essentially identical to before this fix, within the
+run-to-run noise band already seen across every prior run. Stage A grand
+total: 33.26s (barely different from the post-component-selection-fix
+35.22s -- the small further drop is consistent with ordinary noise, not
+this crop). **Real pinna anatomy apparently occupies nearly the ENTIRE
+ROI sphere's bounding box in every direction**, not roughly half of it as
+the hemisphere synthetic test assumed -- likely because the pinna's own
+curls (helix etc.) reach close to the sphere's radius in most directions,
+unlike a simple flat "skin surface cutting the sphere in half" model.
+This crop is left in (it's provably correct and can only ever help, never
+hurt, on some other scan/landmark placement where tissue happens to be
+less space-filling), but it should NOT be counted on as a real fix for
+this specific bottleneck going forward.
+
+**Where this leaves Stage A**: `smooth_boundary` (~15-18s) and
+`label_map_to_mesh`'s marching_cubes (~20-24s) are now the only two large
+costs left, and every zero-quality-cost lever that could shrink the voxel
+count they operate on has been tried (roi_crop's own grid-building fix,
+component selection, this tight crop). Further speedup here would require
+an actual quality/robustness tradeoff, not a free win:
+- Lowering `PINNA_ROI_RADIUS_MM` -- functional risk (could clip real
+  pinna anatomy for some patients), a clinical judgment call for Thomas,
+  not a code change to make unprompted.
+- Reducing `smooth_boundary`'s iteration count (currently 2) -- a genuine
+  smoothing-quality tradeoff, however small.
+- `marching_cubes`' own `step_size` -- Thomas already explicitly declined
+  this earlier in favor of quality-preserving decimation, for the same
+  reason it would apply here too.
+Given all three require an explicit tradeoff, none should be pursued
+without asking Thomas first. Stage A is now ~33s (down from the original
+45.41s at the start of this session, ~27% overall, entirely from the
+component-selection bug fix -- this crop's contribution turned out to be
+negligible on real anatomy).
+
+**UI responsiveness fix (2026-07-30, later same day)**: Thomas reported
+that even with the timing above being "not too bad," 3D Slicer visibly
+goes unresponsive ("Not Responding" title bar on Windows) during these
+multi-second single calls -- a real UX problem distinct from raw speed,
+since a surgeon unfamiliar with what's happening could easily mistake
+this for an actual crash. Root cause: every heavy call
+(`build_spherical_roi_mask`, `segment_pinna_region`,
+`postprocess.run_full_postprocess`, `crop_to_own_bounding_box`,
+`mesh_export.label_map_to_mesh`, `decimate_to_target_resolution`) was
+called directly on Slicer's main/UI thread, blocking its Qt event loop
+(no window-message pumping) for the call's entire multi-second duration --
+`slicer.app.processEvents()` can only be called BETWEEN separate calls,
+never DURING one opaque C call, so the existing between-steps
+`processEvents()` calls never helped for the biggest individual offenders.
+
+**Fix: `base_page.WizardPage.run_blocking()`** (new shared helper) runs a
+given zero-argument callable on a background Python `threading.Thread`
+while the calling (main) thread polls `thread.is_alive()` and calls
+`slicer.app.processEvents()` in a tight loop until it finishes -- keeping
+Slicer's window message pump alive and the UI visibly responsive for the
+computation's whole real duration (this does NOT make the computation
+itself any faster, only keeps the UI alive while it runs). Safe
+specifically because every `core/` module in this project is already
+Slicer/VTK-independent by design (operates only on
+`sitk.Image`/`numpy`/`trimesh` objects) -- the background thread never
+touches the MRML scene or a Qt widget, so there's no non-main-thread
+VTK/Qt safety concern; the only Slicer API call happens on the main
+thread, exactly as it always should. Exceptions raised inside the
+background callable are re-raised on the caller's thread automatically.
+
+Wired into BOTH places in `page_pinna_review.py` that run this same
+heavy postprocess+meshing sequence: `_on_run_clicked()`'s main pipeline
+(refactored into a new `_run_segmentation_pipeline()` helper method for
+clarity) and `_refresh_mesh_from_segmentation()` (runs on "Next" if the
+surgeon used Segment Editor -- same heavy calls, same risk). A new
+`progressBar` widget (added to `page_pinna_review.ui`, hidden by default)
+advances one tick per named pipeline stage (7 stages in the main run, 4
+in the edited-segmentation refresh) with a matching `statusLabel` message
+for each -- coarse, not fine-grained within a stage, but enough to give
+real confirmation that a specific, currently-running step is still
+working rather than one long silent wait. `runButton` is disabled for
+the pipeline's duration to prevent a double-click starting a second
+concurrent run.
+
+**Verified with the actual shipped code (scratchpad, not committed)**:
+faked `slicer.app.processEvents()` as a counter and called the real
+`run_blocking()` directly -- confirmed (1) correct return value and
+correct total elapsed time for a slow call, (2) `processEvents()` called
+repeatedly (18 times) DURING a 1-second call, proving the main thread
+isn't blocked for the call's duration (the actual bug being fixed), (3)
+an exception raised inside the background callable correctly propagates
+back out to the caller, and (4) genuine concurrency (a separate counter
+thread kept incrementing throughout a `run_blocking()` call, confirming
+real parallelism under Python's GIL for this pattern, not just
+cooperative multitasking). **Not yet confirmed in real Slicer** -- next
+session should ask Thomas whether the "Not Responding" title bar still
+appears at all during a real run, and whether the progress bar/status
+text updates are visible and feel responsive in practice.
+
+**Extended to pinna isolation and canal segmentation (2026-07-30, same
+day, Thomas liked the result and asked for the same treatment
+elsewhere)**:
+
+- **`page_pinna_draw.py`'s `_on_isolate_clicked()`** (the Isolate Patch
+  button): refactored into `_run_isolate_pipeline()` following the same
+  pattern, with a new `_advance_progress(label)` helper tracking a plain
+  Python `self._progress_step`/`self._progress_max` pair (NOT read back
+  from the Qt widget -- this codebase has no prior example of reading a
+  QProgressBar property back via PythonQt, so tracking it in Python
+  avoids relying on an unconfirmed API). This page's total step count
+  isn't knowable upfront: the common path is 3 steps (load mesh, crop
+  toward canal, isolate), but the `LoopDoesNotSeparateError` fallback
+  retry path (see the 8-round Isolate Patch saga) adds up to 5 more (the
+  fallback rebuild's own postprocess/crop/mesh/decimate steps, plus a
+  second crop+isolate attempt) -- `_advance_progress()` bumps the bar's
+  max on the fly if the step count exceeds what was originally set,
+  rather than requiring it known in advance. `_build_fallback_mesh()`
+  (only reached from the failure path) now also runs its own internal
+  heavy calls through `run_blocking()`, since real-Slicer logs showed
+  this retry path alone can cost ~30+ seconds (a full postprocess+remesh
+  round trip) -- exactly the situation this fix targets.
+- **`page_scutum_review.py`'s `_on_run_clicked()`/`_refresh_mesh_from_segmentation()`**:
+  same pattern as the pinna review page (refactored into
+  `_run_segmentation_pipeline()`), covering `build_roi_mask`,
+  `crop_to_roi_bounding_box`, `segment_dl.segment()` (can be ~7x slower
+  than plain thresholding with `ENABLE_SHEET_ENHANCEMENT` on, see
+  "Improving Canal Segmentation" below), `postprocess.run_full_postprocess()`,
+  and `mesh_export.label_map_to_mesh_subvoxel()`/`label_map_to_mesh()`.
+  Canal segmentation is faster than pinna's on a typical scan (Thomas's
+  own report: "canal segmentation steps all run at a pretty usual pace"),
+  so this is more a consistency/reassurance measure than a fix for an
+  already-reported problem there -- applied for the same reason pinna
+  needed it (a slower scan or machine could still hit the same
+  single-call multi-second block), not because canal was itself flagged
+  as freezing.
+
+All three pages now share the exact same `run_blocking()` helper from
+`base_page.py` -- no new threading logic was written, just wired into two
+more call sites. New `progressBar` widgets added to `page_pinna_draw.ui`
+and `page_scutum_review.ui` (page_pinna_review.ui already had one). Not
+yet real-Slicer tested for these two pages either.
+
+**Curvature page (2026-07-30, same day): a real progress bar, not
+background-threading.** page_curvature.py is architecturally different
+from the other three -- it already had its own progress-reporting
+mechanism (`curvature_integration.run_curvature_comparison(...,
+progress_callback=self._on_progress_line)`, wired through to
+`core/curvature/pipeline.py`'s `progress(...)` calls at named steps and
+periodically during its two counted loops: candidate scoring, up to
+`CURVATURE_NUM_CANDIDATES`=300, and top-candidate ICP refinement, up to
+`CURVATURE_TOP_N_REFINE`=15). Deliberately did NOT wrap this in
+`run_blocking()`: that would require the progress callback (which
+currently touches Qt directly -- `self.ui.statusLabel.setText()` and
+`slicer.app.processEvents()`) to run safely from a background thread,
+which it doesn't do today, and retrofitting that is a bigger, riskier
+change than what was actually asked for ("a bar in place of where the
+python line is").
+
+Instead, added a `progressBar` widget (page_curvature.ui, positioned
+right above `statusLabel`, hidden except during a run) and taught
+`_on_progress_line()` (page_curvature.py) to parse the *existing*
+progress strings via two regexes (`_PHASE_TOTAL_RE`/`_PHASE_PROGRESS_RE`)
+matching the pipeline's own known message formats ("Scoring 300
+candidates...", "  scored 30/300 candidates", "Refining top 15
+candidates...", "  [3/15] vertex ...") -- no changes needed to
+`core/curvature/pipeline.py`'s interface, preserving that module's
+deliberate "no Slicer/Qt dependency at all" design. Any line matching a
+phase-total pattern resets the bar to a fresh determinate 0..N range;
+any line matching a progress pattern sets the current value; any other
+line (e.g. "Loading meshes...", "Done.") falls back to Qt's
+indeterminate/"busy" idiom (`setMinimum(0)`/`setMaximum(0)`) so the bar
+still visibly animates during named steps with no known fraction rather
+than sitting frozen at wherever the last phase left it. Verified directly
+(scratchpad, not committed) against every actual message string
+`pipeline.py`'s `run()` emits -- both counted-phase message shapes parse
+correctly, every other named-step message correctly falls through to
+indeterminate.
+
+Also tightened the candidate-scoring loop's own reporting interval from
+every 25 candidates to every 10 (`core/curvature/pipeline.py`) -- a
+smaller, in-scope adjustment: a coarser interval left long real gaps with
+NO `progress_callback`/`processEvents()` call at all between ticks
+(25 candidates' worth of geodesic patch extraction + scoring, each
+individually nontrivial), the same underlying "Not Responding" risk as
+the other three pages' single long C calls, just manifesting through a
+periodic-callback loop instead. This doesn't eliminate that risk (still
+no background thread here), but shortens the worst-case gap between UI
+updates by more than half.
+
+Not yet real-Slicer tested.
 
 ---
 
@@ -944,7 +1430,15 @@ don't.
    `ImportLabelmapToSegmentationNode`/`ExportVisibleSegmentsToLabelmapNode`,
    Segment Editor widget attribute names (`setSourceVolumeNode` vs
    `setMasterVolumeNode`), stage-hide/re-show visibility logic for the
-   pinna-first reorder.
+   pinna-first reorder, `slicer.util.restart()` (Setup page's restart
+   button, 2026-07-30), and (2026-07-30) `base_page.WizardPage.
+   run_blocking()`'s core assumption -- that calling
+   `slicer.app.processEvents()` from a polling loop on the main thread
+   while a background Python thread runs SimpleITK/skimage/scipy/trimesh
+   work keeps Slicer's window responsive -- verified against a faked
+   `slicer.app.processEvents()` (scratchpad, not committed), NOT yet
+   against Slicer's real Qt/VTK event loop. If "Not Responding" still
+   appears after this fix, that's the first thing to re-examine.
 
 ---
 

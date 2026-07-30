@@ -37,6 +37,9 @@ download step.
 Expected widgets in page_curvature.ui:
   - tutorialLabel                (QLabel) -- extra guidance, shown only in tutorial mode
   - runButton                    (QPushButton)
+  - progressBar                  (QProgressBar) -- see _on_progress_line() below; shown only
+    during a run, determinate (N of M) during the candidate-scoring/refinement loops,
+    indeterminate ("busy") during named steps with no known fraction
   - statusLabel                  (QLabel) -- also shows live progress while a run is in flight
   - resultsTableWidget           (QTableWidget) -- ranked harvest site candidates, each row has a Locate button in the last column
   - openOutputFolderButton       (QPushButton) -- opens the scratch output/ folder
@@ -45,6 +48,7 @@ Expected widgets in page_curvature.ui:
 from __future__ import annotations
 import logging
 import os
+import re
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
 from EarReconstructionPlannerLib import curvature_integration
 import config
@@ -53,6 +57,20 @@ logger = logging.getLogger(__name__)
 
 _TABLE_HEADERS = ["Rank", "Coarse Score", "Chamfer (mm)", "Hausdorff (mm)", "X", "Y", "Z", "Locate"]
 _LOCATE_COLUMN = len(_TABLE_HEADERS) - 1
+
+# core/curvature/pipeline.py's progress() calls are plain human-readable
+# strings (that module has no Slicer/Qt dependency at all, deliberately --
+# see its own docstring), so this page recovers real N-of-M progress by
+# pattern-matching the specific known message formats it emits, rather
+# than changing that module's interface. Two phases report a running
+# count this way: candidate scoring ("Scoring 300 candidates..." then
+# periodic "  scored 30/300 candidates" lines) and top-candidate
+# refinement ("Refining top 15 candidates..." then "  [3/15] vertex ...").
+# Any other line (e.g. "Loading meshes...", "Done.") doesn't match either
+# pattern, so _on_progress_line() falls back to an indeterminate/"busy"
+# bar for those -- still visibly animating, just without a known fraction.
+_PHASE_TOTAL_RE = re.compile(r"^(?:Scoring|Refining top) (\d+)")
+_PHASE_PROGRESS_RE = re.compile(r"scored (\d+)/(\d+) candidates|^\s*\[(\d+)/(\d+)\]")
 
 
 class CurvaturePage(WizardPage):
@@ -106,6 +124,7 @@ class CurvaturePage(WizardPage):
         )
         self.ui.runButton.clicked.connect(self._on_run_clicked)
         self.ui.openOutputFolderButton.clicked.connect(self._on_open_output_folder_clicked)
+        self.ui.progressBar.setVisible(False)
 
         self.ui.resultsTableWidget.setColumnCount(len(_TABLE_HEADERS))
         self.ui.resultsTableWidget.setHorizontalHeaderLabels(_TABLE_HEADERS)
@@ -129,6 +148,35 @@ class CurvaturePage(WizardPage):
         import slicer
         if line:
             self.ui.statusLabel.setText(line)
+
+            total_match = _PHASE_TOTAL_RE.match(line)
+            progress_match = _PHASE_PROGRESS_RE.search(line)
+            if total_match:
+                # A new phase just started ("Scoring 300 candidates..."/
+                # "Refining top 15 candidates...") -- (re)set the bar to a
+                # fresh determinate 0..total range for this phase.
+                total = int(total_match.group(1))
+                self.ui.progressBar.setMinimum(0)
+                self.ui.progressBar.setMaximum(total)
+                self.ui.progressBar.setValue(0)
+            elif progress_match:
+                # One of the two "N/M" progress lines mid-phase -- groups
+                # 1/2 are the scoring-loop's pair, 3/4 the refine-loop's
+                # (whichever pair the regex actually matched has real
+                # ints, the other pair is None).
+                current = int(progress_match.group(1) or progress_match.group(3))
+                total = int(progress_match.group(2) or progress_match.group(4))
+                self.ui.progressBar.setMinimum(0)
+                self.ui.progressBar.setMaximum(total)
+                self.ui.progressBar.setValue(current)
+            else:
+                # A named step with no known fraction (e.g. "Loading
+                # meshes...", "Computing curvature descriptors...",
+                # "Done.") -- switch to Qt's indeterminate/"busy" idiom
+                # (min=max=0) so the bar still visibly animates instead of
+                # sitting frozen at wherever the last phase left it.
+                self.ui.progressBar.setMinimum(0)
+                self.ui.progressBar.setMaximum(0)
         # Pump the Qt event loop on every callback tick (including the
         # empty-string heartbeat ticks curvature_integration sends during
         # silent stretches) so the UI stays responsive and visibly alive
@@ -145,6 +193,12 @@ class CurvaturePage(WizardPage):
         self.ui.runButton.setEnabled(False)
         self.ui.resultsTableWidget.setRowCount(0)
         self.ui.statusLabel.setText("Running curvature comparison...")
+        # Indeterminate/"busy" to start -- _on_progress_line() switches this
+        # to a determinate N-of-M bar once the run reaches a phase that
+        # reports a real count (candidate scoring/refinement).
+        self.ui.progressBar.setVisible(True)
+        self.ui.progressBar.setMinimum(0)
+        self.ui.progressBar.setMaximum(0)
         slicer.app.processEvents()
 
         output_dir = self._output_dir()
@@ -159,8 +213,10 @@ class CurvaturePage(WizardPage):
         except Exception as e:
             self.ui.statusLabel.setText(f"Error: {e}")
             self.ui.runButton.setEnabled(True)
+            self.ui.progressBar.setVisible(False)
             self._running = False
             return
+        self.ui.progressBar.setVisible(False)
 
         self.state.heatmap_output_path = heatmap_path
 

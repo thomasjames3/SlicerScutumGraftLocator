@@ -26,6 +26,7 @@ both projects.
 """
 
 from __future__ import annotations
+import time
 import numpy as np
 import trimesh
 import networkx as nx
@@ -137,6 +138,16 @@ def isolate_surface_patch(
             "together. Please re-draw with points spread further apart."
         )
 
+    # TEMPORARY TIMING INSTRUMENTATION (2026-07-30, see CLAUDE.md "Pinna
+    # segmentation performance") -- mesh_export.decimate_to_target_resolution()
+    # was added to shrink the pinna mesh before it ever reaches this
+    # function, but Thomas reports no noticeable speedup on a real re-test.
+    # These prints (Slicer Python console) time every real step of this
+    # function individually, so the next report can point at the actual
+    # slow step instead of guessing again. Remove once the bottleneck here
+    # is found and addressed.
+    _t_isolate_total = time.time()
+
     # TEMPORARY DIAGNOSTICS (2026-07-27) -- prints to the Slicer Python
     # console (View > Python console). Added to investigate a report that
     # "isolated region covers almost the entire mesh" started firing on
@@ -146,7 +157,9 @@ def isolate_surface_patch(
     # to tell whether the mesh is unexpectedly fragmented (many small
     # components) vs. genuinely leaking within one component. Remove once
     # this is root-caused.
+    _t0 = time.time()
     num_components = len(mesh.split(only_watertight=False))
+    print(f"[isolate timing] mesh.split (component count): {time.time() - _t0:.2f}s")
     print(
         f"[isolate diag] mesh: {len(mesh.vertices)} vertices, "
         f"{len(mesh.faces)} faces, {num_components} connected component(s)"
@@ -164,9 +177,11 @@ def isolate_surface_patch(
     # trimesh has no `edges_boundary` attribute (confirmed the hard way --
     # this crashed in real use); boundary edges are ones used by exactly
     # one face, found via grouping.group_rows with require_count=1.
+    _t0 = time.time()
     _boundary_edge_count = len(
         trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1)
     )
+    print(f"[isolate timing] euler_number/boundary-edge topology check: {time.time() - _t0:.2f}s")
     print(
         f"[isolate diag] mesh topology: euler_number={mesh.euler_number} "
         f"(2=genus-0/no handles, lower=handles present), "
@@ -178,7 +193,9 @@ def isolate_surface_patch(
         f"{len(raw_loop_set)} distinct vertices before bridging"
     )
 
+    _t0 = time.time()
     graph = mesh.vertex_adjacency_graph  # networkx.Graph, one node per vertex
+    print(f"[isolate timing] vertex_adjacency_graph build: {time.time() - _t0:.2f}s")
 
     # loop_vertex_indices are the drawn curve's control points snapped to
     # their nearest vertices, in click order -- but consecutive clicks are
@@ -191,6 +208,7 @@ def isolate_surface_patch(
     # Bridge every consecutive pair -- and the last point back to the
     # first, closing the loop -- with the shortest path along the mesh's
     # own surface, so the barrier has no gaps regardless of click spacing.
+    _t0 = time.time()
     loop_set = set(loop_vertex_indices)
     n = len(loop_vertex_indices)
     for i in range(n):
@@ -208,6 +226,7 @@ def isolate_surface_patch(
             )
         loop_set.update(bridge)
 
+    print(f"[isolate timing] loop bridging ({n} shortest-path calls): {time.time() - _t0:.2f}s")
     print(f"[isolate diag] loop after bridging: {len(loop_set)} vertices")
 
     # Find the vertex closest to the seed point to start the flood fill
@@ -217,10 +236,12 @@ def isolate_surface_patch(
     # vertex. That's a real, common case on a coarse mesh: if the loop
     # encloses only a few vertices, the boundary vertices are often closer
     # to any interior click than the true interior ones are to each other.
+    _t0 = time.time()
     non_loop_indices = np.fromiter(
         (i for i in range(len(mesh.vertices)) if i not in loop_set),
         dtype=int,
     )
+    print(f"[isolate timing] non_loop_indices (Python loop over all vertices): {time.time() - _t0:.2f}s")
     if len(non_loop_indices) == 0:
         raise ValueError(
             "The drawn outline doesn't enclose any mesh vertices besides "
@@ -228,9 +249,11 @@ def isolate_surface_patch(
             "resolution. Please try drawing a larger outline."
         )
 
+    _t0 = time.time()
     tree = cKDTree(mesh.vertices[non_loop_indices])
     snap_dist, nearest_pos = tree.query(np.asarray(seed_point))
     seed_idx = int(non_loop_indices[nearest_pos])
+    print(f"[isolate timing] seed snapping (cKDTree build + query): {time.time() - _t0:.2f}s")
     print(
         f"[isolate diag] seed snapped {snap_dist:.2f}mm from the clicked "
         f"point (large = may have snapped to the wrong side of a thin fold)"
@@ -258,12 +281,14 @@ def isolate_surface_patch(
     # to enclose vertices reasonably close to where it was actually drawn,
     # so a distant handle can't be reached regardless of whether it
     # exists.
+    _t0 = time.time()
     loop_positions = mesh.vertices[list(loop_set)]
     seed_position = mesh.vertices[seed_idx]
     max_loop_dist = float(np.max(np.linalg.norm(loop_positions - seed_position, axis=1)))
     search_radius = max_loop_dist * 2.0
     nearby_indices = cKDTree(mesh.vertices).query_ball_point(seed_position, r=search_radius)
     nearby_set = set(nearby_indices)
+    print(f"[isolate timing] local-radius search (cKDTree over ALL vertices): {time.time() - _t0:.2f}s")
     print(
         f"[isolate diag] local search radius: {search_radius:.1f}mm, "
         f"{len(nearby_set)} vertices within range"
@@ -274,8 +299,10 @@ def isolate_surface_patch(
     # "inside the loop" rather than spreading across the whole mesh. Built
     # from the local subgraph (nearby_set) rather than the full mesh graph,
     # per the restriction above.
+    _t0 = time.time()
     barrier_graph = graph.subgraph(nearby_set).copy()
     barrier_graph.remove_nodes_from(loop_set)
+    print(f"[isolate timing] barrier_graph subgraph + remove_nodes_from: {time.time() - _t0:.2f}s")
 
     if seed_idx not in barrier_graph:
         raise ValueError(
@@ -284,7 +311,9 @@ def isolate_surface_patch(
             "different seed point."
         )
 
+    _t0 = time.time()
     reached = nx.node_connected_component(barrier_graph, seed_idx)
+    print(f"[isolate timing] flood fill (node_connected_component): {time.time() - _t0:.2f}s")
     local_total = len(nearby_set) - len(loop_set & nearby_set)
     print(
         f"[isolate diag] flood fill reached {len(reached)} of "
@@ -316,7 +345,12 @@ def isolate_surface_patch(
     # just short of the drawn line.
     keep_vertices = reached | loop_set
 
-    return _submesh_from_vertices(mesh, keep_vertices)
+    _t0 = time.time()
+    result = _submesh_from_vertices(mesh, keep_vertices)
+    print(f"[isolate timing] _submesh_from_vertices (incl. np.vectorize remap): {time.time() - _t0:.2f}s")
+    print(f"[isolate timing] isolate_surface_patch TOTAL: {time.time() - _t_isolate_total:.2f}s")
+
+    return result
 
 
 def crop_toward_canal(

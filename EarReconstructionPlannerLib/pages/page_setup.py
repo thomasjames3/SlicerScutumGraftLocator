@@ -14,6 +14,19 @@ Expected widgets in page_setup.ui (see Resources/UI/page_setup.ui):
   - installButton      (QPushButton)
   - progressBar         (QProgressBar)
   - statusLabel         (QLabel)
+  - restartSlicerButton (QPushButton) -- see _on_restart_clicked()'s docstring
+    for why this exists: some freshly pip-installed packages (particularly
+    ones with compiled/binary components, e.g. fast-simplification) don't
+    reliably finish loading into an already-running Slicer process,
+    especially on Windows where an already-loaded DLL can't always be
+    safely replaced. Only shown (see _refresh_status()) when there's
+    something to install/restart for, i.e. hidden on a return visit where
+    everything was already installed in a prior, properly-restarted
+    session -- otherwise a returning surgeon would see an unexplained
+    restart option with no missing packages to justify it. Safe to offer
+    at all only because this is page 0, before any DICOM/landmarks/
+    segmentation state exists yet -- restarting here can never discard
+    in-progress wizard work.
 
 Mode choice (state.tutorial_mode) is made here, once, before anything else
 in the wizard -- every later page reads that single flag (via
@@ -30,6 +43,7 @@ class SetupPage(WizardPage):
         self.ui.progressBar.setVisible(False)
         self._refresh_status()
         self.ui.installButton.clicked.connect(self._on_install_clicked)
+        self.ui.restartSlicerButton.clicked.connect(self._on_restart_clicked)
 
         # Restore from state so re-entering this page (there's no earlier
         # page to come back from, but on_enter can still re-run) doesn't
@@ -47,12 +61,20 @@ class SetupPage(WizardPage):
         if not missing:
             self.ui.statusLabel.setText("All set -- everything needed is already installed.")
             self.ui.installButton.setEnabled(False)
+            # No restart needed on a return visit where everything was
+            # already installed in a prior (properly restarted) session --
+            # only show this button when there's actually something to
+            # install/restart for, so returning surgeons on an
+            # already-set-up Slicer aren't confused by an unexplained
+            # restart option.
+            self.ui.restartSlicerButton.setVisible(False)
         else:
             names = ", ".join(spec for _, spec in missing)
             self.ui.statusLabel.setText(
                 f"The following need to be installed once: {names}"
             )
             self.ui.installButton.setEnabled(True)
+            self.ui.restartSlicerButton.setVisible(True)
 
     def _on_install_clicked(self):
         missing = dependencies.check_missing_packages()
@@ -79,7 +101,26 @@ class SetupPage(WizardPage):
             )
             self.ui.installButton.setEnabled(True)
         else:
-            self.ui.statusLabel.setText("All set -- everything installed successfully.")
+            self.ui.statusLabel.setText(
+                "All set -- everything installed successfully. Please restart "
+                "3D Slicer now (click 'Restart Slicer' below) before continuing."
+            )
+
+    def _on_restart_clicked(self):
+        """Restarts the whole Slicer application via slicer.util.restart().
+
+        Only offered on this page (Setup, page 0) -- always safe here since
+        nothing has been loaded/placed/segmented yet at this point in the
+        wizard, unlike a restart offered from any later page, which would
+        discard real in-progress surgeon work. Still confirms first since
+        restarting closes the entire application, not just this module.
+        """
+        import slicer
+
+        if slicer.util.confirmYesNoDisplay(
+            "This will restart 3D Slicer. Continue?"
+        ):
+            slicer.util.restart()
 
     def on_leave_next(self):
         missing = dependencies.check_missing_packages()

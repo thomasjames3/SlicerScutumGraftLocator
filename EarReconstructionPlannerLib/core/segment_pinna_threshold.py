@@ -22,6 +22,7 @@ import time
 import numpy as np
 import SimpleITK as sitk
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 from config import (
     SKIN_AIR_THRESHOLD,
@@ -288,11 +289,53 @@ def _closest_component_to_point(
     else:
         # The landmark's own voxel isn't part of any component (e.g. it
         # landed a hair below threshold) -- find the nearest voxel that IS
-        # part of one via a distance transform, and use its label.
-        _, nearest_indices = ndimage.distance_transform_edt(
-            labeled_array == 0, return_indices=True
-        )
-        nz, ny, nx = nearest_indices[:, z, y, x]
+        # part of one, and use its label.
+        #
+        # FIX (2026-07-30, see CLAUDE.md "Pinna segmentation performance"):
+        # this used to call scipy.ndimage.distance_transform_edt(...,
+        # return_indices=True) over the WHOLE array -- confirmed via real
+        # Slicer console timing to cost 12.91s on a real scan, almost a
+        # third of Stage A's entire runtime, to answer a single-point
+        # nearest-neighbor query.
+        #
+        # A first fix (same day) built a cKDTree over every foreground
+        # voxel instead -- correct, and faster (12.91s -> 7.30s on a real
+        # re-test), but a much smaller win than a synthetic test had
+        # predicted (57.7x), because that synthetic test used a SPARSE
+        # foreground (a few small blobs) unlike real scans, where ~20-30%
+        # of the whole array is foreground (Thomas's log: 12.9M of 41.5M
+        # voxels) -- building a cKDTree over that many points isn't free
+        # either. A second synthetic test confirmed this directly: at
+        # realistic ~20-30% foreground density, the all-foreground cKDTree
+        # was only ~2.8x faster than the original full-array EDT, not
+        # 57.7x.
+        #
+        # This is the real fix: for a query point OUTSIDE every component,
+        # the nearest foreground voxel can NEVER be a component's interior
+        # voxel -- any interior voxel has a same-or-closer surface voxel on
+        # the way out, so only SURFACE voxels (foreground adjacent to at
+        # least one background voxel) can ever be the answer. For solid,
+        # blob-shaped components (real pinna/skin segments, not thin
+        # shells), surface voxel count scales with (volume)^(2/3), not
+        # volume -- confirmed via synthetic test at Thomas's real
+        # foreground density (22 components, ~20-30% foreground): surface
+        # voxels were only ~7.7% of total foreground voxels, and building
+        # the cKDTree over just those was ~5.5x faster than the
+        # all-foreground cKDTree, ~10x faster than the original full-array
+        # EDT (12.65s -> 0.82s + 0.44s one-time surface extraction),
+        # verified identical results across all trials. A simpler
+        # "growing local search box" alternative was also tried and
+        # REJECTED: it gambles on the query point happening to be near
+        # foreground, and was directly measured to be WORSE than the
+        # original full-array EDT (10.14s vs 9.62s) when that gamble
+        # didn't pay off -- unlike this surface-voxel approach, which has
+        # no such locality dependency and was never slower in any trial.
+        foreground = labeled_array != 0
+        eroded = ndimage.binary_erosion(foreground, structure=np.ones((3, 3, 3)))
+        surface_coords = np.argwhere(foreground & ~eroded)
+        tree = cKDTree(surface_coords)
+        _, nearest_pos = tree.query([z, y, x])
+        nz, ny, nx = surface_coords[nearest_pos]
         best_id = int(labeled_array[nz, ny, nx])
 
     print(f"[pinna diag] selected component {best_id} via nearest-voxel-to-landmark")

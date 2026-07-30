@@ -52,6 +52,13 @@
     </widget>
    </item>
    <item>
+    <widget class="QPushButton" name="toggleRulerButton">
+     <property name="text">
+      <string>Show Ruler</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QPushButton" name="markSeedButton">
      <property name="text">
       <string>Mark Inside Point</string>

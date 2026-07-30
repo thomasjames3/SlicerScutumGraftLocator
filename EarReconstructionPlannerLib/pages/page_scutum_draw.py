@@ -24,6 +24,8 @@ Expected widgets in page_scutum_draw.ui:
   - instructionLabel    (QLabel)
   - tutorialLabel       (QLabel) -- extra guidance, shown only in tutorial mode
   - startCurveButton    (QPushButton)
+  - toggleRulerButton   (QPushButton) -- "Show Ruler"/"Hide Ruler", a 2-point
+                          distance-measurement line for scale reference
   - markSeedButton      (QPushButton) -- "Mark a point inside the outline"
   - isolateButton       (QPushButton)
   - resetPageButton     (QPushButton) -- clear this page's outline/patch
@@ -65,6 +67,7 @@ class ScutumDrawPage(WizardPage):
         self._curve_node = None
         self._seed_fiducial_node = None
         self._seed_point = None
+        self._ruler_node = None
 
         # Defensive duplicate of the same hide performed in
         # page_scutum_review.py's on_enter -- covers the case where the
@@ -79,10 +82,12 @@ class ScutumDrawPage(WizardPage):
             self.state.pinna_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
 
         self.ui.startCurveButton.clicked.connect(self._on_start_curve_clicked)
+        self.ui.toggleRulerButton.clicked.connect(self._on_toggle_ruler_clicked)
         self.ui.markSeedButton.clicked.connect(self._on_mark_seed_clicked)
         self.ui.isolateButton.clicked.connect(self._on_isolate_clicked)
         self.ui.resetPageButton.clicked.connect(self._on_reset_page_clicked)
         self.ui.revertToHereButton.clicked.connect(self._on_revert_to_here_clicked)
+        self.ui.toggleRulerButton.setText("Show Ruler")
         self.ui.markSeedButton.setEnabled(False)
         self.ui.isolateButton.setEnabled(False)
         self.ui.statusLabel.setText(
@@ -134,6 +139,49 @@ class ScutumDrawPage(WizardPage):
             "inside the outline you just drew. This tells the tool which "
             "side of the boundary to keep as the defect patch."
         )
+
+    def _on_toggle_ruler_clicked(self):
+        """Show/hide a 2-point Markups line (a "ruler") the surgeon can use
+        to measure a real physical distance on the bone-wall surface as a
+        scale reference while tracing the defect outline. Colored
+        (config.SCUTUM_RULER_COLOR) distinctly from the outline curve's own
+        default color so the two tools stay visually unambiguous.
+
+        First click: creates the line node and enters Place mode for its 2
+        points (Slicer exits Place mode on its own once both are placed,
+        the same way the outline curve's max-point-count behaves). Later
+        clicks just toggle the existing line's visibility, so a
+        surgeon-placed measurement isn't lost by hiding it -- e.g. to
+        declutter the view while drawing, then bring it back to re-check
+        scale.
+        """
+        import slicer
+
+        if self._ruler_node is None:
+            self._ruler_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsLineNode", "ScutumRuler"
+            )
+            self.set_absolute_point_size(self._ruler_node, config.SCUTUM_RULER_POINT_SIZE_MM)
+            display_node = self._ruler_node.GetDisplayNode()
+            display_node.SetColor(*config.SCUTUM_RULER_COLOR)
+            display_node.SetSelectedColor(*config.SCUTUM_RULER_COLOR)
+
+            interaction_node = slicer.app.applicationLogic().GetInteractionNode()
+            selection_node = slicer.app.applicationLogic().GetSelectionNode()
+            selection_node.SetActivePlaceNodeID(self._ruler_node.GetID())
+            interaction_node.SetCurrentInteractionMode(interaction_node.Place)
+            interaction_node.SetPlaceModePersistence(1)  # stay in place mode for the 2nd point
+
+            self.ui.toggleRulerButton.setText("Hide Ruler")
+            self.ui.statusLabel.setText(
+                "Click two points on the surface to measure a reference distance."
+            )
+            return
+
+        display_node = self._ruler_node.GetDisplayNode()
+        now_visible = not display_node.GetVisibility()
+        display_node.SetVisibility(now_visible)
+        self.ui.toggleRulerButton.setText("Hide Ruler" if now_visible else "Show Ruler")
 
     def _on_mark_seed_clicked(self):
         import slicer
@@ -240,6 +288,9 @@ class ScutumDrawPage(WizardPage):
             self._curve_node.GetDisplayNode().SetVisibility(False)
         if self._seed_fiducial_node is not None:
             self._seed_fiducial_node.GetDisplayNode().SetVisibility(False)
+        if self._ruler_node is not None:
+            self._ruler_node.GetDisplayNode().SetVisibility(False)
+            self.ui.toggleRulerButton.setText("Show Ruler")
 
         self.ui.statusLabel.setText(
             f"Defect patch isolated ({len(patch.vertices)} vertices). "

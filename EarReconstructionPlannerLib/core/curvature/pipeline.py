@@ -217,7 +217,16 @@ def run(scutum_path, pinna_path, output_dir,
         coarse_scores[i] = coarse_score(defect_signature, patch_signature, weights)
         candidate_patches[vid] = patch_mesh
 
-        if (i + 1) % 25 == 0 or (i + 1) == len(candidate_vertex_ids):
+        # Every 10 (not the previous 25) -- see page_curvature.py's
+        # _on_progress_line(), which now parses this line to drive a real
+        # progress bar. A coarser interval left long gaps with no
+        # progress_callback (and therefore no processEvents()) call at
+        # all between ticks -- risking Slicer's window looking
+        # "Not Responding" during those gaps on a dense mesh, same
+        # underlying issue as CLAUDE.md's "Pinna segmentation performance"
+        # section, just via a periodic-callback loop here instead of a
+        # single opaque C call.
+        if (i + 1) % 10 == 0 or (i + 1) == len(candidate_vertex_ids):
             progress(f"  scored {i + 1}/{len(candidate_vertex_ids)} candidates")
 
     valid_mask = np.isfinite(coarse_scores)

@@ -26,6 +26,7 @@ REQUIRED_PACKAGES = [
     ("networkx", "networkx>=3.0"),
     ("skimage", "scikit-image>=0.22"),
     ("scipy", "scipy>=1.11"),
+    ("fast_simplification", "fast-simplification>=0.1.13"),
 ]
 
 

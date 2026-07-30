@@ -21,6 +21,7 @@ from config import (
     MESH_SMOOTHING_ITERATIONS,
     SUBVOXEL_MESH_BAND_MM,
     SUBVOXEL_MESH_SAFETY_MARGIN_HU,
+    PINNA_MESH_TARGET_EDGE_MM,
 )
 from core.smoothing import smooth_for_thresholding
 
@@ -282,6 +283,39 @@ def _verts_faces_to_trimesh(verts: np.ndarray, faces: np.ndarray, label_image: s
         )
 
     return mesh
+
+
+def decimate_to_target_resolution(
+    mesh: trimesh.Trimesh, target_edge_mm: float = PINNA_MESH_TARGET_EDGE_MM
+) -> trimesh.Trimesh:
+    """
+    Simplifies `mesh` toward roughly `target_edge_mm`-sized triangles via
+    quadric-error decimation (trimesh.simplify_quadric_decimation, backed by
+    the fast-simplification package) -- collapses the vertex pairs that
+    distort the surface's shape least first, so curvature-rich areas (e.g.
+    the helix) keep more detail than flat ones (e.g. the cheek) for the same
+    final vertex count.
+
+    Pinna-pipeline only -- see PINNA_MESH_TARGET_EDGE_MM's docstring in
+    config.py for why: the pinna's much larger ROI surface area (vs. the
+    canal's thin-tube ROI) is what makes its mesh balloon at fine native
+    scan spacing in the first place, dragging down both Stage A meshing and
+    the draw/isolate step (core/mesh_isolate.py's networkx graph). Never
+    applied to the scutum bone-wall mesh, which relies on
+    label_map_to_mesh_subvoxel()'s sub-voxel boundary precision -- decimating
+    afterward would blur exactly the boundary-placement improvement that
+    function exists to add.
+
+    No-ops (returns `mesh` unchanged) if `mesh` is already at or coarser
+    than the target density -- this only ever reduces detail, never adds
+    it, so a scan with coarse-enough native spacing that marching_cubes
+    never produced excessive geometry is left untouched.
+    """
+    triangle_area_mm2 = (3 ** 0.5 / 4) * target_edge_mm ** 2
+    target_face_count = max(4, int(mesh.area / triangle_area_mm2))
+    if target_face_count >= len(mesh.faces):
+        return mesh
+    return mesh.simplify_quadric_decimation(face_count=target_face_count)
 
 
 def flip_ras_lps_points(points) -> np.ndarray:

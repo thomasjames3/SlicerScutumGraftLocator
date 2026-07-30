@@ -187,6 +187,41 @@ def crop_to_roi_bounding_box(
     return sitk.RegionOfInterest(image, size=size, index=start)
 
 
+def crop_to_own_bounding_box(label_image: sitk.Image, margin_mm: float) -> sitk.Image:
+    """
+    Crops `label_image` down to the tight bounding box of its OWN
+    foreground (label value 1), plus `margin_mm` on every side.
+
+    Unlike crop_to_roi_bounding_box() above (which crops one image to the
+    bounding box of a SEPARATE mask -- e.g. cropping the raw scan to the
+    coarse ROI sphere's bounding box, before that ROI has even been
+    thresholded), this crops a segmentation result down to just the space
+    its own detected tissue actually occupies -- meant to run AFTER
+    postprocessing and BEFORE meshing, so morphological smoothing and
+    marching_cubes stop paying for the surrounding empty-air padding that
+    the coarse ROI crop necessarily carries. See PINNA_TIGHT_CROP_MARGIN_MM
+    in config.py for how the margin was chosen.
+
+    Correctness note: this only ever affects HOW MUCH of the (already
+    fully-decided) label array gets processed downstream, not WHERE any
+    voxel sits physically -- sitk.RegionOfInterest (used internally, via
+    crop_to_roi_bounding_box) correctly updates the returned image's own
+    origin to account for the crop offset, so code that reads geometry
+    from the cropped image itself (e.g. mesh_export's marching_cubes call,
+    which builds physical-space vertices from `label_image.GetOrigin()`)
+    produces bit-identical physical (RAS mm) positions either way.
+
+    Returns `label_image` UNCHANGED if it has no foreground at all, rather
+    than raising -- callers already handle a genuinely empty segmentation
+    via mesh_export.EmptySegmentationError downstream; this function isn't
+    the right place to introduce a second, different error path for that
+    same case.
+    """
+    if not sitk.GetArrayViewFromImage(label_image).any():
+        return label_image
+    return crop_to_roi_bounding_box(label_image, label_image, margin_mm=margin_mm)
+
+
 def crop_to_physical_bounds(image: sitk.Image, min_point, max_point) -> sitk.Image:
     """
     Cheaply crop `image` to an axis-aligned physical-space box, without

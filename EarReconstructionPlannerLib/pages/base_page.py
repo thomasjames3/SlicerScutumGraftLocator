@@ -109,6 +109,84 @@ class WizardPage:
         if axis is not None:
             three_d_view.lookFromAxis(axis)
 
+    def run_blocking(self, work_fn, status_text: str = None):
+        """
+        Runs `work_fn` (a zero-argument callable doing pure computation --
+        a core/ function operating only on sitk.Image/numpy/trimesh
+        objects, never touching Slicer's MRML scene or any Qt widget) on a
+        background Python thread, while THIS (main) thread keeps pumping
+        Slicer's Qt event loop until it finishes.
+
+        Why this exists (2026-07-30, see CLAUDE.md "Pinna segmentation
+        performance"): a single long SimpleITK/skimage/scipy call --
+        confirmed in real use to run 15-20+ seconds for
+        postprocess.smooth_boundary()/mesh_export.label_map_to_mesh() on a
+        real scan -- blocks the main thread for its entire duration if
+        called directly, with no way to call slicer.app.processEvents()
+        in the middle of one opaque C call. Windows (and other OSes) flag
+        an application "Not Responding" whenever its message queue goes
+        unpumped for a few seconds -- exactly what a surgeon would see
+        during these calls, easily (and reasonably) mistaken for an
+        actual crash, especially the first time it happens. Running the
+        same call on a background thread instead lets the main thread
+        keep dequeuing/dispatching window messages throughout (via the
+        processEvents() calls in this function's poll loop, below), so
+        the window stays visibly alive and repaints normally for the
+        whole duration -- this does NOT make the underlying computation
+        any faster, only keeps the UI alive while it runs.
+
+        Safe specifically because every core/ module in this project is
+        already Slicer/VTK-independent by design (see CLAUDE.md's "core/
+        reference" section) -- `work_fn` never touches the MRML scene or
+        a Qt widget itself, so there is no risk of an unsafe
+        non-main-thread VTK/Qt call. The only Slicer API touched from a
+        non-main thread anywhere in this function is nothing -- this
+        function's own slicer.app.processEvents() call happens here, on
+        the caller's (main) thread, exactly as it always should.
+
+        Parameters
+        ----------
+        work_fn : callable
+            Zero-argument callable to run. Its return value or raised
+            exception is propagated back to the caller exactly as if
+            work_fn() had been called directly, just off the main thread.
+        status_text : str, optional
+            If given, shown in this page's `statusLabel` (if present) for
+            the duration of work_fn() -- callers doing a multi-step
+            pipeline should call this once per step with a short
+            human-readable label (e.g. "Cleaning up segmentation...") so
+            the surgeon sees real progress through named stages rather
+            than one long silent wait.
+
+        Returns
+        -------
+        Whatever work_fn() returns.
+        """
+        import slicer
+        import threading
+
+        if status_text is not None and hasattr(self.ui, "statusLabel"):
+            self.ui.statusLabel.setText(status_text)
+            slicer.app.processEvents()
+
+        result = {}
+
+        def _target():
+            try:
+                result["value"] = work_fn()
+            except Exception as exc:  # noqa: BLE001 -- re-raised below, on the caller's thread
+                result["error"] = exc
+
+        thread = threading.Thread(target=_target, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            slicer.app.processEvents()
+            thread.join(timeout=0.05)
+
+        if "error" in result:
+            raise result["error"]
+        return result["value"]
+
     def set_absolute_point_size(self, markups_node, size_mm: float) -> None:
         """Give a Markups node (curve or fiducial) a fixed physical point
         size (in mm) instead of Slicer's default screen-relative

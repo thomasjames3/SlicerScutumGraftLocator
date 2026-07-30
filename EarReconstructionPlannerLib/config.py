@@ -594,6 +594,71 @@ MIN_INTERAURAL_DISTANCE_MM = 100.0
 # working by Thomas.
 PINNA_SPIKE_REMOVAL_RADIUS_MM = 1.5
 
+# Target triangle edge length (mm) for mesh_export.decimate_to_target_resolution(),
+# applied only to the pinna pipeline (segment_pinna_threshold's skin-surface
+# blob) after marching_cubes, never to the scutum bone-wall mesh.
+#
+# Root cause this addresses (2026-07-30): unlike the ear canal ROI (a thin
+# tube, small surface area regardless of spacing), PINNA_ROI_RADIUS_MM's 45mm
+# sphere covers a much larger patch of skin, and marching_cubes' vertex count
+# scales with (surface area) / (native voxel spacing)^2. Since
+# page_dicom_load.py deliberately does NOT resample to a fixed spacing (see
+# TARGET_VOXEL_SPACING_MM's own docstring), a scan with fine native spacing
+# (e.g. 0.173mm, vs. a more typical ~0.5mm) produces a pinna mesh with many
+# times more vertices/faces for the "same" anatomical shape -- confirmed via
+# synthetic test (scratchpad, not committed): an 8.4x face-count increase
+# going from 0.5mm to 0.173mm spacing on the same synthetic blob. This
+# directly explains both the pinna-specific Stage A slowness and the
+# draw/isolate step's slowness (core/mesh_isolate.py's networkx-based flood
+# fill scales poorly with vertex count) -- the canal pipeline never hits this
+# because its mesh stays small regardless of spacing.
+#
+# Set equal to TARGET_VOXEL_SPACING_MM (0.3mm) -- not because that resampling
+# actually happens, but because that's the density scale the rest of this
+# pipeline (mesh_isolate.py, draw-step point sizes, etc.) was implicitly
+# built and tested around historically, on scans that happened to be near
+# that native spacing. decimate_to_target_resolution() only ever reduces
+# density (no-ops if the mesh is already coarser than this), so a
+# coarse-native scan's pinna mesh is unaffected.
+PINNA_MESH_TARGET_EDGE_MM = TARGET_VOXEL_SPACING_MM
+
+# Margin (mm) kept around the pinna segmentation's own tight bounding box
+# in roi_crop.crop_to_own_bounding_box(), applied right after postprocessing
+# and before meshing (see core/postprocess.py's smooth_boundary() and
+# mesh_export.label_map_to_mesh() call sites in page_pinna_review.py /
+# page_pinna_draw.py).
+#
+# Root cause this addresses (2026-07-30, see CLAUDE.md "Pinna segmentation
+# performance"): both smooth_boundary() and label_map_to_mesh()'s
+# marching_cubes ran on the FULL ROI-sphere bounding box (~41.5M voxels on
+# a real scan) even though the actual segmented tissue only occupies a
+# fraction of it -- confirmed via real Slicer timing to cost 18-24s
+# combined, unaffected by mesh_export.decimate_to_target_resolution() (that
+# only shrinks the mesh AFTER these steps already ran on the full box).
+# Cropping down to the segmentation's own footprint first removes that
+# wasted surrounding-air computation with no change to the final mesh --
+# same voxels processed either way.
+#
+# This margin has to cover TWO different needs, not just one:
+# 1. Processing safety: postprocess.smooth_boundary()'s morphological
+#    closing/opening only ever reaches 1 voxel from the existing boundary
+#    per iteration, and marching_cubes needs a little guaranteed
+#    background around the true tissue so the mesh doesn't get an
+#    artificial flat "cut" face right at the cropped array's edge. This
+#    alone would only need a few mm.
+# 2. Segment Editor headroom: the SAME cropped mask is what gets pushed to
+#    Slicer as the segmentation node the surgeon can hand-edit (see
+#    page_pinna_review.py's _on_run_clicked) -- unlike the scutum's bone
+#    wall (a thin, well-defined shell), the pinna's skin-surface
+#    segmentation can plausibly miss a bit of real material right at its
+#    detected edge (e.g. component selection or spike removal excluding a
+#    genuine sliver of skin). If the crop is too tight, the surgeon has no
+#    room left in the pushed volume to paint that material back in via
+#    Segment Editor -- a real usability regression, not just a
+#    theoretical one. This is the larger of the two needs and is why this
+#    default is generous (15mm) rather than the few mm #1 alone would need.
+PINNA_TIGHT_CROP_MARGIN_MM = 15.0
+
 # After the surgeon draws and isolates the pinna outline, any remaining
 # part of the mesh toward the interior of the head (past the ear canal
 # opening) is cropped away automatically -- the drawn outline marks the
@@ -629,6 +694,15 @@ PINNA_CANAL_CROP_MARGIN_MM = 2.0
 # wrong on the other. Tune independently if needed.
 SCUTUM_DRAW_POINT_SIZE_MM = 0.3
 PINNA_DRAW_POINT_SIZE_MM = 2.0
+
+# Optional on-demand ruler (vtkMRMLMarkupsLineNode) on the scutum outline
+# page -- a 2-point line the surgeon can toggle on to get a real physical
+# distance reading on the bone-wall surface, as a scale reference while
+# tracing the defect outline. Colored distinctly (blue) from the outline
+# curve's own default Markups color (yellow/green) so the two tools can't
+# be confused for one another in the 3D view.
+SCUTUM_RULER_POINT_SIZE_MM = 0.3
+SCUTUM_RULER_COLOR = (0.0, 0.6, 1.0)
 
 # Harvest-site locator points on the curvature page (page_curvature.py).
 # Started at 3.0 but Thomas found that too large on the heatmap -- halved.

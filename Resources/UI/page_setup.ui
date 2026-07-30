@@ -55,7 +55,7 @@
    <item>
     <widget class="QLabel" name="instructionLabel">
      <property name="text">
-      <string>Before starting, this extension needs to install a few Python packages it depends on. This is a one-time setup -- you won't need to do this again on future uses.</string>
+      <string>Before starting, this extension needs to install a few Python packages it depends on. This is a one-time setup -- you won't need to do this again on future uses. After installing, please restart 3D Slicer before continuing -- some packages include components that don't fully load into an already-running copy of Slicer until it's restarted.</string>
      </property>
      <property name="wordWrap">
       <bool>true</bool>
@@ -83,6 +83,13 @@
      </property>
      <property name="wordWrap">
       <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="restartSlicerButton">
+     <property name="text">
+      <string>Restart Slicer</string>
      </property>
     </widget>
    </item>
