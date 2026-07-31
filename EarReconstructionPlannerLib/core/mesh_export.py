@@ -37,15 +37,61 @@ class EmptySegmentationError(ValueError):
     """
 
 
-def label_map_to_mesh(label_image: sitk.Image) -> trimesh.Trimesh:
+def label_map_to_mesh(
+    label_image: sitk.Image,
+    smoothing_iterations: int = MESH_SMOOTHING_ITERATIONS,
+    smoothing_method: str = "laplacian",
+    mask_blur_sigma_mm: float = 0.0,
+) -> trimesh.Trimesh:
     """
     Runs marching cubes on a binary label map to produce a surface mesh in
-    physical (mm) coordinates, then applies light Laplacian smoothing.
+    physical (mm) coordinates, then applies light smoothing.
 
     Parameters
     ----------
     label_image : sitk.Image
         The final, surgeon-approved segmentation (UInt8, 1 = canal).
+    smoothing_iterations : int
+        Passed through to the shared smoothing step (see
+        _verts_faces_to_trimesh). Defaults to config.MESH_SMOOTHING_ITERATIONS
+        (unchanged behavior for existing callers) -- override with a lower
+        value for a mask that's already precise (e.g. hand-refined via
+        Slicer's Segment Editor), where 15 iterations measurably rounds
+        off detail the surgeon just dialed in rather than cleaning up
+        automated-threshold noise.
+    smoothing_method : str
+        "laplacian" (default, unchanged behavior) or "taubin". Both move
+        mesh VERTICES after marching_cubes has already snapped the surface
+        to the voxel grid -- confirmed on a real scan (2026-07-31) that
+        this is the wrong tool for de-blocking an already-precise
+        hand-refined mask: enough iterations to visibly remove terracing
+        also measurably distorted the true shape. Prefer
+        mask_blur_sigma_mm below for that case; these vertex-space methods
+        are still the default (unchanged) for masks that came from raw
+        automated thresholding, where some rounding is an acceptable
+        cleanup rather than a precision loss.
+    mask_blur_sigma_mm : float
+        If > 0, blurs the binary MASK itself (SimpleITK Gaussian, physical
+        mm sigma, applied BEFORE marching_cubes) instead of smoothing mesh
+        vertices afterward. marching_cubes then finds where the blurred,
+        continuous field crosses level=0.5, which can land anywhere within
+        a voxel rather than only ever snapping to the grid -- genuine
+        sub-voxel positioning, the same idea label_map_to_mesh_subvoxel()
+        uses, but without needing a known single threshold value, so it
+        works on a mask with Paint/Erase edits on top of a threshold.
+        Operates only on already-decided mask material (not the original
+        intensity field), so unlike label_map_to_mesh_subvoxel() it can't
+        reopen anything postprocess.py's morphological steps closed.
+        Confirmed via a synthetic hollow-shell-with-thin-ridge test
+        (scratchpad, not committed) to beat every vertex-smoothing method
+        tried (Laplacian, Taubin, Humphrey) on BOTH staircase removal and
+        real-detail preservation simultaneously, at sigma roughly 1-1.5x
+        the voxel spacing -- too little (below ~1x spacing) barely helps
+        staircase, too much (above ~2x spacing) starts eroding real
+        detail and can even make terracing worse by interacting with
+        nearby surfaces (a 2mm-thick wall's two sides start blurring into
+        each other). See config.SCUTUM_MESH_MASK_BLUR_SIGMA_MM. Default
+        0.0 (disabled) preserves existing behavior for other callers.
 
     Returns
     -------
@@ -62,22 +108,34 @@ def label_map_to_mesh(label_image: sitk.Image) -> trimesh.Trimesh:
         # Uniform label map (almost always all-zero in practice) -- no
         # surface for marching_cubes to find. Raise a clear, catchable
         # error instead of letting skimage's "Surface level must be within
-        # volume data range" ValueError surface to the surgeon.
+        # volume data range" ValueError surface to the surgeon. Checked on
+        # the raw (pre-blur) array -- blurring can only change this if the
+        # mask was already all-0/all-1, which this check already catches.
         raise EmptySegmentationError(
             "The segmentation is empty -- no bone wall was found. Try "
             "adjusting the air/bone threshold sliders, or go back and "
             "double-check the landmark placement."
         )
 
+    if mask_blur_sigma_mm > 0:
+        blurred_image = sitk.SmoothingRecursiveGaussian(
+            sitk.Cast(label_image, sitk.sitkFloat32), sigma=mask_blur_sigma_mm
+        )
+        mesh_array = sitk.GetArrayFromImage(blurred_image)
+    else:
+        mesh_array = array
+
     # marching_cubes expects the spacing tuple in the same axis order as
     # the array it's given, i.e. (z, y, x).
     array_spacing = (spacing[2], spacing[1], spacing[0])
 
     verts, faces, normals, _ = measure.marching_cubes(
-        array, level=0.5, spacing=array_spacing
+        mesh_array, level=0.5, spacing=array_spacing
     )
 
-    return _verts_faces_to_trimesh(verts, faces, label_image)
+    return _verts_faces_to_trimesh(
+        verts, faces, label_image, smoothing_iterations, smoothing_method
+    )
 
 
 def label_map_to_mesh_subvoxel(
@@ -239,7 +297,72 @@ def label_map_to_mesh_subvoxel(
     return _verts_faces_to_trimesh(verts, faces, label_image)
 
 
-def _verts_faces_to_trimesh(verts: np.ndarray, faces: np.ndarray, label_image: sitk.Image) -> trimesh.Trimesh:
+def crop_mesh_to_vertex_mask(mesh: trimesh.Trimesh, keep_vertex_mask: np.ndarray) -> trimesh.Trimesh:
+    """
+    Keeps only faces whose 3 vertices are ALL inside `keep_vertex_mask`,
+    then drops the now-unreferenced vertices. A hard boolean crop -- same
+    all-or-nothing semantics as the voxel-space `label_array & roi_array`
+    intersection used elsewhere in this pipeline, no boundary
+    interpolation either way. Mesh-space counterpart to
+    roi_crop.crop_to_roi_bounding_box() + the ROI mask intersection, for
+    callers working directly with a mesh instead of a label image (see
+    roi_crop.points_inside_roi() for the matching per-vertex ROI test).
+    """
+    face_mask = keep_vertex_mask[mesh.faces].all(axis=1)
+    cropped = mesh.copy()
+    cropped.update_faces(face_mask)
+    cropped.remove_unreferenced_vertices()
+    return cropped
+
+
+def select_mesh_component_nearest_axis(mesh: trimesh.Trimesh, axis_start, axis_end) -> trimesh.Trimesh:
+    """
+    Splits `mesh` into its connected components and returns the one whose
+    vertices are, on average, closest to the line through axis_start/
+    axis_end. Mesh-space counterpart to
+    segment_threshold._closest_component_to_axis_line() (same purpose via
+    ndimage center-of-mass on a labeled voxel array instead): whole-
+    surface thresholding can pick up unrelated material (e.g. ossicles, a
+    sliver of adjacent skull) now that there's no shell restriction --
+    keep only the piece that's actually the canal wall.
+
+    Uses a plain vertex mean rather than trimesh's own `.centroid`
+    property (which is area-weighted) -- this only needs to pick the
+    right blob, not compute a true center of mass, and a plain mean keeps
+    the behavior easy to reason about/verify synthetically.
+    """
+    components = mesh.split(only_watertight=False)
+    if len(components) == 0:
+        raise EmptySegmentationError(
+            "No surface found inside the region of interest after cropping."
+        )
+
+    axis_start = np.asarray(axis_start, dtype=float)
+    axis_end = np.asarray(axis_end, dtype=float)
+    axis_vec = axis_end - axis_start
+    axis_unit = axis_vec / np.linalg.norm(axis_vec)
+
+    best_component = None
+    best_dist = np.inf
+    for component in components:
+        vec = component.vertices.mean(axis=0) - axis_start
+        along = vec @ axis_unit
+        perp = vec - along * axis_unit
+        dist = np.linalg.norm(perp)
+        if dist < best_dist:
+            best_dist = dist
+            best_component = component
+
+    return best_component
+
+
+def _verts_faces_to_trimesh(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    label_image: sitk.Image,
+    smoothing_iterations: int = MESH_SMOOTHING_ITERATIONS,
+    smoothing_method: str = "laplacian",
+) -> trimesh.Trimesh:
     """
     Shared tail for label_map_to_mesh()/label_map_to_mesh_subvoxel(): both
     marching_cubes calls above return vertices in (z, y, x) voxel-spacing
@@ -277,10 +400,18 @@ def _verts_faces_to_trimesh(verts: np.ndarray, faces: np.ndarray, label_image: s
     # logic stays in place as a backstop for whatever slips through.
     trimesh.repair.fill_holes(mesh)
 
-    if MESH_SMOOTHING_ITERATIONS > 0:
-        trimesh.smoothing.filter_laplacian(
-            mesh, iterations=MESH_SMOOTHING_ITERATIONS
-        )
+    if smoothing_iterations > 0:
+        if smoothing_method == "taubin":
+            # Alternating shrink/inflate passes -- removes the same
+            # high-frequency marching-cubes terracing as Laplacian without
+            # its low-frequency shrink/round-off bias. See
+            # label_map_to_mesh()'s docstring for why this is used for the
+            # scutum bone wall specifically.
+            trimesh.smoothing.filter_taubin(mesh, iterations=smoothing_iterations)
+        else:
+            trimesh.smoothing.filter_laplacian(
+                mesh, iterations=smoothing_iterations
+            )
 
     return mesh
 

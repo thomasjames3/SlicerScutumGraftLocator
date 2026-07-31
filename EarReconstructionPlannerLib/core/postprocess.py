@@ -90,7 +90,9 @@ def smooth_boundary(label_image: sitk.Image, iterations: int = 2) -> sitk.Image:
     return smoothed
 
 
-def run_full_postprocess(label_image: sitk.Image, close_tunnels: bool = False) -> sitk.Image:
+def run_full_postprocess(
+    label_image: sitk.Image, close_tunnels: bool = False, smooth: bool = True
+) -> sitk.Image:
     """Convenience wrapper running the standard cleanup sequence in order.
 
     close_tunnels defaults to False: close_small_tunnels()'s 2mm closing
@@ -107,6 +109,17 @@ def run_full_postprocess(label_image: sitk.Image, close_tunnels: bool = False) -
     (2026-07-28 regression report). Scutum's bone-wall shell still opts in
     explicitly (page_scutum_review.py) since that structure is genuinely
     tube/tunnel-shaped and unaffected by this fix.
+
+    smooth defaults to True (unchanged behavior for every caller that
+    doesn't pass it): smooth_boundary()'s morphological closing+opening
+    exists to clean up noise from an *automated* threshold pass. It
+    actively hurts a mask the surgeon already hand-refined via Slicer's
+    live Threshold/Paint/Erase effects (page_scutum_review.py) -- rounding
+    corners and shifting the boundary by up to its 1-voxel kernel on a
+    mask that was already precise, with no noise left to justify it.
+    Scutum's finalize step passes smooth=False for this reason (2026-07-31
+    regression report: "preview 3d result" visibly degraded a
+    good hand-tuned segmentation).
     """
     # TEMPORARY TIMING INSTRUMENTATION (2026-07-29, see CLAUDE.md "Pinna
     # segmentation performance") -- see matching note in
@@ -125,7 +138,8 @@ def run_full_postprocess(label_image: sitk.Image, close_tunnels: bool = False) -
         result = close_small_tunnels(result)
         print(f"[pinna timing] close_small_tunnels: {time.time() - _t0:.2f}s")
 
-    _t0 = time.time()
-    result = smooth_boundary(result)
-    print(f"[pinna timing] smooth_boundary: {time.time() - _t0:.2f}s")
+    if smooth:
+        _t0 = time.time()
+        result = smooth_boundary(result)
+        print(f"[pinna timing] smooth_boundary: {time.time() - _t0:.2f}s")
     return result

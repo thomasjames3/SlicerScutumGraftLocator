@@ -16,11 +16,10 @@ state of its own -- see PAGE_ORDER/SKIP_PAGE_IF below.)
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 from core.landmarks import EarCanalLandmarks
 from core.pinna_landmarks import PinnaLandmarks
-from core.threshold_seeds import ThresholdSeeds
 
 
 @dataclass
@@ -52,6 +51,17 @@ class WizardState:
     # --- Pages 3-5: Pinna (landmarks, review, draw) ---
     pinna_landmarks: PinnaLandmarks = field(default_factory=PinnaLandmarks)
     pinna_landmarks_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, hidden once drawing starts
+    # Optional seed-click calibration, placed on the pinna review page --
+    # see core/threshold_seeds.py's module docstring. pinna_air_seed +
+    # pinna_soft_tissue_seed together pre-fill that page's own skin/air
+    # threshold slider; pinna_soft_tissue_seed is ALSO carried forward to
+    # pre-fill the scutum review page's bone threshold slider (together
+    # with scutum_bone_seed below) -- reused there rather than asking for
+    # a third soft-tissue click. pinna_air_seed is pinna-page-local, not
+    # reused anywhere else.
+    pinna_air_seed: Optional[Tuple[float, float, float]] = None
+    pinna_soft_tissue_seed: Optional[Tuple[float, float, float]] = None
+    pinna_seed_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, both calibration points
     pinna_region_segmentation_node = None  # vtkMRMLSegmentationNode, hands off to Segment Editor for manual touch-ups
     pinna_region_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
     pinna_region_mesh_path: Optional[str] = None
@@ -59,11 +69,13 @@ class WizardState:
     pinna_isolated_model_node = None  # vtkMRMLModelNode for the isolated pinna patch, hidden during the scutum stage, re-shown for Verify
 
     # --- Pages 6-7: Scutum review + draw (ear canal bone wall + defect outline) ---
-    # Optional seed-click calibration for the air/bone threshold sliders
-    # below -- see core/threshold_seeds.py. Purely a pre-fill convenience;
-    # the sliders remain the actual source of truth.
-    scutum_threshold_seeds: ThresholdSeeds = field(default_factory=ThresholdSeeds)
-    scutum_threshold_seeds_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, the 3 calibration seed points
+    # Optional seed-click calibration for the bone threshold slider below --
+    # see core/threshold_seeds.py. Purely a pre-fill convenience; the
+    # slider remains the actual source of truth. Combined with
+    # pinna_soft_tissue_seed above (placed earlier, on the pinna review
+    # page) to compute a calibrated bone threshold.
+    scutum_bone_seed: Optional[Tuple[float, float, float]] = None
+    scutum_bone_seed_fiducial_node = None  # vtkMRMLMarkupsFiducialNode, the 1 calibration point
     scutum_bone_wall_segmentation_node = None  # vtkMRMLSegmentationNode, hands off to Segment Editor for manual touch-ups
     scutum_bone_wall_model_node = None  # vtkMRMLModelNode, loaded into the scene for drawing on
     scutum_bone_wall_mesh_path: Optional[str] = None
@@ -122,14 +134,17 @@ PAGE_OWNED_FIELDS = {
     "scutum_landmarks": ["scutum_landmarks", "scutum_landmarks_fiducial_node"],
     "pinna_landmarks": ["pinna_landmarks", "pinna_landmarks_fiducial_node"],
     "pinna_review": [
+        "pinna_air_seed",
+        "pinna_soft_tissue_seed",
+        "pinna_seed_fiducial_node",
         "pinna_region_segmentation_node",
         "pinna_region_model_node",
         "pinna_region_mesh_path",
     ],
     "pinna_draw": ["pinna_isolated_mesh_path", "pinna_isolated_model_node"],
     "scutum_review": [
-        "scutum_threshold_seeds",
-        "scutum_threshold_seeds_fiducial_node",
+        "scutum_bone_seed",
+        "scutum_bone_seed_fiducial_node",
         "scutum_bone_wall_segmentation_node",
         "scutum_bone_wall_model_node",
         "scutum_bone_wall_mesh_path",
@@ -149,7 +164,6 @@ PAGE_OWNED_FIELDS = {
 _FIELD_RESET_DEFAULTS = {
     "scutum_landmarks": EarCanalLandmarks,
     "pinna_landmarks": PinnaLandmarks,
-    "scutum_threshold_seeds": ThresholdSeeds,
     "surgeon_approved_scutum": lambda: False,
     "surgeon_approved_pinna": lambda: False,
 }

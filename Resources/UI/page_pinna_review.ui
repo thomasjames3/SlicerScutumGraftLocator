@@ -35,6 +35,30 @@
     </widget>
    </item>
    <item>
+    <widget class="QLabel" name="calibrationInstructionLabel">
+     <property name="text">
+      <string>Optional: click 2 points (open air, then soft tissue) to help auto-fill the starting threshold.</string>
+     </property>
+     <property name="wordWrap">
+      <bool>true</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="placeCalibrationPointButton">
+     <property name="text">
+      <string>Place Calibration Point</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QPushButton" name="redoCalibrationButton">
+     <property name="text">
+      <string>Redo Calibration Points</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="label1">
      <property name="text">
       <string>Skin threshold</string>

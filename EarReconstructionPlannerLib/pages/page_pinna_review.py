@@ -13,6 +13,9 @@ next page (page_pinna_draw.py), same two-step split as the scutum stage.
 
 Expected widgets in page_pinna_review.ui:
   - tutorialLabel             (QLabel) -- extra guidance, shown only in tutorial mode
+  - calibrationInstructionLabel (QLabel) -- current calibration step's instruction/status
+  - placeCalibrationPointButton (QPushButton)
+  - redoCalibrationButton       (QPushButton) -- clear both of this page's calibration points
   - skinThresholdSlider       (QSlider or ctkSliderWidget)
   - runButton                 (QPushButton)
   - openSegmentEditorButton  (QPushButton)
@@ -21,6 +24,30 @@ Expected widgets in page_pinna_review.ui:
   - progressBar               (QProgressBar) -- shown only while a background step (see
     base_page.WizardPage.run_blocking()) is running, hidden otherwise
   - statusLabel               (QLabel)
+
+Seed-click calibration (core/threshold_seeds.py, added 2026-07-31; made
+REQUIRED, not optional, 2026-07-31 -- see on_leave_next()): the surgeon
+clicks two points here (open air near the ear, then ordinary soft tissue
+near the ear), which immediately pre-fills the Skin threshold slider
+above with a per-scan-calibrated starting value
+(core/threshold_seeds.calibrate_skin_threshold(), the midpoint of the
+two) instead of the fixed config default. The slider itself remains
+adjustable afterward -- the surgeon can still drag it to any value before
+clicking Run -- but PLACING the two points is gated on Next, because the
+soft-tissue point is also carried forward (state.pinna_soft_tissue_seed)
+to help calibrate the scutum review page's bone threshold later,
+alongside a bone point placed there -- one click, reused by both pages,
+since it's correcting for this scan's overall HU calibration, not
+sampling anatomy specific to either page. Confirmed on a real scan
+(2026-07-31) that typing a threshold into the slider directly, instead of
+placing these points, leaves pinna_soft_tissue_seed at None -- the scutum
+page's "Auto-Calibrate & Segment" then silently falls back to
+config.DEFAULT_BONE_THRESHOLD with no error, which is what this gate
+exists to prevent. (A same-day first version of the calibration itself
+tried to avoid the air click by guessing a fixed offset below just the
+soft-tissue point -- reverted after its first real-Slicer test came out
+badly wrong; see core/threshold_seeds.py's module docstring for the full
+story.)
 """
 
 from __future__ import annotations
@@ -28,8 +55,24 @@ import os
 import time
 from EarReconstructionPlannerLib.pages.base_page import WizardPage
 from EarReconstructionPlannerLib import wizard_state
-from core import roi_crop, segment_pinna_threshold, postprocess, mesh_export, io_utils
+from core import roi_crop, segment_pinna_threshold, postprocess, mesh_export, io_utils, threshold_seeds
 import config
+
+# The 2-point calibration sequence placed on this page, in click order --
+# same shape as the old core.threshold_seeds.SEED_STEPS pattern (removed
+# 2026-07-31 when it was down to 1 point per page), but kept local here
+# now that this page needs 2 points again -- see this file's module
+# docstring and core/threshold_seeds.py's for why the air point came back.
+_CALIBRATION_STEPS = [
+    {
+        "field": "pinna_air_seed",
+        "instruction": "Required: click a point in open air near the ear (not touching skin).",
+    },
+    {
+        "field": "pinna_soft_tissue_seed",
+        "instruction": "Required: click a point on ordinary soft tissue near the ear.",
+    },
+]
 
 
 class PinnaReviewPage(WizardPage):
@@ -46,6 +89,19 @@ class PinnaReviewPage(WizardPage):
             )
 
         self.set_tutorial_text(
+            "Click 'Place Calibration Point' twice -- once in open air "
+            "near the ear, once on ordinary soft tissue near the ear. "
+            "Placing both points is required before you can continue past "
+            "this page (manually typing a threshold into the slider "
+            "doesn't give the scutum page's 'Auto-Calibrate' button the "
+            "sample points it needs later) -- but the 'Skin threshold' "
+            "slider itself stays fully yours to adjust: placing the "
+            "points just pre-fills it with a value tuned to this specific "
+            "scan, you can still drag it to anything you prefer afterward. "
+            "If a point lands in the wrong spot, use 'Redo Calibration "
+            "Points' to start over. The soft-tissue point also helps "
+            "calibrate the bone-wall threshold later on the Temporal Bone "
+            "Canal Segmentation page.\n\n"
             "This step finds the outer skin surface around the ear you "
             "marked (not the cartilage itself -- that gets isolated by "
             "hand-drawing on the next page). The 'Skin threshold' slider "
@@ -65,6 +121,10 @@ class PinnaReviewPage(WizardPage):
         self.ui.skinThresholdSlider.maximum = config.SKIN_THRESHOLD_ADJUST_RANGE[1]
         self.ui.skinThresholdSlider.value = config.SKIN_AIR_THRESHOLD
 
+        self._setup_calibration_seed()
+
+        self.ui.placeCalibrationPointButton.clicked.connect(self._on_place_calibration_point_clicked)
+        self.ui.redoCalibrationButton.clicked.connect(self._on_redo_calibration_clicked)
         self.ui.runButton.clicked.connect(self._on_run_clicked)
         self.ui.openSegmentEditorButton.clicked.connect(self._on_open_segment_editor_clicked)
         self.ui.resetPageButton.clicked.connect(self._on_reset_page_clicked)
@@ -72,6 +132,127 @@ class PinnaReviewPage(WizardPage):
         self.ui.openSegmentEditorButton.setEnabled(self.state.pinna_region_mesh_path is not None)
         self.ui.progressBar.setVisible(False)
         self.ui.statusLabel.setText("Adjust the slider if needed, then click Run.")
+
+    def _setup_calibration_seed(self):
+        import slicer
+
+        # Reuse the fiducial node from a previous visit if it's still live,
+        # same reasoning as page_scutum_review.py's matching setup.
+        existing = self.state.pinna_seed_fiducial_node
+        if existing is not None and slicer.mrmlScene.IsNodePresent(existing):
+            self._seed_fiducial_node = existing
+        else:
+            self._seed_fiducial_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode", "PinnaThresholdSeeds"
+            )
+            self._seed_fiducial_node.SetLocked(False)
+            self._seed_fiducial_node.CreateDefaultDisplayNodes()
+            self.state.pinna_seed_fiducial_node = self._seed_fiducial_node
+        self._seed_fiducial_node.GetDisplayNode().SetVisibility(True)
+
+        # Resume at whichever step matches what's already been placed --
+        # same pattern page_scutum_review.py used to use for its old
+        # 3-point sequence.
+        self._current_calib_step = 0
+        for step in _CALIBRATION_STEPS:
+            if getattr(self.state, step["field"]) is None:
+                break
+            self._current_calib_step += 1
+
+        self._calib_observer_tag = None
+        self._update_calibration_step_display()
+
+    def _update_calibration_step_display(self):
+        if self._current_calib_step >= len(_CALIBRATION_STEPS):
+            self.ui.calibrationInstructionLabel.setText(
+                f"All {len(_CALIBRATION_STEPS)} calibration points placed. "
+                "You can still adjust the Skin threshold slider below by "
+                "hand before clicking Run."
+            )
+            self.ui.placeCalibrationPointButton.setEnabled(False)
+        else:
+            step = _CALIBRATION_STEPS[self._current_calib_step]
+            self.ui.calibrationInstructionLabel.setText(step["instruction"])
+            self.ui.placeCalibrationPointButton.setEnabled(True)
+
+    def _on_place_calibration_point_clicked(self):
+        import slicer
+
+        interaction_node = slicer.app.applicationLogic().GetInteractionNode()
+        selection_node = slicer.app.applicationLogic().GetSelectionNode()
+        selection_node.SetActivePlaceNodeID(self._seed_fiducial_node.GetID())
+        interaction_node.SetCurrentInteractionMode(interaction_node.Place)
+        interaction_node.SetPlaceModePersistence(0)  # one point, then back to normal mode
+
+        self._calib_observer_tag = self._seed_fiducial_node.AddObserver(
+            self._seed_fiducial_node.PointPositionDefinedEvent, self._on_calibration_point_placed
+        )
+        self.ui.placeCalibrationPointButton.setEnabled(False)
+        self.ui.statusLabel.setText("Click a point in the 3D view or on a slice...")
+
+    def _on_calibration_point_placed(self, caller, event):
+        if self._calib_observer_tag is not None:
+            self._seed_fiducial_node.RemoveObserver(self._calib_observer_tag)
+            self._calib_observer_tag = None
+
+        point_index = self._seed_fiducial_node.GetNumberOfControlPoints() - 1
+        ras = [0.0, 0.0, 0.0]
+        self._seed_fiducial_node.GetNthControlPointPositionWorld(point_index, ras)
+
+        field_name = _CALIBRATION_STEPS[self._current_calib_step]["field"]
+        setattr(self.state, field_name, tuple(ras))
+        self._seed_fiducial_node.SetNthControlPointLabel(point_index, field_name)
+
+        self._current_calib_step += 1
+        self._update_calibration_step_display()
+
+        if self.state.pinna_air_seed is not None and self.state.pinna_soft_tissue_seed is not None:
+            self._calibrate_skin_threshold_from_seeds()
+
+    def _calibrate_skin_threshold_from_seeds(self):
+        """Pre-fills skinThresholdSlider once both calibration points are
+        placed -- no separate "Auto-Calibrate" button, unlike
+        page_scutum_review.py's embedded-Segment-Editor rework, since this
+        page's Threshold step is still the older slider+Run pattern (see
+        this file's module docstring). The slider stays the actual source
+        of truth either way; this only changes its starting value."""
+        import sitkUtils
+
+        if self.state.volume_node is None:
+            return
+
+        sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(self.state.volume_node))
+        coarse_cropped = roi_crop.crop_to_point_region(
+            sitk_image,
+            self.state.pinna_landmarks.ear_center,
+            radius_mm=config.PINNA_ROI_RADIUS_MM,
+        )
+        try:
+            skin_threshold = threshold_seeds.calibrate_skin_threshold(
+                coarse_cropped, self.state.pinna_air_seed, self.state.pinna_soft_tissue_seed
+            )
+        except ValueError as exc:
+            self.ui.statusLabel.setText(str(exc))
+            return
+
+        self.ui.skinThresholdSlider.value = skin_threshold
+        self.ui.statusLabel.setText(
+            f"Slider pre-filled from your calibration points (~{skin_threshold:.0f} HU). "
+            "Adjust if needed, then click Run."
+        )
+
+    def _on_redo_calibration_clicked(self):
+        if self._seed_fiducial_node is not None:
+            self._seed_fiducial_node.RemoveAllControlPoints()
+        self.state.pinna_air_seed = None
+        self.state.pinna_soft_tissue_seed = None
+        self._current_calib_step = 0
+        self._update_calibration_step_display()
+        self.ui.skinThresholdSlider.value = config.SKIN_AIR_THRESHOLD
+        self.ui.statusLabel.setText(
+            "Calibration points cleared. Place them again to continue -- "
+            "both are required before you can click Next."
+        )
 
     def _on_run_clicked(self):
         import sitkUtils
@@ -290,6 +471,8 @@ class PinnaReviewPage(WizardPage):
         # reasoning as page_scutum_review.py.
         if self.state.pinna_landmarks_fiducial_node is not None:
             self.state.pinna_landmarks_fiducial_node.GetDisplayNode().SetVisibility(False)
+        if self.state.pinna_seed_fiducial_node is not None:
+            self.state.pinna_seed_fiducial_node.GetDisplayNode().SetVisibility(False)
 
         # Recenter and reorient the 3D view on the new model -- same
         # reasoning as page_scutum_review.py.
@@ -423,7 +606,13 @@ class PinnaReviewPage(WizardPage):
         return True, ""
 
     def _on_reset_page_clicked(self):
+        # clear_page_state also resets pinna_air_seed/pinna_soft_tissue_seed/
+        # pinna_seed_fiducial_node (owned by "pinna_review" -- see
+        # wizard_state.PAGE_OWNED_FIELDS) and removes their MRML node from
+        # the scene -- re-run the calibration setup so a fresh fiducial
+        # node exists and the label/button reflect the clear.
         wizard_state.clear_page_state(self.state, "pinna_review")
+        self._setup_calibration_seed()
         self.ui.skinThresholdSlider.value = config.SKIN_AIR_THRESHOLD
         self.ui.openSegmentEditorButton.setEnabled(False)
         self.ui.statusLabel.setText("Segmentation cleared. Adjust the slider if needed, then click Run.")
@@ -445,6 +634,22 @@ class PinnaReviewPage(WizardPage):
         )
 
     def on_leave_next(self):
+        # Required, not just a convenience -- confirmed 2026-07-31 that
+        # skipping this (e.g. typing a threshold into the slider directly)
+        # leaves state.pinna_soft_tissue_seed at None, which silently makes
+        # the scutum review page's "Auto-Calibrate & Segment" button fall
+        # back to config.DEFAULT_BONE_THRESHOLD instead of using the
+        # surgeon's own scan-specific calibration, with no error -- just a
+        # quietly wrong-looking result two pages later. Gating here catches
+        # it at the source instead.
+        if self.state.pinna_air_seed is None or self.state.pinna_soft_tissue_seed is None:
+            return False, (
+                "Please place both calibration points above (open air, "
+                "then soft tissue) before continuing -- click 'Place "
+                "Calibration Point'. Once placed, you can still adjust "
+                "the Skin threshold slider by hand if you want a "
+                "different value."
+            )
         if self.state.pinna_region_mesh_path is None:
             return False, "Please run the segmentation before continuing."
         # Only re-derive the mesh from the segmentation if Segment Editor

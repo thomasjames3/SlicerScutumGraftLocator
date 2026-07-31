@@ -31,6 +31,48 @@ from config import INITIAL_ROI_DIAMETER_MM, ROI_AXIAL_MARGIN_MM
 from core.landmarks import EarCanalLandmarks
 
 
+def points_inside_roi(
+    points: np.ndarray,
+    landmarks: EarCanalLandmarks,
+    diameter_mm: float = INITIAL_ROI_DIAMETER_MM,
+    axial_margin_mm: float = ROI_AXIAL_MARGIN_MM,
+) -> np.ndarray:
+    """
+    Boolean test: which of `points` (an (N, 3) array of physical RAS mm
+    coordinates) fall inside the same truncated-cylinder ROI
+    build_roi_mask() below builds as a voxel mask. Factored out of that
+    function so mesh-space callers (e.g. page_scutum_review.py's
+    mesh-based finalize, 2026-07-31) can test mesh vertices directly
+    against the identical cylinder definition without needing a voxel
+    grid at all.
+    """
+    if not landmarks.is_complete():
+        raise ValueError("Cannot test ROI membership: landmarks are not all placed yet.")
+
+    points = np.asarray(points, dtype=float)
+    canal_axis_start = np.array(landmarks.canal_opening)
+    canal_axis_end = np.array(landmarks.near_eardrum)
+
+    axis_vec = canal_axis_end - canal_axis_start
+    axis_length = np.linalg.norm(axis_vec)
+    axis_unit = axis_vec / axis_length
+
+    radius = diameter_mm / 2.0
+
+    vec_from_start = points - canal_axis_start
+    along_axis = vec_from_start @ axis_unit
+    perp_vec = vec_from_start - np.outer(along_axis, axis_unit)
+    perp_dist = np.linalg.norm(perp_vec, axis=1)
+
+    inside_cylinder = perp_dist <= radius
+    # Bounding planes, perpendicular to the axis, each extended
+    # axial_margin_mm past its landmark -- no surgeon-supplied direction
+    # involved, so there's no "wrong side" possible.
+    outer_side = along_axis >= -axial_margin_mm
+    inner_side = along_axis <= axis_length + axial_margin_mm
+    return inside_cylinder & outer_side & inner_side
+
+
 def build_roi_mask(
     reference_image: sitk.Image,
     landmarks: EarCanalLandmarks,
@@ -71,31 +113,8 @@ def build_roi_mask(
     if not landmarks.is_complete():
         raise ValueError("Cannot build ROI: landmarks are not all placed yet.")
 
-    canal_axis_start = np.array(landmarks.canal_opening)
-    canal_axis_end = np.array(landmarks.near_eardrum)
-
-    axis_vec = canal_axis_end - canal_axis_start
-    axis_length = np.linalg.norm(axis_vec)
-    axis_unit = axis_vec / axis_length
-
-    radius = diameter_mm / 2.0
-
     def inside_test(physical_coords: np.ndarray) -> np.ndarray:
-        # Signed distance along the axis, measured from canal_opening --
-        # used both for the cylinder's perpendicular distance and to bound
-        # the two ends (0 = canal_opening, axis_length = near_eardrum).
-        vec_from_start = physical_coords - canal_axis_start
-        along_axis = vec_from_start @ axis_unit
-        perp_vec = vec_from_start - np.outer(along_axis, axis_unit)
-        perp_dist = np.linalg.norm(perp_vec, axis=1)
-
-        inside_cylinder = perp_dist <= radius
-        # Bounding planes, perpendicular to the axis, each extended
-        # axial_margin_mm past its landmark -- no surgeon-supplied
-        # direction involved, so there's no "wrong side" possible.
-        outer_side = along_axis >= -axial_margin_mm
-        inner_side = along_axis <= axis_length + axial_margin_mm
-        return inside_cylinder & outer_side & inner_side
+        return points_inside_roi(physical_coords, landmarks, diameter_mm, axial_margin_mm)
 
     mask_array = _build_mask_by_slices(reference_image, inside_test)
 
@@ -294,6 +313,25 @@ def crop_to_landmark_region(
     computation rather than risking clipping off part of the real ROI.
     """
     points = np.array([landmarks.canal_opening, landmarks.near_eardrum])
+    min_point = points.min(axis=0) - margin_mm
+    max_point = points.max(axis=0) + margin_mm
+    return crop_to_physical_bounds(image, min_point, max_point)
+
+
+def crop_to_points_region(
+    image: sitk.Image, points, margin_mm: float = 15.0
+) -> sitk.Image:
+    """
+    Coarse pre-crop: a rectangular box around an arbitrary set of physical
+    (RAS mm) points, expanded by `margin_mm` on every side. Generalizes
+    crop_to_landmark_region() for callers that need the crop to also
+    guarantee containment of extra points beyond the 2 canal landmarks
+    (e.g. a surgeon-placed calibration seed) -- since every point passed
+    in directly defines the box, none of them can ever land outside their
+    own crop, unlike cropping to the landmarks alone and then separately
+    sampling a seed that may sit further away.
+    """
+    points = np.array(list(points), dtype=float)
     min_point = points.min(axis=0) - margin_mm
     max_point = points.max(axis=0) + margin_mm
     return crop_to_physical_bounds(image, min_point, max_point)

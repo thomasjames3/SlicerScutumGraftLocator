@@ -1,129 +1,78 @@
 """
 threshold_seeds.py
 ===================
-Optional per-scan calibration for the two Stage A thresholds in
-core/segment_threshold.py (DEFAULT_AIR_THRESHOLD / DEFAULT_BONE_THRESHOLD).
-Kept separate from core/landmarks.py -- same reasoning as
-core/pinna_landmarks.py -- since this is a different kind of point (an
-intensity sample, not an anatomical axis/center reference) used for a
-different purpose.
+Optional per-scan calibration points that pre-fill starting threshold
+values for two different pages' segmentation steps, from real intensity
+samples on this specific scan instead of one fixed HU pair used for every
+patient/scanner.
 
-Background: config.py's air/bone thresholds are one fixed HU pair applied
-to every patient/scanner. A synthetic 150-patient experiment (run against
-the real segment_threshold.segment_bone_wall(), not a reimplementation)
-found that deriving both thresholds instead from 3 quick surgeon
-seed-clicks -- one in the air lumen, one on bone, one on ordinary soft
-tissue -- raised mean Dice from 0.599 to 0.650, and the improvement roughly
-doubled specifically under simulated scanner HU calibration drift vs. a
-no-drift control, confirming the mechanism is really correcting inter-scan
+Points, placed on two different wizard pages:
+
+  - pinna_air_seed + soft_tissue_seed: both placed on the PINNA REVIEW
+    page (a click in open air near the ear, and a click on ordinary soft
+    tissue near the ear). calibrate_skin_threshold() takes their midpoint
+    for that page's own skin/air threshold. soft_tissue_seed is ALSO
+    carried forward in WizardState to help calibrate the SCUTUM REVIEW
+    page's bone/tissue threshold (calibrate_bone_threshold(), together
+    with bone_seed below) -- reused there rather than asking for a third
+    soft-tissue click, since ordinary soft tissue near the ear canal and
+    near the pinna is the same tissue type.
+  - bone_seed: placed on the SCUTUM REVIEW page (a click on solid bone
+    near the ear canal). Only feeds calibrate_bone_threshold().
+
+Background: a synthetic 150-patient experiment (run against the real
+segment_threshold.segment_bone_wall(), not a reimplementation) found that
+deriving the bone threshold from seed-clicks instead of one fixed default
+raised mean Dice from 0.599 to 0.650, and the improvement roughly doubled
+specifically under simulated scanner HU calibration drift vs. a no-drift
+control -- confirming the mechanism is really correcting inter-scan
 calibration, not just averaging out noise. See config.py's "seed-based
 threshold calibration" section for the full writeup.
 
-This is a convenience, not a replacement for the review page's sliders:
-calibrate_thresholds() below only computes starting values for those
-sliders, which stay the actual source of truth and remain fully
-surgeon-adjustable.
+Originally a third point (air_seed, a click inside the air-filled canal)
+was also placed alongside bone_seed on the scutum page, to derive an
+air_threshold the same way. That threshold stopped being used once
+page_scutum_review.py was reworked (2026-07-30) to run Slicer's own
+Threshold effect directly, rather than the old shell-restricted
+segment_threshold.segment_bone_wall() pipeline that needed it -- so THAT
+air_seed was pure dead weight (sampled a point, computed a value, and
+never used it) and was removed (2026-07-31).
+
+calibrate_skin_threshold() briefly (also 2026-07-31, same day) tried
+avoiding a pinna-side air click entirely -- soft_tissue_hu minus a fixed
+config constant, on the theory that true open air's HU is close to a
+scanner-invariant -1000 by definition of the Hounsfield scale, so a
+second click wouldn't add information a constant didn't already have.
+**Directly disproven on the first real-Slicer test**: calibrated to -359
+HU, but Thomas had already found ~-550 HU necessary for a good result on
+that scan by hand -- soft_tissue_hu backed out to -59 (a perfectly
+plausible fat/soft-tissue reading), meaning the needed margin below it
+was ~491 HU, nowhere near the fixed 300 assumed. Backing out what a
+genuine air sample would need to be for midpoint(air_hu, -59) to land at
+-550 gives air_hu ~= -1041 -- itself a perfectly plausible real-air
+reading, which is what motivated reverting to a real, per-scan air click
+rather than guessing a new fixed constant (this project has been burned
+more than once -- see CLAUDE.md's sheetness-feature history -- by
+retuning a fixed constant against one real scan's feedback and having it
+fail the next one; a directly-sampled midpoint, the same mechanism
+calibrate_bone_threshold already uses successfully, doesn't have that
+problem). Not yet re-confirmed against a real scan.
+
+This is a convenience, not a replacement for either page's threshold
+slider: both calibrate_*() functions below only compute a starting value
+for those sliders, which stay the actual source of truth and remain
+fully surgeon-adjustable.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import SimpleITK as sitk
 
-import config
+from config import GAUSSIAN_SMOOTHING_SIGMA_MM, MIN_BONE_SOFT_TISSUE_SEPARATION_HU
 from core.smoothing import smooth_for_thresholding
 
 Point3D = Tuple[float, float, float]  # (x, y, z) in RAS mm, Slicer's convention
-
-
-@dataclass
-class ThresholdSeeds:
-    """
-    3 points the surgeon clicks on the raw scan (before any segmentation
-    exists) to calibrate the air/bone thresholds for this specific scan.
-
-    air_seed:
-        A point inside the air-filled ear canal lumen.
-    bone_seed:
-        A point on solid bone near the ear canal.
-    soft_tissue_seed:
-        A point on ordinary soft tissue near the ear canal -- neither bone
-        nor air. This is the shared reference point calibrate_thresholds()
-        anchors BOTH boundaries against: the air/tissue split and the
-        bone/tissue split.
-
-    Unlike EarCanalLandmarks/PinnaLandmarks, placing these is entirely
-    optional -- the review page's sliders already have sensible defaults
-    from config.py, so an incomplete ThresholdSeeds is not itself a
-    problem (see validate() below).
-    """
-
-    air_seed: Optional[Point3D] = None
-    bone_seed: Optional[Point3D] = None
-    soft_tissue_seed: Optional[Point3D] = None
-
-    def is_complete(self) -> bool:
-        return (
-            self.air_seed is not None
-            and self.bone_seed is not None
-            and self.soft_tissue_seed is not None
-        )
-
-    def validate(self) -> Optional[str]:
-        """
-        Plain-English, forgiving sanity check -- same philosophy as
-        EarCanalLandmarks.validate()/PinnaLandmarks.validate(), but with a
-        much tighter proximity threshold (1mm, not 5mm): these 3 points are
-        *expected* to sit close together right at the canal wall by design
-        (unlike the canal-axis landmarks, which are 10-25mm apart), so
-        reusing the wider threshold would false-positive on entirely normal
-        seed placement. Returns None if incomplete -- incompleteness isn't
-        itself a warning here, since calibration is optional.
-        """
-        if not self.is_complete():
-            return None
-
-        import math
-
-        points = {
-            "air": self.air_seed,
-            "bone": self.bone_seed,
-            "soft tissue": self.soft_tissue_seed,
-        }
-        names = list(points.keys())
-        for i in range(len(names)):
-            for j in range(i + 1, len(names)):
-                a, b = names[i], names[j]
-                if math.dist(points[a], points[b]) < 1.0:
-                    return (
-                        f"The '{a}' and '{b}' calibration points are almost "
-                        "on top of each other. Please double-check these "
-                        "points, or use Redo Calibration Points to re-place them."
-                    )
-        return None
-
-
-# Plain-language instructions + reference image filenames shown in the
-# wizard, one per step -- same shape as core.landmarks.LANDMARK_STEPS /
-# core.pinna_landmarks.PINNA_LANDMARK_STEP.
-SEED_STEPS = [
-    {
-        "field": "air_seed",
-        "instruction": "Click a point inside the air-filled ear canal (the dark, hollow part).",
-        "reference_image": "step1_air_seed.png",
-    },
-    {
-        "field": "bone_seed",
-        "instruction": "Click a point on solid bone near the ear canal.",
-        "reference_image": "step2_bone_seed.png",
-    },
-    {
-        "field": "soft_tissue_seed",
-        "instruction": "Click a point on ordinary soft tissue near the ear canal (not bone, not air).",
-        "reference_image": "step3_soft_tissue_seed.png",
-    },
-]
 
 
 def _sample_hu_at_point(smoothed_image: sitk.Image, point: Point3D) -> float:
@@ -139,69 +88,86 @@ def _sample_hu_at_point(smoothed_image: sitk.Image, point: Point3D) -> float:
     if any(i < 0 or i >= s for i, s in zip(index, size)):
         raise ValueError(
             "A calibration point fell outside the scan region. Please "
-            "re-place it closer to the ear canal, using Redo Calibration Points."
+            "go back and re-place it closer to the ear, using this page's "
+            "Redo button."
         )
     return float(smoothed_image.GetPixel(index))
 
 
-def calibrate_thresholds(
+def calibrate_bone_threshold(
     image: sitk.Image,
-    seeds: ThresholdSeeds,
-) -> Tuple[float, float]:
+    bone_seed: Point3D,
+    soft_tissue_seed: Point3D,
+) -> float:
     """
-    Derives (air_threshold, bone_threshold) from the 3 seed points, to
-    pre-fill the review page's sliders for this specific scan.
+    bone_threshold = midpoint(bone_seed, soft_tissue_seed) -- the
+    bone/tissue boundary that determines the exported wall.
 
     Smooths `image` with the exact same function
     segment_threshold.segment_bone_wall() itself uses before thresholding
     (core/smoothing.py), so the sampled intensities reflect what
     thresholding will actually see -- calibrating against the raw
     (unsmoothed) image would systematically mismatch the values the
-    sliders are meant to drive.
+    slider is meant to drive.
 
-    air_threshold = midpoint(air_seed, soft_tissue_seed) -- the air/tissue
-    boundary used internally to find the air-lumen scaffold.
-    bone_threshold = midpoint(bone_seed, soft_tissue_seed) -- the
-    bone/tissue boundary that determines the exported wall.
-
-    Raises ValueError if `seeds` is incomplete, or if any seed point falls
-    outside `image` (see _sample_hu_at_point) -- both are meant to be
-    caught by the caller and shown via the page's statusLabel, same idiom
-    as roi_crop.build_roi_mask's ValueError.
+    Raises ValueError if either seed point falls outside `image` (see
+    _sample_hu_at_point) -- meant to be caught by the caller and shown via
+    the page's statusLabel, same idiom as roi_crop.build_roi_mask's
+    ValueError.
     """
-    if not seeds.is_complete():
-        raise ValueError("Cannot calibrate thresholds: not all 3 calibration points are placed yet.")
-
     smoothed = smooth_for_thresholding(image)
-
-    air_hu = _sample_hu_at_point(smoothed, seeds.air_seed)
-    bone_hu = _sample_hu_at_point(smoothed, seeds.bone_seed)
-    soft_hu = _sample_hu_at_point(smoothed, seeds.soft_tissue_seed)
-
-    air_threshold = (air_hu + soft_hu) / 2.0
-    bone_threshold = (bone_hu + soft_hu) / 2.0
-    return air_threshold, bone_threshold
+    bone_hu = _sample_hu_at_point(smoothed, bone_seed)
+    soft_hu = _sample_hu_at_point(smoothed, soft_tissue_seed)
+    return (bone_hu + soft_hu) / 2.0
 
 
-def check_seed_plausibility(
+def calibrate_skin_threshold(
     image: sitk.Image,
-    seeds: ThresholdSeeds,
+    air_seed: Point3D,
+    soft_tissue_seed: Point3D,
+) -> float:
+    """
+    skin_threshold = midpoint(air_seed, soft_tissue_seed) -- the skin/air
+    boundary that determines which voxels count as skin surface.
+
+    Same mechanism as calibrate_bone_threshold() (a real midpoint between
+    two directly-sampled points, not a point plus a guessed fixed offset)
+    -- see this module's docstring for why a fixed-offset version of this
+    function was tried first and reverted after failing its first
+    real-Slicer test.
+
+    Smooths with plain Gaussian at GAUSSIAN_SMOOTHING_SIGMA_MM -- matching
+    segment_pinna_threshold.segment_pinna_region()'s own smoothing exactly
+    (NOT smooth_for_thresholding/CurvatureFlow, which is scutum-pipeline-
+    only, see core/smoothing.py) -- for the same reason
+    calibrate_bone_threshold must match its own pipeline's smoothing:
+    calibrating against a differently-smoothed field would systematically
+    mismatch what thresholding will actually see.
+
+    Raises ValueError if either seed point falls outside `image`.
+    """
+    smoothed = sitk.SmoothingRecursiveGaussian(image, sigma=GAUSSIAN_SMOOTHING_SIGMA_MM)
+    air_hu = _sample_hu_at_point(smoothed, air_seed)
+    soft_hu = _sample_hu_at_point(smoothed, soft_tissue_seed)
+    return (air_hu + soft_hu) / 2.0
+
+
+def check_bone_soft_tissue_plausibility(
+    image: sitk.Image,
+    bone_seed: Point3D,
+    soft_tissue_seed: Point3D,
 ) -> Optional[str]:
     """
     Plain-English, advisory-only warning (never raises) if the bone seed's
     sampled intensity isn't meaningfully above the soft-tissue seed's --
     the most likely explanation is the "bone" click actually landed on soft
-    tissue. Returns None if seeds are incomplete or everything looks
-    plausible.
+    tissue. Returns None if everything looks plausible.
     """
-    if not seeds.is_complete():
-        return None
-
     smoothed = smooth_for_thresholding(image)
-    bone_hu = _sample_hu_at_point(smoothed, seeds.bone_seed)
-    soft_hu = _sample_hu_at_point(smoothed, seeds.soft_tissue_seed)
+    bone_hu = _sample_hu_at_point(smoothed, bone_seed)
+    soft_hu = _sample_hu_at_point(smoothed, soft_tissue_seed)
 
-    if (bone_hu - soft_hu) < config.MIN_BONE_SOFT_TISSUE_SEPARATION_HU:
+    if (bone_hu - soft_hu) < MIN_BONE_SOFT_TISSUE_SEPARATION_HU:
         return (
             "The bone calibration point doesn't look distinctly denser "
             "than the soft-tissue point -- double-check that the 'bone' "

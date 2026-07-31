@@ -57,9 +57,77 @@ Smoothing effects, used directly in-page). **First real-Slicer test
 (2026-07-30, same day): core operations confirmed good** — Thomas
 reported the actual segmentation is noticeably more accurate than the old
 automated pipeline, and the level of automation (one-click calibrate,
-live adjust) feels right. **Some interface fixes still needed — not yet
-specified.** Next session: ask Thomas what specifically about the
-interface needs fixing before doing anything else here; don't guess.
+live adjust) feels right. The "some interface fixes still needed, not yet
+specified" note that used to be here is now answered — see "Scutum
+finalize mesh quality" below for what it turned out to be (the "Preview
+3D Result" button visibly degrading an already-good hand-tuned
+segmentation). **Round 4 (2026-07-31, same day)** replaced the whole
+crop/postprocess/marching_cubes rebuild with pulling the segmentation's
+own already-good closed-surface mesh directly — root cause diagnosis and
+implementation done, **not yet real-Slicer-confirmed**, including a
+deliberately-accepted open question (does skipping postprocess entirely
+still work OK with the draw page's Isolate Patch step?) that Thomas
+wants tested empirically rather than guessed at. **This is the active,
+unfinished thread — pick up here first in a new session.**
+
+**Calibration-seed rework across pinna review + scutum review pages
+(2026-07-31)** — see "Calibration-seed cleanup" under "Interactive
+Segment Editor threshold rework" below for the full history. Summary:
+removed a dead, silently-discarded air calibration point from the scutum
+page; added a real 2-point (air + soft-tissue) calibration to the pinna
+review page, which never had one before; one bad design (a guessed
+fixed-offset formula) was tried, real-Slicer-tested, found wrong, and
+replaced with a real air click + midpoint (same mechanism the existing
+bone-threshold calibration already uses successfully). **Confirmed
+directionally correct on a real scan but not exact** (predicted -465 HU,
+Thomas's own hand-tuned working value was ~-550) — Thomas explicitly
+deferred closing that gap until more scans are tested, so the plain
+midpoint (no extra margin) is what's currently shipped; don't add a
+correction constant unprompted.
+
+**Two more calibration bugs found and fixed, same feature, later same day
+(2026-07-31) — both RESOLVED, confirmed by Thomas:**
+1. **Scutum page's coarse crop rejected valid calibration points.**
+   `page_scutum_review.py`'s `_on_calibrate_clicked` sampled the bone/
+   soft-tissue seed points against a crop box built from only the 2 canal
+   landmarks (±15mm margin, `roi_crop.crop_to_landmark_region`) — a box
+   sized for the OLD shell-restricted mask-building pipeline, not for
+   containing arbitrary surgeon clicks elsewhere. A bone point placed
+   legitimately on the scutum (further than 15mm from the canal axis)
+   fell outside it, raising a spurious "calibration point fell outside
+   the scan region" error. **Fix**: new `roi_crop.crop_to_points_region()`
+   builds the crop from the landmarks AND both seed points together, so a
+   point can never fall outside a box it directly helped define. Confirmed
+   this resolved it ("this is working well now"). Worth revisiting later:
+   if a scutum point is ever THAT far from the canal axis, the *actual*
+   segmentation ROI cylinder (10mm radius from that same axis,
+   `INITIAL_ROI_DIAMETER_MM`/`ROI_AXIAL_MARGIN_MM`) may also not reach it
+   — flagged to Thomas, not yet independently confirmed either way.
+2. **"Auto-Calibrate always gives 100 no matter where the marker is
+   placed" — root-caused to NOT be a code bug.** Live-Slicer console
+   checks (`w = slicer.modules.earreconstructionplanner.
+   widgetRepresentation().self(); print(w.state...)`) confirmed
+   `scutum_bone_seed` was set correctly, but `pinna_air_seed`/
+   `pinna_soft_tissue_seed` were both `None` AND the pinna page's
+   calibration fiducial node had 0 control points — the pinna review
+   page's 2-point calibration sequence (open air, then soft tissue) had
+   simply never been completed for this scan; Thomas had been typing a
+   threshold into that page's slider directly instead. Since
+   `calibrate_bone_threshold()` needs BOTH the scutum bone point and the
+   pinna soft-tissue point, missing either one silently falls back to
+   `config.DEFAULT_BONE_THRESHOLD` (100) with no error — which is exactly
+   what was observed. **Fix, agreed with Thomas**: rather than leave this
+   as a silent gotcha, `page_pinna_review.py`'s `on_leave_next()` now
+   BLOCKS "Next" until both calibration points are placed (previously
+   optional-by-design — a real, deliberate policy change, not just a
+   messaging fix). The Skin threshold slider itself remains fully
+   surgeon-adjustable either way; only PLACING the two points is now
+   required. Every user-facing string that used to imply the slider was
+   an equivalent substitute (tutorial text, the per-step instructions,
+   the Redo-calibration message, the module docstring) was updated to say
+   "Required" and to explicitly clarify the slider stays editable
+   afterward, per Thomas's follow-up request. See "Calibration-seed
+   cleanup" below for the code-level detail.
 
 **Not yet exercised in real Slicer:** Verify page; Curvature page's Qt
 widgets (progress streaming, results table, heatmap vertex-color
@@ -874,9 +942,13 @@ of reimplementing it.
 
 **New flow**:
 1. **"Auto-Calibrate & Segment" (one click)**: computes a starting bone
-   threshold -- from the existing optional 3-point seed calibration
-   (`core/threshold_seeds.py`) if placed, else `config.DEFAULT_BONE_THRESHOLD`
-   -- and applies it via the Threshold effect (`effect.setParameter
+   threshold -- from the existing optional seed calibration
+   (`core/threshold_seeds.py` -- a bone point placed here, combined with a
+   soft-tissue point placed earlier on the pinna review page; see
+   "Calibration-seed cleanup" below for the current, reworked shape of
+   this, last touched 2026-07-31) if placed, else
+   `config.DEFAULT_BONE_THRESHOLD` -- and applies it via the Threshold
+   effect (`effect.setParameter
    ("MinimumThreshold"/"MaximumThreshold", ...)`, `effect.self().onApply()`
    -- the documented Slicer script-repository recipe) to the **whole
    loaded volume**, not a shell/ROI restriction. This directly matches
@@ -975,6 +1047,413 @@ exists, progress bar behavior, something about the curated effect list,
 etc. are all plausible but unconfirmed candidates -- get the actual list
 from Thomas first).
 
+**Calibration-seed cleanup (2026-07-31)** -- prompted by Thomas asking
+whether all 3 calibration points were still needed post-rework, not by
+the "unspecified interface fixes" comment above, though it may turn out
+to be the same complaint (that comment had already flagged "the
+calibration-seed workflow feeling redundant now that Auto-Calibrate
+exists" as one guess -- still don't assume that's confirmed, ask Thomas
+directly next time this page comes up).
+
+Checked each of the 3 points (air/bone/soft-tissue) against what's
+actually used post-rework: `_on_calibrate_clicked` does
+`_, bone_threshold = threshold_seeds.calibrate_thresholds(...)` --
+`air_threshold` was computed and silently discarded every time, because
+the old shell-restricted pipeline that needed it
+(`segment_threshold.segment_bone_wall()`) is no longer called by this
+page (see "Interactive Segment Editor threshold rework" above). **Deleted
+`air_seed` entirely** -- dead weight, zero behavior change (it was never
+used).
+
+Separately, Thomas asked whether a calibration point could help the pinna
+review page too (which has never had one) -- and if so, whether the
+soft-tissue point could be placed there once and reused, instead of
+asking twice. Judged genuinely useful, not just for symmetry: pinna's
+`SKIN_AIR_THRESHOLD` (-300) has a large built-in margin against typical
+scanner noise (config.py's own comment says as much), but
+`SKIN_THRESHOLD_ADJUST_RANGE`'s existing comment already documents a real
+scan whose intensity values needed a much lower threshold than the
+standard-HU default assumed -- i.e. a genuinely *shifted* scan
+calibration, not just noise, which a fixed margin doesn't protect against
+regardless of its size. This is also a plausible (unconfirmed) partial
+explanation for Known Issue #7's EmptySegmentationError reports, which
+were previously attributed only to a mis-landed ear_center landmark.
+
+**Shipped**: `pinna_soft_tissue_seed` moved to a new optional calibration
+step on the PINNA REVIEW page (page 4) -- one click on ordinary soft
+tissue near the ear, placed via the same fiducial-node/Place-mode pattern
+already used elsewhere. Placing it immediately pre-fills that page's own
+`skinThresholdSlider` via a new `core/threshold_seeds.
+calibrate_skin_threshold()`: `soft_tissue_hu - config.
+SKIN_THRESHOLD_OFFSET_BELOW_SOFT_TISSUE_HU` (300.0 -- picked so a
+*typical* soft-tissue reading lands close to the old fixed -300 default,
+while a *shifted* scan's threshold moves with it). Deliberately NOT a
+midpoint against a second air-seed click: true open air sits at a
+scanner-invariant ~-1000 HU by definition of the Hounsfield scale, so a
+fixed offset below the (per-scan-sampled) soft-tissue reading already
+tracks a scan-wide shift the same way `calibrate_bone_threshold`'s
+midpoint does, without a second click. Smooths with plain Gaussian at
+`GAUSSIAN_SMOOTHING_SIGMA_MM` -- matching
+`segment_pinna_threshold.segment_pinna_region()`'s own smoothing exactly,
+NOT `smooth_for_thresholding`'s CurvatureFlow (scutum-pipeline-only) --
+same "must match the pipeline's own smoothing" lesson this project has
+hit before with the bone-threshold calibration.
+
+The same point is carried forward in `WizardState.pinna_soft_tissue_seed`
+and reused on the SCUTUM REVIEW page (page 6, later in the wizard),
+combined with a `scutum_bone_seed` still placed there, for
+`calibrate_bone_threshold()` (unchanged formula: midpoint of the two,
+smoothed via `smooth_for_thresholding`/CurvatureFlow, matching that
+page's own pipeline as before) -- so calibration is now 2 total clicks
+(1 on pinna, 1 on scutum) instead of the old 3 (all on scutum), with the
+same or better coverage: previously-dead `air_seed` is gone, and pinna
+gets a calibration option it never had.
+
+`core/threshold_seeds.py`'s `ThresholdSeeds` dataclass and `SEED_STEPS`
+list (built for a 3-point sequence on one page) were removed along with
+this -- each page now tracks its own single optional point as a plain
+`Optional[Tuple[float,float,float]]` field on `WizardState`
+(`pinna_soft_tissue_seed`, `scutum_bone_seed`), each owned by the page
+that places it (`wizard_state.PAGE_OWNED_FIELDS`), matching this
+project's general preference for the simplest structure that fits rather
+than carrying a now-oversized abstraction forward.
+`check_seed_plausibility()` (advisory bone-vs-soft-tissue sanity check)
+was carried over as `check_bone_soft_tissue_plausibility()`, but --
+confirmed while making this change, pre-existing, not a regression --
+was never actually wired into `page_scutum_review.py`'s UI either before
+or after this session; still available to wire in later if wanted.
+
+**First real-Slicer test (2026-07-31, same day): fixed-offset formula
+confirmed wrong, reverted to a real air click.** Thomas placed the
+soft-tissue point clearly on the pinna, but the resulting segmentation
+looked as if the threshold were too high (too little material counted as
+skin) -- the calibrated value was -359 HU, but he'd already found ~-550
+HU necessary for a good result on this scan by hand. Backing out the
+math: -359 = soft_tissue_hu - 300, so the sampled soft-tissue HU was -59
+-- a perfectly ordinary fat/soft-tissue reading, meaning the click itself
+was almost certainly fine. The bug was in the fixed 300 HU margin
+assumption: the real gap needed was ~491 HU (-59 to -550), not 300, and
+there's no reason to expect that gap is constant across scans -- exactly
+the "fixed constant doesn't generalize scan-to-scan" failure mode this
+project has hit and fixed before (see the sheetness-feature saga above).
+Solving for what a genuinely-sampled air point would need to be for
+midpoint(air_hu, -59) to land at -550 gives air_hu ~= -1041 -- itself a
+perfectly plausible real air reading, which is what motivated the fix
+below rather than just retuning the constant again.
+
+**Fix**: reverted to a real, per-scan air click, restoring the same
+midpoint-of-two-directly-sampled-points mechanism `calibrate_bone_
+threshold()` already uses successfully (see the seed-based calibration
+section above -- that one worked on its first real test). The pinna
+review page now has a 2-point calibration sequence again (open air, then
+soft tissue -- `_CALIBRATION_STEPS` in `page_pinna_review.py`, the same
+step-list shape `core/threshold_seeds.py`'s old `SEED_STEPS` used, kept
+page-local now rather than in the shared module since only this page
+needs a multi-step sequence). `calibrate_skin_threshold(image, air_seed,
+soft_tissue_seed)` now takes both points and returns their midpoint,
+same shape as `calibrate_bone_threshold`. New `WizardState.pinna_air_seed`
+field (pinna-page-local, not reused elsewhere) alongside the existing
+`pinna_soft_tissue_seed` (still carried forward to the scutum page,
+unaffected by this fix); both live on one shared fiducial node
+(`pinna_seed_fiducial_node`), matching how the original 3-point scutum
+sequence used to share one node. Total calibration clicks are now 3
+again (2 on pinna, 1 on scutum) -- back to the original count, but with
+the previously-dead scutum air click now gone and replaced by a pinna
+air click that's actually used.
+
+**Second real-Slicer test (2026-07-31, same day): mechanism confirmed
+correct, real residual gap found, more tuning deliberately deferred.**
+Thomas re-ran calibration on the same scan and reported the real sampled
+values: soft_tissue_hu=86, air_hu=-1016 -- both perfectly plausible
+(confirms the -1041 back-calculation above was a good guess, and that the
+click placements are fine). Midpoint = -465 ("roughly -470" per Thomas),
+a big improvement on the first version's -359 (down from 191 HU off the
+-550 target to 85 HU off) but still not quite there, and in the SAME
+direction both times (the true value is always somewhat below the
+predicted one).
+
+Working hypothesis, not yet confirmed: the pinna is a thin, folded
+structure (cartilage + skin, often 1-3mm), so true-boundary voxels
+partial-volume with air from both sides at once and read closer to air
+than a clean 50/50 blend of the two bulk materials would predict -- a
+plain two-point midpoint has no way to capture that, it only knows the
+two bulk materials clicked on. Notably consistent with `SKIN_AIR_
+THRESHOLD`'s own pre-existing config.py comment (predates this whole
+calibration feature): the default was already deliberately set as "a
+generous margin... to reliably catch the full skin surface," i.e. this
+threshold was always expected to sit measurably below the naive
+tissue/air midpoint, for this same partial-volume reason.
+
+**Deliberately NOT fixed further right now** -- offered Thomas a choice
+(add another guessed safety-margin constant below the midpoint, vs.
+leave the pure midpoint as-is and treat the residual gap as normal
+per-scan slider adjustment) rather than picking a third constant guess
+off one data point, matching this project's hard-won lesson from the
+sheetness feature (multiple rounds burned exactly this way). **Thomas's
+call: leave it as the plain midpoint for now** -- "good enough starting
+value," wants to gather more real-scan data before tuning further, may
+revisit. Do not add a margin constant unprompted; wait for Thomas to
+raise it again, ideally with results from more than one scan so any
+future constant isn't fit to n=1 again.
+
+Also still open from the first version of this feature, unaffected by
+this fix: does placing the soft-tissue point on the pinna page and
+having it silently reused two pages later (on scutum review) make sense
+to a surgeon without confusion (both pages' status/tutorial text mention
+the other page explicitly, but this is unconfirmed to read clearly in
+practice), and does resetting either page's calibration points behave as
+expected across a Back/Next round-trip.
+
+**Follow-up, 2026-07-31, later same day — both RESOLVED, confirmed by
+Thomas:** see the "Two more calibration bugs found and fixed" entry under
+"Current status" above for the full story; summarized here since it's
+this section's code. (1) `page_scutum_review.py`'s calibration-sampling
+crop switched from `roi_crop.crop_to_landmark_region()` (2 landmarks
+only, ±15mm) to the new `roi_crop.crop_to_points_region()` (landmarks +
+both seed points together), fixing a spurious "calibration point fell
+outside the scan region" error for a bone point placed validly but
+further than 15mm from the canal axis. (2) `page_pinna_review.py`'s
+2-point calibration (open air, then soft tissue) is no longer optional —
+`on_leave_next()` now blocks "Next" until both are placed, because
+skipping it (e.g. typing a threshold into the slider by hand instead)
+silently left `pinna_soft_tissue_seed` at `None`, making THIS page's
+"Auto-Calibrate & Segment" quietly fall back to
+`config.DEFAULT_BONE_THRESHOLD` (100) with no error regardless of where
+the scutum bone marker was placed. The Skin threshold slider itself is
+still fully adjustable either way; only placing the two points is now
+required, and every user-facing string on that page was updated to say
+so explicitly (not just the gating logic) per Thomas's request.
+
+---
+
+## Scutum finalize mesh quality (2026-07-31)
+
+**Status: round 4 shipped, NOT yet real-Slicer tested — pick up here
+first in a new session.** See "Round 4" at the end of this section for
+the current approach and exactly what to ask Thomas to check. Rounds 1-3
+below are superseded (all three tried to fix the finalized mesh by
+re-tuning our own marching_cubes/smoothing pipeline; round 4 sidesteps
+that pipeline entirely) but kept for the full history/reasoning trail.
+
+Thomas reported that "Preview 3D Result" (the finalize step
+in `page_scutum_review.py` -- crop/select-component/postprocess/mesh,
+see "Interactive Segment Editor threshold rework" above) visibly
+degrades an already-good, hand-tuned live segmentation: the exported
+mesh looks noticeably less precise than what the live Segment Editor
+widget shows before clicking the button.
+
+**Root cause, confirmed by code inspection (not yet independently
+disproven): two smoothing steps run between the live segmentation and
+the exported mesh, both originally tuned for cleaning up automated-
+threshold noise, neither appropriate for a mask the surgeon already
+hand-refined via live Threshold/Paint/Erase:**
+1. `postprocess.smooth_boundary()` — 2 rounds of binary morphological
+   closing+opening (voxel-level).
+2. `mesh_export._verts_faces_to_trimesh()`'s Laplacian smoothing —
+   `MESH_SMOOTHING_ITERATIONS=15` (vertex-level), applied unconditionally
+   to every mesh from every pipeline (pinna and scutum both), not scutum-
+   specific.
+
+**Round 1 (shipped, real-Slicer confirmed PARTIALLY): disabled step 1
+entirely for scutum, reduced step 2's iteration count.** Added
+`smooth: bool = True` to `postprocess.run_full_postprocess()` (default
+preserves existing behavior everywhere else; scutum's finalize call
+passes `smooth=False`) and a `smoothing_iterations` parameter to
+`mesh_export.label_map_to_mesh()` (default `MESH_SMOOTHING_ITERATIONS`;
+scutum passes a new `config.SCUTUM_MESH_SMOOTHING_ITERATIONS`, first set
+to 2 — matching `smooth_boundary()`'s own "intentionally mild" count).
+**Real-Slicer result**: shape preserved much better, but Thomas reported
+the mesh now looks "too blocky" — 2 iterations of Laplacian isn't enough
+to hide marching_cubes' voxel-grid staircase terracing.
+
+**Round 2 (shipped, real-Slicer confirmed WORSE — a genuine regression,
+reverted in round 3):** tried `trimesh.smoothing.filter_taubin()`
+(alternating shrink/inflate passes, the textbook fix for Laplacian's
+staircase-vs-shrinkage tradeoff) at 8 iterations instead of plain
+Laplacian, based on a synthetic hollow-shell-with-thin-ridge test
+(scratchpad, not committed) showing Taubin's behavior was more stable
+across iteration counts than Laplacian's. **Real-Slicer result: WORSE on
+both axes** — Thomas reported it was "still very blocky" AND "somehow
+made it the wrong shape too." **Lesson, important**: both Laplacian and
+Taubin operate on mesh VERTICES after marching_cubes has already snapped
+the surface to the voxel grid — moving vertices around after the fact
+can only trade blockiness against shape distortion on the same knob,
+never fix both at once, regardless of which vertex-smoothing algorithm
+is used. The synthetic test's inconclusive/noisy numbers (all vertex-
+smoothing configs tried — Laplacian, Taubin, Humphrey — scored within
+noise of each other) should have been a stronger warning sign than it
+was treated as at the time.
+
+**Round 3 (shipped, NOT YET real-Slicer tested — this is where the next
+session picks up): structurally different approach — blur the MASK
+before marching_cubes, not the mesh after.** New
+`mesh_export.label_map_to_mesh(..., mask_blur_sigma_mm=...)`: casts the
+label image to float, runs `sitk.SmoothingRecursiveGaussian` (physical mm
+sigma) BEFORE marching_cubes, then extracts the isosurface from the
+blurred continuous field at the same `level=0.5` — recovers genuine
+sub-voxel surface position (same idea as
+`mesh_export.label_map_to_mesh_subvoxel()`, but works without a single
+known threshold value, so it's safe for Paint/Erase-edited masks). Safe
+by construction against the "reopens what postprocessing closed" concern
+`label_map_to_mesh_subvoxel()` had to guard against (see "Improving Canal
+Segmentation" below): this blurs only the mask's own already-decided
+material, never the original intensity field, so it can't reintroduce
+anything postprocessing already excluded. Scutum's finalize call now
+uses `smoothing_iterations=0` (no vertex-space smoothing at all —
+deliberately, to remove that variable entirely after round 2's
+regression) plus `mask_blur_sigma_mm=config.SCUTUM_MESH_MASK_BLUR_SIGMA_MM`
+(0.6mm).
+
+**Validation so far (synthetic + one real-code smoke test, NOT real
+Slicer)**: same hollow-shell-with-thin-ridge synthetic geometry as
+round 2's test, at 0.4mm spacing / 2mm wall thickness. At sigma=0.6mm
+this approach beat every vertex-smoothing method tried (Laplacian,
+Taubin, Humphrey) on BOTH staircase-removal AND real-ridge-preservation
+SIMULTANEOUSLY — not just a different point on the same tradeoff curve —
+the first synthetic result in this whole saga to actually show that. Too
+little sigma (≤0.4mm here) barely helped staircase; too much (≥0.8mm)
+started eroding real detail and even made terracing WORSE (the wall's
+two surfaces blurring into each other). Also ran a smoke test of the
+actual shipped `mesh_export.label_map_to_mesh()` code path (not just the
+standalone synthetic script) against a synthetic `sitk.Image` — confirmed
+it runs without error, produces a watertight mesh, and volume shifts by
+under 3%.
+
+**Honest caveats, not yet resolved:**
+- 0.6mm was tuned against a 2mm-thick synthetic wall at 0.4mm spacing.
+  Real scans vary in both wall thickness and native spacing — if a
+  particular scan's wall is much thinner, or spacing much finer/coarser,
+  this sigma may need adjusting. `config.SCUTUM_MESH_MASK_BLUR_SIGMA_MM`
+  is the one constant to revisit if so.
+- This is the THIRD attempt at this specific problem in one day, and the
+  second one (Taubin) was confidently reasoned about, synthetically
+  tested, and still came out worse on the real scan. Don't report this as
+  "fixed" to Thomas until he's actually re-run "Preview 3D Result" and
+  confirmed it — ask directly, the same way prior rounds were confirmed
+  or refuted.
+- **Next session, concretely**: ask Thomas to click "Preview 3D Result"
+  again on the same scan/segmentation he's been testing with, and report
+  specifically (a) is the blockiness gone or reduced, (b) does the shape
+  now match what the live Segment Editor showed before finalizing. If
+  either is still wrong, the next lever to consider is
+  `SCUTUM_MESH_MASK_BLUR_SIGMA_MM` (try smaller if still blocky in a
+  different way than before, larger if under-smoothed) — NOT a return to
+  vertex-space smoothing, which has now failed twice on this exact
+  problem.
+
+  (Superseded by round 4 below before this was ever real-Slicer tested —
+  Thomas asked to explain the finalize pipeline for a fresh look instead,
+  which led to round 4's different diagnosis.)
+
+**Round 4 (shipped 2026-07-31, later same day — NOT yet real-Slicer
+tested, this is where the next session picks up): root cause reframed
+entirely, and the whole crop/postprocess/marching_cubes rebuild replaced
+with reusing Slicer's own already-good mesh.** Asked to explain the
+finalize pipeline from scratch (fresh eyes, not another blind constant
+retune), which surfaced something rounds 1-3 never questioned: **why does
+the live Segment Editor view look good, but the finalized mesh doesn't,
+when both supposedly come from "the same segmentation"?**
+
+Checked against Slicer's own source (`vtkBinaryLabelmapToClosedSurfaceConversionRule.cxx`,
+via WebFetch, not assumed from memory — this project's established
+practice, see [[feedback_verify_before_trusting_apis]]): the live 3D view
+is Slicer's own auto-generated closed surface,
+`vtkDiscreteFlyingEdges3D` → `vtkWindowedSincPolyDataFilter` at Slicer's
+default smoothing factor 0.5. The old finalize step, meanwhile, re-derived
+a COMPLETELY SEPARATE mesh — `ExportVisibleSegmentsToLabelmapNode` →
+crop → component-select → `postprocess.run_full_postprocess()` →
+`mesh_export.label_map_to_mesh()`'s own `skimage.measure.marching_cubes`
++ mask-blur/vertex-smoothing (rounds 1-3's tuning target). **Two
+genuinely different meshing/smoothing algorithms running on
+similar-but-not-identical voxel data** — this is why 3 rounds of tuning
+constants on OUR OWN pipeline never converged on what Slicer's pipeline
+already looked like: rounds 1-3 were all tuning the wrong variable.
+
+Also directly answered a natural follow-up question (is the labelmap
+export itself lossy?) rather than leaving it assumed: **no** —
+`ExportVisibleSegmentsToLabelmapNode` is not resampling/requantizing
+anything. Segment Editor's Threshold/Paint/Erase effects already edit a
+binary labelmap directly as their native representation, at
+`state.volume_node`'s own resolution (no oversampling factor is
+configured anywhere on this page) — exporting it is a plain data copy.
+The mismatch was always downstream of that, in which algorithm turns the
+(identical) voxels into a surface.
+
+**Fix implemented**: finalize now pulls the segmentation's OWN
+closed-surface mesh directly, via `ExportVisibleSegmentsToModels`
+(confirmed via Slicer's script-repository docs, alongside
+`ExportAllSegmentsToModels`, to return model nodes in world/RAS
+coordinates — deliberately NOT `GetClosedSurfaceRepresentation()`
+directly, which those same docs say returns the segmentation node's own
+internal coordinate system and would need a manual parent-transform
+correction, not worth the risk on a project with this much RAS/LPS
+history). New `page_scutum_review.py` methods:
+`_export_segment_as_trimesh()` (Slicer/VTK-facing: exports via a
+temporary subject-hierarchy folder + model node, converts the polydata to
+`trimesh.Trimesh` via `_polydata_to_trimesh()`, cleans up the temp nodes)
+and, in `core/mesh_export.py` (Slicer-independent, synthetic-testable):
+`crop_mesh_to_vertex_mask()` (mesh-space equivalent of the old
+`label_array & roi_array` intersection — keeps only faces whose 3
+vertices all pass `roi_crop.points_inside_roi()`, a new function factored
+out of `build_roi_mask()`'s inside-test closure so both the voxel and
+mesh paths share identical cylinder-ROI math) and
+`select_mesh_component_nearest_axis()` (mesh-space equivalent of
+`segment_threshold._closest_component_to_axis_line()` — splits into
+connected components via `trimesh.split()`, keeps the one whose vertex
+mean is closest to the canal axis line).
+
+**EXPERIMENTAL, Thomas's explicit call**: this also means
+`postprocess.run_full_postprocess()` no longer runs AT ALL for scutum
+finalize — no speck removal, no hole filling, and critically no
+`close_small_tunnels()` (this region is "genuinely tube-shaped" per
+`TUNNEL_CLOSING_RADIUS_MM`'s own comment, i.e. prone to real topological
+handles — exactly the failure mode the 8-round Isolate Patch saga fought
+to fix, and `page_scutum_draw.py` feeds this exact mesh into the same
+`mesh_isolate.isolate_surface_patch()` flood-fill engine). I flagged this
+risk explicitly before implementing (offered a lower-risk alternative:
+keep the existing voxel pipeline including `close_small_tunnels()`
+unchanged, and only swap the FINAL step to push the cleaned mask through
+a temp segmentation node so Slicer's own converter meshes it — smaller
+diff, same benefit, no topology risk). **Thomas's call: skip postprocess
+entirely anyway** — his reasoning is that hole/speck/tunnel cleanup may
+not matter here since this mesh only needs to accurately depict the
+scutum, not be a polished/watertight display asset, and he'd rather test
+this empirically on the draw page than assume it'll be a problem.
+
+**Validation so far**: synthetic-only (scratchpad, not committed) —
+confirmed `roi_crop.points_inside_roi()` produces bit-for-bit identical
+results to `build_roi_mask()`'s voxel test on the same geometry (pure
+refactor, no behavior change to the existing voxel path), and confirmed
+`crop_mesh_to_vertex_mask()` + `select_mesh_component_nearest_axis()`
+correctly reject an unrelated far-away blob and correctly pick the
+TRULY-closest of two components near the axis (not just the first one
+found) on synthetic multi-component meshes. This validates the new
+mesh-space math is correct — it does NOT validate real-scan mesh quality
+or the topology/Isolate-Patch question, which per this project's own
+repeated lesson ([[feedback_synthetic_tests_limits]]) only a real-Slicer
+test can answer.
+
+**Next session, concretely — two separate things to ask Thomas to
+check, in this order:**
+1. Click "Preview 3D Result" on a real scan/segmentation. Does the
+   finalized mesh now visually match the live Segment Editor view (the
+   original complaint this whole thread started from)? This is the part
+   round 4's fix directly targets and should be strong evidence for.
+2. **Separately**, go to the scutum draw page and actually run Isolate
+   Patch on that finalized mesh. Does it work normally, or does it hit
+   `LoopDoesNotSeparateError` / need the fallback-retry path / behave
+   differently than it used to? This is the deliberately-untested risk
+   from skipping postprocess — don't assume it's fine just because step 1
+   looked good, they're testing different things. If Isolate Patch
+   breaks, the fallback is porting tunnel-closing-equivalent cleanup to
+   mesh space (e.g. `trimesh.repair.fill_holes()`, which
+   `mesh_export._verts_faces_to_trimesh()` already uses unconditionally
+   for the OLD marching_cubes-based meshes — notably, round 4's new mesh
+   path never calls this either, another piece of the "skip postprocess"
+   experiment, not an oversight), NOT reverting to the labelmap-based
+   approach (that would bring back the original mesh-quality mismatch
+   this round exists to fix).
+
 ---
 
 ## Improving Canal Segmentation
@@ -992,7 +1471,12 @@ outcomes, twice, in opposite directions.
 **Shipped, confirmed working:**
 
 - **Seed-based threshold calibration** (`core/threshold_seeds.py`,
-  optional). Surgeon clicks 3 points (air lumen / bone / soft tissue);
+  optional). *As originally shipped* (this bullet describes that original
+  design; see "Calibration-seed cleanup" under "Interactive Segment
+  Editor threshold rework" below for how this was reworked 2026-07-31 --
+  the 3 points are no longer all on this page, `calibrate_thresholds()`
+  no longer exists, and the mechanism for the skin/air side changed twice
+  in one day): surgeon clicks 3 points (air lumen / bone / soft tissue);
   `calibrate_thresholds()` samples the same smoothed field thresholding
   itself sees and pre-fills the review page's air/bone sliders —
   `soft_tissue_seed` anchors both boundaries (air/tissue split and
@@ -1578,15 +2062,17 @@ don't.
    `slicer.app.processEvents()` (scratchpad, not committed), NOT yet
    against Slicer's real Qt/VTK event loop. If "Not Responding" still
    appears after this fix, that's the first thing to re-examine.
-5. (2026-07-30) `page_scutum_review.py`'s embedded `qMRMLSegmentEditorWidget`
-   -- see "Interactive Segment Editor threshold rework": instantiating the
-   widget class directly and inserting it into a scripted module's own
-   `.ui` layout (rather than reusing the SegmentEditor module's singleton
-   instance), `setEffectNameOrder`/`unorderedEffectsVisible` to curate the
-   effect list, and driving the Threshold effect via `effect.setParameter
+5. ~~(2026-07-30) `page_scutum_review.py`'s embedded `qMRMLSegmentEditorWidget`~~
+   **CONFIRMED working (2026-07-30, same day)** -- see "Interactive
+   Segment Editor threshold rework": instantiating the widget class
+   directly and inserting it into a scripted module's own `.ui` layout
+   (rather than reusing the SegmentEditor module's singleton instance),
+   `setEffectNameOrder`/`unorderedEffectsVisible` to curate the effect
+   list, and driving the Threshold effect via `effect.setParameter
    ("MinimumThreshold"/"MaximumThreshold", ...)` + `effect.self().onApply()`
-   are all unconfirmed against this project's real Slicer install. This is
-   the single biggest untested surface in the codebase right now.
+   all function in practice, not just per-docs. (Some unspecified
+   interface complaints remain -- see "Current status" above -- but the
+   core API surface itself is confirmed, not untested.)
 
 ---
 

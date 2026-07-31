@@ -35,16 +35,9 @@
     </widget>
    </item>
    <item>
-    <widget class="QLabel" name="calibrationStepProgressLabel">
-     <property name="text">
-      <string>Optional calibration: 0 of 3</string>
-     </property>
-    </widget>
-   </item>
-   <item>
     <widget class="QLabel" name="calibrationInstructionLabel">
      <property name="text">
-      <string>Optional: click 3 points (air, bone, soft tissue) to auto-fill the starting threshold.</string>
+      <string>Optional: click a point on solid bone near the ear canal to help auto-fill the starting threshold (combines with the soft-tissue point from the Pinna Segmentation page).</string>
      </property>
      <property name="wordWrap">
       <bool>true</bool>
@@ -61,7 +54,7 @@
    <item>
     <widget class="QPushButton" name="redoCalibrationButton">
      <property name="text">
-      <string>Redo Calibration Points</string>
+      <string>Redo Calibration Point</string>
      </property>
     </widget>
    </item>

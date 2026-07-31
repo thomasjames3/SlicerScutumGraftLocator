@@ -359,24 +359,39 @@ DARK_SHEETNESS_INTENSITY_MARGIN_HU = 150.0
 # Stage A: seed-based threshold calibration (optional convenience)
 # ---------------------------------------------------------------------------
 #
-# DEFAULT_AIR_THRESHOLD/DEFAULT_BONE_THRESHOLD above are one fixed HU pair
-# used for every patient/scanner. A synthetic 150-patient experiment (run
-# against the real segment_threshold.segment_bone_wall() function, varying
-# per-patient HU calibration drift, noise, blur, and anatomy) found that
-# deriving both thresholds instead from 3 quick surgeon seed-clicks (air
-# lumen / bone / general soft tissue -- see core/threshold_seeds.py) raised
-# mean Dice from 0.599 to 0.650, and the improvement roughly doubled
-# specifically under simulated scanner HU drift vs. a no-drift control --
-# confirming this really corrects inter-scan calibration drift, not just
-# averages out noise. This is optional: the review page's sliders remain
-# the actual source of truth, and seed calibration only pre-fills their
-# starting values (see page_scutum_review.py).
+# DEFAULT_BONE_THRESHOLD above is one fixed HU value used for every
+# patient/scanner. A synthetic 150-patient experiment (run against the
+# real segment_threshold.segment_bone_wall() function, varying per-patient
+# HU calibration drift, noise, blur, and anatomy) found that deriving it
+# instead from 2 quick surgeon seed-clicks (bone / general soft tissue --
+# see core/threshold_seeds.py) raised mean Dice from 0.599 to 0.650, and
+# the improvement roughly doubled specifically under simulated scanner HU
+# drift vs. a no-drift control -- confirming this really corrects
+# inter-scan calibration drift, not just averages out noise. This is
+# optional: the review page's slider remains the actual source of truth,
+# and seed calibration only pre-fills its starting value.
+#
+# The bone/soft-tissue calibration points are placed on two different
+# pages: the soft-tissue point is placed on the PINNA REVIEW page (it
+# doubles as one half of the calibration input for that page's own
+# skin/air threshold -- see core/threshold_seeds.calibrate_skin_
+# threshold(), which pairs it with a separate air point also placed
+# there), and carried forward to also calibrate the bone threshold here
+# on the SCUTUM REVIEW page, where the bone point is placed. One
+# soft-tissue click, reused by both pages, instead of asking for it
+# twice -- see core/threshold_seeds.py's module docstring for the full
+# reasoning, including why a THIRD point (an air-lumen click, alongside
+# the bone click) that used to also be placed here was removed 2026-07-31
+# (page_scutum_review.py's Segment-Editor rework, 2026-07-30, made the
+# air_threshold it fed genuinely unused -- sampled and discarded every
+# time) -- not to be confused with the separate air point now placed on
+# the pinna review page instead, which IS used.
 
 # Minimum plausible difference (in Hounsfield-Unit-like intensity) between
 # the bone seed and soft-tissue seed's sampled values. If the difference is
 # smaller than this, one of the two clicks probably landed in the wrong
 # place (most likely the "bone" click actually landed on soft tissue) --
-# core/threshold_seeds.check_seed_plausibility() uses this to show an
+# core/threshold_seeds.check_bone_soft_tissue_plausibility() uses this to show an
 # advisory warning (not a hard block; the surgeon can still proceed and
 # manually adjust the sliders afterward). Set well below a typical
 # bone-vs-soft-tissue HU gap (hundreds of HU) so this only fires on a
@@ -443,6 +458,54 @@ TUNNEL_CLOSING_RADIUS_MM = 2.0
 # Mesh smoothing iterations applied before STL export. Higher = smoother
 # but less true to the raw voxel boundary.
 MESH_SMOOTHING_ITERATIONS = 15
+
+# Scutum-specific overrides, passed to mesh_export.label_map_to_mesh() only
+# by page_scutum_review.py's finalize step. That mask comes from the
+# surgeon's own live Threshold/Paint/Erase edits (already precise, not raw
+# automated-threshold noise), so the full 15-iteration Laplacian default was
+# measurably rounding off detail the surgeon had just dialed in (2026-07-31
+# regression report: "preview 3d result" visibly degraded a good hand-tuned
+# segmentation).
+#
+# History (all 2026-07-31, same day):
+# 1. Dropped iterations to 2 (matching smooth_boundary()'s own
+#    "intentionally mild" count elsewhere in this file) -- confirmed on a
+#    real scan to preserve shape much better, but too blocky (raw
+#    marching-cubes voxel-grid terracing, barely smoothed).
+# 2. Switched to smoothing_method="taubin" (alternating shrink/inflate
+#    passes, the standard fix for staircase-vs-shrinkage) at 8 iterations,
+#    based on a synthetic hollow-shell-with-thin-ridge test showing
+#    Taubin's behavior was more stable across iteration counts than plain
+#    Laplacian's. **Confirmed WORSE on a real scan** -- still blocky AND
+#    now a visibly wrong shape. Both Laplacian and Taubin operate on mesh
+#    VERTICES after marching_cubes has already snapped the surface to the
+#    voxel grid -- moving vertices around after the fact is fundamentally
+#    the wrong tool to recover sub-voxel positioning; it can only trade
+#    blockiness against shape distortion on the same knob, never fix both.
+# 3. Replaced vertex-space smoothing with mask_blur_sigma_mm (see below) --
+#    a structurally different approach that blurs the MASK before
+#    marching_cubes instead of the mesh after. A synthetic test (same
+#    hollow-shell-with-ridge geometry) found this beats every vertex-space
+#    method (plain Laplacian, Taubin, Humphrey) tried, on BOTH staircase
+#    removal AND real-detail preservation simultaneously -- not just a
+#    different tradeoff point on the same curve. iterations dropped to 0
+#    (fully disabled) so no vertex-space shape risk remains; the mask blur
+#    alone handled the synthetic staircase about as well as blur+light-
+#    Taubin combined did, so there's little left for vertex smoothing to
+#    usefully add. Not yet real-Slicer re-tested.
+SCUTUM_MESH_SMOOTHING_ITERATIONS = 0
+
+# Sigma (physical mm) for the pre-marching-cubes mask blur described above
+# (mesh_export.label_map_to_mesh(mask_blur_sigma_mm=...)). 0.6mm was the
+# synthetic sweet spot for a 2mm-thick wall at 0.4mm native spacing (~1.5x
+# spacing) -- clearly better than 0.4mm (undersmoothed, staircase_rms
+# 0.061mm) and clearly worse than 0.8mm+ (oversmoothed: staircase_rms rose
+# again to 0.073mm at 0.8mm and 0.136mm at 1.0mm as the wall's two
+# surfaces started blurring into each other, and real-ridge retention
+# dropped below 1.0 -- genuine erosion). Real scans vary in wall thickness
+# and native spacing, so this may need adjusting if a particular scan's
+# wall is thinner than ~3x this sigma. Not yet real-Slicer tested.
+SCUTUM_MESH_MASK_BLUR_SIGMA_MM = 0.6
 
 # mesh_export.label_map_to_mesh_subvoxel() extracts the scutum bone-wall
 # mesh from the actual smoothed grayscale field near the mask boundary,
