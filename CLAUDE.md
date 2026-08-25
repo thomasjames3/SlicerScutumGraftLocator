@@ -32,6 +32,53 @@ coordinates, one-time dependency install, plain-language instructions.
 
 ## Current status
 
+**One active, unconfirmed thread to pick up first in a new session:**
+1. **Scutum finalize mesh quality, round 4** — see below, unchanged from
+   before.
+
+**Pinna mesh anisotropy tear (2026-08-22, resolved 2026-08-25) —
+confirmed fixed on Thomas's first real failing scan, but he still wants
+to test more scans before fully closing this out; treat as
+provisionally resolved, not yet a closed issue.** Full trail in "Pinna
+mesh decimation topology bug" below. Short version: a real scan at
+extreme Z-anisotropy (0.39/0.39/2.5mm, ~6.4:1 ratio, only 32 slices) was
+tearing a genuinely single-connected voxel mask into a non-watertight,
+multi-component mesh. The first fix (upsample the coarse axis right
+before `marching_cubes`, when the ratio exceeds `config.
+MESH_MAX_ANISOTROPY_RATIO = 2.0`) fired correctly but **was not enough
+on its own** -- a per-component diagnostic added afterward showed the
+2nd component was a real torn-off piece of anatomy (188 verts, 18mm²,
+its own fully watertight sub-mesh), not decimation-style debris, so it
+couldn't just be dropped. Thomas independently confirmed the actual
+mechanism by manually resampling the whole scan to isotropic *before*
+running the pipeline and getting a correct result -- proving the fix
+needed to happen much earlier than just before meshing, since
+thresholding/connected-components/spike-removal/`postprocess`'s own
+voxel-radius-based morphology were all still running on the
+badly-anisotropic native grid first. **Real fix shipped**: new
+`io_utils.resample_to_bounded_anisotropy()` (same "only intervene once
+anisotropic enough, then resample fully to isotropic" logic, generalized
+to also handle grayscale intensity data, not just binary masks) is now
+called as early as possible in each of the 3 pinna pipeline flows --
+right after the coarse crop for a fresh segmentation, right after
+pulling the labelmap for a Segment-Editor-edited or Isolate-Patch-
+fallback re-derive -- instead of only once, right before
+`marching_cubes`. Deliberately did NOT switch to always-resample-every-
+scan-to-a-fixed-spacing (Thomas recalled an earlier version of this
+program did that and got worse results) -- this only ever touches a scan
+that's already badly anisotropic; an already-near-isotropic scan is
+untouched. **First real-Slicer re-test (2026-08-25): Thomas reports the
+result is "much better."** Still open: more scans need testing before
+this is fully confirmed general -- until then, leave the TEMPORARY
+diagnostic prints and the forced-visible `restartSlicerButton` in place
+(see "Known open issues" item 6).
+
+An EARLIER, separate real bug was also found and fixed in the same
+investigation (decimation corrupting thin folded anatomy) -- genuinely
+real, kept, synthetically confirmed -- but turned out NOT to be what
+Thomas was seeing on his test scan (decimation no-opped there). Don't
+confuse the two fixes.
+
 Entire scutum and pinna pipelines confirmed working end-to-end in real
 Slicer as of 2026-07-28/29: DICOM load → scutum landmarks → pinna
 landmarks/review/draw → scutum review/draw → (Verify, Curvature not yet
@@ -194,7 +241,7 @@ EarReconstructionPlanner/
 │   ├── wizard_state.py               # WizardState dataclass + PAGE_ORDER (source of truth for page order)
 │   ├── curvature_integration.py      # in-process bridge to core/curvature/
 │   ├── core/                         # Slicer-independent, unit-testable
-│   │   ├── io_utils.py               # DICOM/volume load; flip_ras_lps(); resample_to_isotropic() unused
+│   │   ├── io_utils.py               # DICOM/volume load; flip_ras_lps(); resample_to_isotropic() unused; resample_to_bounded_anisotropy() (pinna anisotropy fix)
 │   │   ├── landmarks.py              # EarCanalLandmarks (2pt), validate()
 │   │   ├── pinna_landmarks.py        # PinnaLandmarks (1pt + side)
 │   │   ├── roi_crop.py               # ROI mask + MANDATORY coarse-crop-first (memory)
@@ -916,6 +963,326 @@ no background thread here), but shortens the worst-case gap between UI
 updates by more than half.
 
 Not yet real-Slicer tested.
+
+---
+
+## Pinna mesh decimation topology bug (2026-08-22)
+
+**Status: fix shipped, synthetically confirmed, NOT yet real-Slicer
+tested -- ask Thomas to re-run the same scan/threshold he reported this
+on and confirm before considering this closed.**
+
+Thomas reported (after a break, first session back) that pinna
+segmentation was giving "much less accurate" results than before, on the
+*same scan and same threshold value* -- described specifically as: the
+basic pinna shape is present, but low resolution, with many holes/chunks
+missing (not spiky). He'd tried both setting the threshold via the
+calibration points and typing/dragging the slider directly and got
+similar bad results either way -- a strong signal the bug was downstream
+of thresholding entirely, not a calibration/threshold issue.
+
+**Root cause, confirmed via synthetic test (scratchpad, not committed) --
+not a guess:** `mesh_export.decimate_to_target_resolution()` (shipped
+2026-07-30, see "Pinna segmentation performance" above) calls
+`trimesh.simplify_quadric_decimation()` (backed by `fast_simplification`)
+with no repair pass afterward. That function's original validation only
+checked nearest-surface DISTANCE accuracy on a simple rounded blob shape
+-- never watertightness, and never a shape with a thin curled fold like
+the pinna's own helix. Built a synthetic "pinna-like" label volume (a
+main lobe + a thin curled ridge ~4 voxels thick, mimicking a helix fold,
+at fine native spacing matching real scans Thomas has reported) and ran
+the actual shipped code path: the mesh coming OUT of marching_cubes was
+clean (watertight=True, 2 sensible connected components: lobe + ridge).
+After `decimate_to_target_resolution()`, the SAME mesh came out
+`is_watertight=False`, fragmented into 5 components -- the 2 real ones
+plus 3 new degenerate 3-vertex slivers carved off the thin ridge by the
+decimation algorithm. A sliver separating from the surface leaves a real
+gap behind -- exactly Thomas's "holes/chunks missing" description, and
+it happens regardless of the threshold value used, matching his own
+observation.
+
+**Fix**: new `mesh_export._repair_decimation_fragments()`, called at the
+end of `decimate_to_target_resolution()` -- splits the decimated mesh
+into connected components, drops any component smaller than
+`config.DECIMATION_FRAGMENT_MIN_TRIANGLES` (20) "target-sized" triangles
+(relative to `PINNA_MESH_TARGET_EDGE_MM`, not a fixed absolute vertex/
+area count, so it scales with target density instead of needing
+re-tuning per scan resolution -- same lesson this project already
+learned once with `SHEET_ENHANCEMENT_SCALE_MULTIPLIERS`), then runs
+`trimesh.repair.fill_holes()`. Safe to drop these fragments specifically
+because the mesh going INTO decimation is already clean --
+`postprocess.remove_small_specks()` already removed any genuinely small
+segmented tissue in voxel space, well before meshing -- so anything this
+small appearing only AFTER decimation is provably decimation debris, not
+real anatomy that slipped through.
+
+**Re-validated on the real shipped function** (not just the standalone
+scratchpad copy) on two geometries -- the original 4-voxel-thick ridge
+and a much thinner, harder 2-voxel-thick ridge: both came back
+`is_watertight=True` post-decimation with the same euler number as
+before decimation, and the ridge component itself preserved (thousands
+of vertices, not dropped) in both cases -- not just the garbage
+fragments.
+
+**Not yet real-Slicer tested** -- per this project's own repeated lesson
+([[feedback_synthetic_tests_limits]]), a synthetic topology test can
+confirm the mechanism and that the fix doesn't regress a clean case, but
+only Thomas re-running the actual scan he reported this on can confirm
+it's actually fixed in practice. Next session: ask him to re-run pinna
+segmentation on that same scan/threshold and check whether the
+holes/missing chunks are gone and resolution looks normal again.
+
+**First real-Slicer attempt (2026-08-22, same day): "looks exactly the
+same" -- not yet explained.** Thomas re-ran the scan and reported no
+visible change at all. Since a fix that changes nothing visually usually
+means it isn't actually running, added TEMPORARY `[mesh_export diag]` /
+`[pinna diag]` prints (see `core/mesh_export.py`: one at module-import
+time confirming `__file__`, three per call inside
+`decimate_to_target_resolution()`/`_repair_decimation_fragments()`
+showing real vert/face/watertight/component counts at each stage) --
+same stale-code-suspicion pattern as the sheetness feature's "is the code
+even being applied?" moment. **Not yet checked** -- next step is asking
+Thomas to fully restart Slicer, re-run the same scan, and paste the
+console output. All 3 call sites
+(`page_pinna_review.py` Run + Segment-Editor-refresh,
+`page_pinna_draw.py`'s fallback mesh) confirmed still wired to call this
+exact function, so the diagnostic will fire regardless of which path he
+used. Remove these prints (and the temporarily-forced-visible
+`restartSlicerButton` below) once this is resolved either way.
+
+**`page_setup.py`'s `restartSlicerButton` temporarily forced visible
+(2026-08-22)**: normally auto-hidden once `dependencies.
+check_missing_packages()` finds nothing missing (see "Restart Slicer
+button" under "Wizard/Slicer-specific notes" below for why it's hidden by
+default) -- Thomas asked for it back purely to speed up the repeated
+restart-and-retest cycle this diagnostic requires. `_refresh_status()`'s
+`if not missing:` branch now hard-codes `setVisible(True)` instead of
+`False`, clearly commented as temporary. **Revert this (restore the
+`False`) once the diagnostic-print testing above wraps up** -- it's not a
+bug fix, just a convenience for this specific testing session, and the
+original hidden-when-nothing-missing behavior is still the right default
+for a returning surgeon.
+
+**Real console output came back (2026-08-22, same day): decimation
+confirmed NOT the culprit on this scan -- the mesh was already broken
+before decimation ever ran.** Thomas's `[pinna diag]`/`[pinna timing]`
+output showed `decimate_to_target_resolution() called: ... watertight=False
+components=2` immediately followed by `no-op (mesh already coarser than
+target)` -- i.e. the fix shipped above never even executes on this scan,
+because `label_map_to_mesh()`'s own output (63,727 verts) is already at
+or below `PINNA_MESH_TARGET_EDGE_MM`'s target density. The non-watertight,
+2-component mesh is present BEFORE decimation touches it, so the fix,
+while a real and independently-confirmed bug (see above), is not what
+Thomas is seeing when he says "looks exactly the same."
+
+**New, stronger lead from the same console output**: this scan's spacing
+is `(0.390625, 0.390625, 2.5)mm` -- only 32 axial slices, 2.5mm apart.
+Every previously-tested real scan in this project's history was
+near-isotropic (0.173-0.5mm on every axis); this is the first real run on
+a scan this coarse/anisotropic in Z. Prime suspect: something in
+`segment_pinna_threshold.segment_pinna_region()` (component selection +
+`_remove_boundary_spike`) or `postprocess.run_full_postprocess()`
+(`remove_small_specks`/`fill_holes`/`smooth_boundary`) is turning a
+single selected component into 2 disconnected pieces somewhere along the
+way -- by construction, `segment_pinna_region()`'s own component
+selection (`region_mask_array = (labeled_array == best_component_id)`)
+and `_remove_boundary_spike()`'s post-opening re-selection both guarantee
+a single component going OUT of that function, so if the count is already
+>1 there, something is genuinely surprising; more likely it's introduced
+in `run_full_postprocess()`.
+
+**One specific theory tested and REJECTED, don't re-suggest**:
+suspected `postprocess.smooth_boundary()`'s fixed `[1,1,1]`-voxel
+`BinaryMorphologicalClosing`/`Opening` radius would behave far more
+aggressively along Z on this scan (a "1 voxel" radius = ~2.5mm of real
+physical reach in Z vs ~0.39mm in X/Y), possibly severing a thin
+anatomical bridge that's only 1-2 voxels thick in Z. Directly tested
+(scratchpad, not committed): built a synthetic two-lobe-plus-thin-bridge
+geometry at both this scan's real anisotropic spacing and an isotropic
+control, ran the actual `smooth_boundary()` on both. **Identical results
+in both cases, bridge survived intact in both** -- confirmed
+`sitk.BinaryMorphologicalClosing`/`Opening`'s radius parameter is defined
+in voxel counts, not physical mm, and is completely blind to
+`Image.GetSpacing()`. This specific mechanism doesn't apply; the real
+cause is still unknown.
+
+**Diagnostics added to find it for real (2026-08-22, TEMPORARY, remove
+once found)**: `page_pinna_review.py` now has a `_diag_component_count()`
+helper (voxel-space, 6-connectivity, same convention as
+`segment_pinna_threshold._label_6_connected`) printing `[pinna diag]
+component count after <stage>` at 3 checkpoints inside
+`_run_segmentation_pipeline()`: right after `segment_pinna_region` (which
+includes spike removal), right after `run_full_postprocess`, and right
+after `crop_to_own_bounding_box`. **Next session: ask Thomas to re-run
+the same scan and paste the console output** -- whichever checkpoint
+first shows >1 components pinpoints the culprit directly, rather than
+guessing again. If all three checkpoints show 1 (i.e. the voxel data
+stays a single connected blob the whole way through Stage A), the bug
+isn't in voxel-space postprocessing at all -- it would have to be in
+`mesh_export.label_map_to_mesh()`'s own marching_cubes + `trimesh.repair.
+fill_holes(mesh)` step, meaning marching_cubes on this scan's extreme
+Z-anisotropy is producing a topologically split mesh from a genuinely
+single-component voxel mask -- a different class of bug from anything
+checked so far, worth testing synthetically (a solid blob at this same
+0.39/0.39/2.5mm spacing run straight through `label_map_to_mesh()`)
+before touching any code.
+
+**Real console output confirmed exactly this (2026-08-22, same day):**
+Thomas's actual `[pinna diag] component count after ...` lines all read
+`1` (segment_pinna_region incl. spike removal, postprocess, tight-crop),
+then `decimate_to_target_resolution() called: ... watertight=False
+components=2` -- the input mesh to decimation was ALREADY broken, meaning
+`label_map_to_mesh()` itself is where a genuinely single-component voxel
+mask becomes a torn, 2-component mesh. **Second real data point, strongly
+corroborating**: Thomas separately tried a different scan at 0.43/0.43/
+0.5mm spacing (~1.16:1 Z:XY ratio -- near isotropic) and got normal,
+accurate results resembling prior good segmentations. The broken scan is
+0.39/0.39/2.5mm (~6.4:1 ratio). This is a clean, well-known failure mode:
+marching-cubes-family algorithms can produce topologically inconsistent
+surfaces on severely anisotropic grids. Every scan this pipeline had been
+tested on before this session was near-isotropic (0.173-0.5mm on every
+axis) -- this is the first real run on a scan this anisotropic in Z,
+which is why it never surfaced earlier.
+
+**Fix shipped**: new `max_anisotropy_ratio` parameter on `mesh_export.
+label_map_to_mesh()` -- when the label image's coarsest-axis spacing
+exceeds `max_anisotropy_ratio` times its finest-axis spacing, upsamples
+the coarse axis (linear interpolation on the mask cast to float,
+re-thresholded at 0.5 -- the standard sub-voxel-accurate way to resample
+a binary mask, same technique `mask_blur_sigma_mm` already uses for a
+different purpose) via the new `_resample_to_bounded_anisotropy()`
+helper, BEFORE marching_cubes ever sees it. Wired into all 3 pinna call
+sites (`page_pinna_review.py`'s Run + Segment-Editor-refresh,
+`page_pinna_draw.py`'s fallback mesh) via new `config.
+MESH_MAX_ANISOTROPY_RATIO = 2.0` (a starting value: comfortably below the
+~6.4:1 ratio that broke, comfortably above the ~1.16:1 ratio that
+worked -- not yet tuned against more real data points either way). Default
+parameter value is `0.0` (disabled), so every other caller (scutum) is
+completely unaffected.
+
+**Synthetic reproduction of the actual tear did NOT succeed** -- two
+attempts at building a thin curled/ribbon shape meant to mimic a real
+helix fold both had construction bugs (the "ridge" and "main lobe" ended
+up NOT touching in voxel space to begin with, an artifact of the test
+geometry, not a real finding) rather than reproducing marching_cubes
+tearing a genuinely-connected mask. Not worth further blind attempts
+right now given how strong the real-scan evidence already is (2 real
+data points, clean correlation with anisotropy ratio, exact mechanism
+matches a well-documented general failure mode). **What WAS validated
+synthetically**: the fix is safe -- no-ops correctly on near-isotropic
+spacing (confirmed at the same 0.43/0.43/0.5mm ratio as Thomas's working
+scan), doesn't regress a case that already meshed fine (a solid blob at
+the broken scan's exact 0.39/0.39/2.5mm spacing, watertight before and
+after), and when it does resample, volume changes by only 0.35% --
+negligible shape distortion.
+
+**Not yet confirmed on the actual failing scan** -- the fix is
+well-motivated and safe, but nobody has run it against Thomas's real
+broken scan yet, since the specific tear couldn't be reproduced
+synthetically to test against directly. Next session: ask Thomas to
+restart Slicer and re-run the SAME scan that showed `watertight=False
+components=2`. Watch for a new `[pinna diag] _resample_to_bounded_
+anisotropy: spacing ... -> ...` line (confirms it fired) and check
+whether `decimate_to_target_resolution() called: ...` now reports
+`watertight=True components=1` (or however many real anatomical pieces
+there should be) -- and, most importantly, whether the visible mesh
+actually looks right again in Slicer. If it's still broken, the ratio
+(2.0) is the first knob to try lowering (forces earlier/more aggressive
+resampling); if that still doesn't help, the tear may not be a pure
+anisotropy effect and needs the per-component breakdown of the broken
+mesh (vertex counts, individual watertight status per component) to
+understand what's actually happening -- not yet added as a diagnostic,
+would be the next thing to add if this fix doesn't resolve it.
+
+**Real re-test (2026-08-25): the ratio-2.0 mask-level fix fired, but
+still wasn't enough -- per-component breakdown revealed why.** Thomas
+re-ran the same scan. The resample DID trigger (`spacing (0.390625,
+0.390625, 2.4999677419354835) -> (0.390625, 0.390625, 0.78125)`), but
+`decimate_to_target_resolution() called: ...` still reported
+`watertight=False components=2`. Following this section's own
+established practice (diagnose before guessing again), added a
+per-component breakdown to that same diagnostic (vertex/face count,
+area, watertight status, bounds for each component when count > 1)
+instead of immediately trying another fix. The real numbers: component 0
+(the main lobe) was 112249 verts, 19142.71mm², **itself
+`watertight=False`** (i.e. it has a genuine hole, not just a separate
+neighbor); component 1 was 188 verts, 18.01mm², fully `watertight=True`
+on its own -- a real, physically plausible small piece of anatomy (too
+large to be a decimation-debris sliver, unlike the earlier,
+unrelated decimation-fragment bug above), not something safe to just
+drop. This ruled out reusing `_repair_decimation_fragments`-style
+drop-small-fragments logic here -- it would risk deleting real tissue.
+
+**Root cause pinned down by Thomas's own direct experiment**: he
+manually resampled the whole scan to isotropic spacing *before* running
+the pipeline (not just the mask right before meshing) and got a
+correctly-shaped result. This proved the fix needed to move much earlier
+in the pipeline -- `segment_pinna_region`'s thresholding/connected-
+components/spike-removal (`_remove_boundary_spike`'s morphological
+opening) and `postprocess.run_full_postprocess()`'s own morphology
+(`remove_small_specks`/`fill_holes`/`smooth_boundary`, all voxel-radius-
+based per this section's own earlier-confirmed finding that these
+operations are blind to physical spacing) were all still running on the
+raw 32-slice anisotropic grid before the late, mesh-only fix ever got a
+chance to help -- by the time marching_cubes saw the data, a real fold
+may already have been mis-processed by earlier steps operating on
+badly-conditioned voxels.
+
+**Fix shipped (2026-08-25), two parts:**
+1. **Made the resample itself more aggressive.** `_resample_to_bounded_
+   anisotropy`'s target spacing changed from "resample only down to the
+   trigger ratio" (`min_spacing * max_ratio`) to "resample all the way
+   to match the finest axis" (full isotropy) once triggered --
+   `MESH_MAX_ANISOTROPY_RATIO = 2.0` remains only the TRIGGER, not the
+   target, so already-near-isotropic scans are still completely
+   unaffected. On this scan, Z now goes to 0.390625mm (matching X/Y)
+   instead of stopping at 0.78125mm.
+2. **Moved the resample far earlier in the pipeline, and generalized it
+   to grayscale data.** The logic was extracted out of `mesh_export.py`
+   (where `_resample_to_bounded_anisotropy` was mask-only, threshold-
+   based) into a new shared `io_utils.resample_to_bounded_anisotropy
+   (image, max_ratio, is_label=False)` -- same trigger/target math, plus
+   an `is_label` flag: `True` casts-to-float/resamples/re-thresholds at
+   0.5 (for a binary mask, unchanged behavior), `False` does plain linear
+   interpolation on grayscale intensity data, cast back to the original
+   pixel type. `mesh_export.label_map_to_mesh()`'s own late-stage call
+   (right before `marching_cubes`) now just delegates to this shared
+   function (`is_label=True`) rather than duplicating the logic, and
+   stays in place as defense-in-depth (now usually a no-op, since the
+   volume is already isotropic by the time it gets there). The real fix
+   is 3 NEW call sites, each as early as possible in its own flow:
+   - `page_pinna_review.py`'s `_run_segmentation_pipeline()` -- resamples
+     the grayscale `coarse_cropped` volume right after the coarse crop,
+     BEFORE `build_spherical_roi_mask()`/thresholding/spike-removal/
+     postprocess ever run.
+   - `page_pinna_review.py`'s `_refresh_mesh_from_segmentation()`
+     (Segment-Editor-edited path) -- resamples the binary labelmap right
+     after pulling it from the segmentation node, before
+     `postprocess.run_full_postprocess()`.
+   - `page_pinna_draw.py`'s `_build_fallback_mesh()` (Isolate Patch
+     `LoopDoesNotSeparateError` retry path) -- same treatment as the
+     refresh path above.
+
+   Deliberately did NOT adopt the existing-but-unused `io_utils.
+   resample_to_isotropic()` (always resamples every scan to one fixed
+   absolute spacing, `TARGET_VOXEL_SPACING_MM`) -- Thomas specifically
+   recalled an earlier version of this program doing exactly that and
+   getting WORSE results, consistent with this project's own repeated
+   "implicit fixed working-resolution assumption never actually true on
+   real data" lesson (see the sheetness feature's multi-round scale-
+   calibration saga below). The shipped fix stays scan-relative
+   (only intervenes when a scan is ALREADY badly anisotropic) rather than
+   imposing one resolution on every scan.
+
+**First real-Slicer re-test (2026-08-25, same day): "much better."**
+Thomas re-ran the same previously-broken scan and confirmed a clear
+improvement -- no longer the blocky/missing-chunks look. **Provisional,
+not fully closed**: he wants to test more scans before calling this
+fully resolved, so the TEMPORARY diagnostic prints (`[mesh_export diag]`,
+`[pinna diag]` component-count checks and the resample helper's own
+print, now also present in `io_utils.py`) and the forced-visible
+`restartSlicerButton` should all stay in place until that broader
+validation completes -- see "Known open issues" item 6.
 
 ---
 
@@ -2073,6 +2440,24 @@ don't.
    all function in practice, not just per-docs. (Some unspecified
    interface complaints remain -- see "Current status" above -- but the
    core API surface itself is confirmed, not untested.)
+6. **Once the pinna anisotropy fix is confirmed across more scans: remove
+   the temporarily-forced-visible `restartSlicerButton`** (`page_setup.py`'s
+   `_refresh_status()`, added 2026-08-22 -- see "Pinna mesh decimation
+   topology bug" above for the full context). Right now it's hard-coded
+   to always show, purely to speed up Thomas's repeated restart-and-retest
+   cycle while chasing the pinna anisotropy bug. **Status as of
+   2026-08-25: the underlying fix is confirmed working on the first real
+   scan it was reported on ("much better"), but Thomas wants to test more
+   scans before calling it fully resolved** -- leave this button and the
+   diagnostics below in place until that happens. Once it's confirmed
+   general, restore the original behavior (hidden once nothing needs
+   installing, so a returning surgeon doesn't see an unexplained restart
+   option) -- change that one `setVisible(True)` back to `setVisible(False)`
+   in the `if not missing:` branch. At the same time, sweep out this
+   session's TEMPORARY markers: `[mesh_export diag]` prints in
+   `core/mesh_export.py`, `[pinna diag]` component-count checks in
+   `page_pinna_review.py`, and the `[pinna diag] resample_to_bounded_
+   anisotropy: ...` print in `core/io_utils.py`.
 
 ---
 

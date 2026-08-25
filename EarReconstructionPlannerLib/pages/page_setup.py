@@ -61,13 +61,18 @@ class SetupPage(WizardPage):
         if not missing:
             self.ui.statusLabel.setText("All set -- everything needed is already installed.")
             self.ui.installButton.setEnabled(False)
-            # No restart needed on a return visit where everything was
-            # already installed in a prior (properly restarted) session --
-            # only show this button when there's actually something to
-            # install/restart for, so returning surgeons on an
-            # already-set-up Slicer aren't confused by an unexplained
-            # restart option.
-            self.ui.restartSlicerButton.setVisible(False)
+            # Normally hidden here (no restart needed on a return visit
+            # where everything was already installed in a prior, properly
+            # restarted session -- a returning surgeon on an already-set-up
+            # Slicer shouldn't see an unexplained restart option).
+            #
+            # TEMPORARILY forced visible instead (2026-08-22) -- Thomas is
+            # mid-cycle restarting Slicer repeatedly to test the pinna
+            # decimation fix (see core/mesh_export.py's [pinna diag]
+            # prints), so the convenience outweighs the confusion risk for
+            # now. Restore the `False` line above (and delete this one)
+            # once that testing wraps up.
+            self.ui.restartSlicerButton.setVisible(True)
         else:
             names = ", ".join(spec for _, spec in missing)
             self.ui.statusLabel.setText(

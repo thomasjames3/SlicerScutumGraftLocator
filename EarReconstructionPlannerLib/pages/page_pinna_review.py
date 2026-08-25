@@ -58,6 +58,31 @@ from EarReconstructionPlannerLib import wizard_state
 from core import roi_crop, segment_pinna_threshold, postprocess, mesh_export, io_utils, threshold_seeds
 import config
 
+
+def _diag_component_count(sitk_image, label):
+    """
+    TEMPORARY (2026-08-22, remove once the mesh-fragmentation bug below is
+    found) -- reports the label array's own connected-component count
+    (voxel space, 6-connectivity, same convention as
+    segment_pinna_threshold._label_6_connected) at a named pipeline stage.
+    Added after a real-scan run showed the mesh coming OUT of
+    label_map_to_mesh() was already non-watertight with 2 components --
+    BEFORE decimate_to_target_resolution() ever touched it (it no-opped)
+    -- on a scan with unusually anisotropic spacing (0.39/0.39/2.5mm, only
+    32 slices). Bisects which upstream step (segment_pinna_region's own
+    component selection + spike removal, or postprocess's
+    remove_small_specks/fill_holes/smooth_boundary) is where a single
+    selected component first becomes multiple.
+    """
+    import SimpleITK as sitk
+    from scipy import ndimage
+    import numpy as np
+
+    array = sitk.GetArrayFromImage(sitk_image)
+    structure = ndimage.generate_binary_structure(3, 1)  # 6-connectivity
+    _, num_components = ndimage.label(array, structure=structure)
+    print(f"[pinna diag] component count after {label}: {num_components} (spacing={sitk_image.GetSpacing()})")
+
 # The 2-point calibration sequence placed on this page, in click order --
 # same shape as the old core.threshold_seeds.SEED_STEPS pattern (removed
 # 2026-07-31 when it was down to 1 point per page), but kept local here
@@ -341,6 +366,22 @@ class PinnaReviewPage(WizardPage):
         )
         print(f"[pinna timing] coarse crop: {time.time() - _t0:.2f}s (size {coarse_cropped.GetSize()})")
 
+        # Fixes a real bug found on a badly-anisotropic scan (2026-08-22/25,
+        # see CLAUDE.md "Pinna mesh decimation topology bug"): only
+        # resampling the final mask right before marching_cubes wasn't
+        # enough, because thresholding/connected-components/spike-removal/
+        # postprocess below all still ran on the badly-conditioned native
+        # grid first. Doing it here, as early as possible (before any of
+        # those steps), is what actually matched Thomas's own manual fix
+        # of resampling the whole scan to isotropic before running the
+        # pipeline. No-ops on an already-near-isotropic scan -- see
+        # io_utils.resample_to_bounded_anisotropy's docstring.
+        _t0 = time.time()
+        coarse_cropped = io_utils.resample_to_bounded_anisotropy(
+            coarse_cropped, config.MESH_MAX_ANISOTROPY_RATIO
+        )
+        print(f"[pinna timing] resample_to_bounded_anisotropy: {time.time() - _t0:.2f}s (size {coarse_cropped.GetSize()})")
+
         _t0 = time.time()
         roi_mask = self.run_blocking(
             lambda: roi_crop.build_spherical_roi_mask(
@@ -379,6 +420,7 @@ class PinnaReviewPage(WizardPage):
         )
         self.ui.progressBar.setValue(3)
         print(f"[pinna timing] segment_pinna_region TOTAL: {time.time() - _t0:.2f}s")
+        _diag_component_count(region_mask, "segment_pinna_region (incl. spike removal)")
 
         _t0 = time.time()
         region_mask = self.run_blocking(
@@ -387,6 +429,7 @@ class PinnaReviewPage(WizardPage):
         )
         self.ui.progressBar.setValue(4)
         print(f"[pinna timing] postprocess TOTAL: {time.time() - _t0:.2f}s")
+        _diag_component_count(region_mask, "postprocess.run_full_postprocess")
 
         _t0 = time.time()
         region_mask = self.run_blocking(
@@ -396,6 +439,7 @@ class PinnaReviewPage(WizardPage):
         self.ui.progressBar.setValue(5)
         print(f"[pinna timing] crop_to_own_bounding_box: {time.time() - _t0:.2f}s (size {region_mask.GetSize()})")
         print(f"[pinna timing] Stage A grand total: {time.time() - _t_total:.2f}s")
+        _diag_component_count(region_mask, "crop_to_own_bounding_box")
 
         # Push into a segmentation node (not a plain labelmap) so it's
         # something Segment Editor can actually operate on -- see the
@@ -440,7 +484,9 @@ class PinnaReviewPage(WizardPage):
         # mesh's vertices line up correctly when loaded back into Slicer.
         _t0 = time.time()
         mesh = self.run_blocking(
-            lambda: mesh_export.label_map_to_mesh(region_mask),
+            lambda: mesh_export.label_map_to_mesh(
+                region_mask, max_anisotropy_ratio=config.MESH_MAX_ANISOTROPY_RATIO
+            ),
             status_text="Building 3D surface mesh...",
         )
         self.ui.progressBar.setValue(6)
@@ -550,6 +596,16 @@ class PinnaReviewPage(WizardPage):
         sitk_image = io_utils.flip_ras_lps(sitkUtils.PullVolumeFromSlicer(temp_label_node))
         slicer.mrmlScene.RemoveNode(temp_label_node)
 
+        # Same badly-anisotropic-scan fix as _run_segmentation_pipeline()
+        # above, applied here too since this path re-derives from a
+        # hand-edited segmentation rather than going through thresholding
+        # -- postprocess's own voxel-radius-based morphology below needs
+        # the better-conditioned grid just as much. No-ops on an
+        # already-near-isotropic scan.
+        sitk_image = io_utils.resample_to_bounded_anisotropy(
+            sitk_image, config.MESH_MAX_ANISOTROPY_RATIO, is_label=True
+        )
+
         # See _on_run_clicked()/run_blocking()'s docstring in base_page.py
         # for why these run on a background thread while a progress bar
         # shows here -- this same postprocess+meshing round trip runs
@@ -574,7 +630,9 @@ class PinnaReviewPage(WizardPage):
 
             try:
                 mesh = self.run_blocking(
-                    lambda: mesh_export.label_map_to_mesh(sitk_image),
+                    lambda: mesh_export.label_map_to_mesh(
+                        sitk_image, max_anisotropy_ratio=config.MESH_MAX_ANISOTROPY_RATIO
+                    ),
                     status_text="Building 3D surface mesh...",
                 )
             except mesh_export.EmptySegmentationError:

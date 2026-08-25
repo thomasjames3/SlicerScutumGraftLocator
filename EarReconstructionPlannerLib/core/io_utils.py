@@ -139,6 +139,91 @@ def resample_to_isotropic(
     return resampler.Execute(image)
 
 
+def resample_to_bounded_anisotropy(
+    image: sitk.Image, max_ratio: float, is_label: bool = False
+) -> sitk.Image:
+    """
+    Upsamples the coarsest axis/axes of `image` so no axis's spacing
+    exceeds max_ratio times the finest axis's spacing, giving downstream
+    steps (thresholding, connected components, morphology, marching_cubes)
+    a better-conditioned grid. Only a TRIGGER, not a fixed target: once an
+    image is anisotropic enough to trigger this at all, the coarse
+    axis/axes are resampled all the way down to match the finest axis
+    (full isotropy), not merely down to max_ratio -- confirmed on a real
+    scan (2026-08-22/25) that stopping at the trigger ratio alone still
+    let marching_cubes tear a real fold off as its own small watertight
+    mesh fragment, leaving a genuine hole behind in the main mesh. No-ops
+    (returns `image` unchanged) if already within the ratio.
+
+    Deliberately NOT the same as resample_to_isotropic() above (which
+    always resamples every scan to one fixed absolute spacing): Thomas
+    recalled an earlier version of this pipeline that always resampled
+    every scan and got WORSE results, and this project has separately hit
+    real performance regressions from assuming one fixed working
+    resolution regardless of a scan's actual native spacing (see
+    CLAUDE.md "Pinna segmentation performance" -- the sheetness feature's
+    multi-round scale-calibration saga hit exactly this trap). This
+    function only ever intervenes on a scan that's ALREADY badly
+    anisotropic -- an already-near-isotropic scan is returned completely
+    unchanged, so nothing about behavior on a normal scan changes.
+
+    Root cause this addresses (confirmed on a real pinna scan,
+    2026-08-22/25): a 0.39/0.39/2.5mm scan (~6.4:1 Z:XY ratio, only 32
+    slices) reliably tore a genuinely single-connected voxel mask apart
+    somewhere in the pipeline. Fixing this only at the very last step
+    (mesh_export.label_map_to_mesh's own marching_cubes call) was NOT
+    enough on its own, because thresholding/connected-components/spike-
+    removal/postprocess's own voxel-radius-based morphology all still ran
+    on the badly-anisotropic native grid before that late fix ever got a
+    chance to help -- confirmed directly when Thomas manually resampled
+    the whole scan to isotropic BEFORE running the pipeline and got a
+    correct result. Callers should call this as early as possible in each
+    pipeline flow: on the cropped grayscale volume before thresholding
+    for a fresh segmentation, or on an already-binary hand-edited mask
+    before postprocessing when re-deriving from a Segment Editor edit.
+
+    Parameters
+    ----------
+    image : sitk.Image
+        Grayscale intensity data or a binary label mask -- see is_label.
+    max_ratio : float
+        Trigger threshold: only fires if the coarsest axis's spacing is
+        more than this many times the finest axis's spacing.
+    is_label : bool
+        True for a binary label mask -- casts to float, resamples with
+        linear interpolation, then re-thresholds at 0.5 (the standard
+        sub-voxel-accurate way to resample a mask, avoids nearest-
+        neighbor's blockier result). False (default) for grayscale
+        intensity data -- plain linear interpolation, cast back to the
+        input's own pixel type.
+    """
+    spacing = image.GetSpacing()
+    min_spacing = min(spacing)
+    if max(spacing) / min_spacing <= max_ratio:
+        return image
+
+    new_spacing = tuple(min(s, min_spacing) for s in spacing)
+    old_size = image.GetSize()
+    new_size = tuple(
+        max(1, int(round(old_size[i] * spacing[i] / new_spacing[i]))) for i in range(3)
+    )
+    print(
+        f"[pinna diag] resample_to_bounded_anisotropy: spacing {spacing} -> {new_spacing}, "
+        f"size {old_size} -> {new_size}"
+    )
+
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetOutputSpacing(new_spacing)
+    resampler.SetSize(new_size)
+    resampler.SetOutputOrigin(image.GetOrigin())
+    resampler.SetOutputDirection(image.GetDirection())
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampled_float = resampler.Execute(sitk.Cast(image, sitk.sitkFloat32))
+    if is_label:
+        return sitk.Cast(resampled_float > 0.5, sitk.sitkUInt8)
+    return sitk.Cast(resampled_float, image.GetPixelID())
+
+
 def save_label_map(label_image: sitk.Image, path: str) -> None:
     """Save a segmentation label map to disk (.nrrd recommended)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)

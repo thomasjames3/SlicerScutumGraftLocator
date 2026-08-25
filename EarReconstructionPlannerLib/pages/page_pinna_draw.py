@@ -522,6 +522,15 @@ class PinnaDrawPage(WizardPage):
         finally:
             slicer.mrmlScene.RemoveNode(temp_label_node)
 
+        # Same badly-anisotropic-scan fix as page_pinna_review.py's
+        # _run_segmentation_pipeline()/_refresh_mesh_from_segmentation() --
+        # postprocess's own voxel-radius-based morphology below needs the
+        # better-conditioned grid too, not just the final marching_cubes
+        # call. No-ops on an already-near-isotropic scan.
+        sitk_image = io_utils.resample_to_bounded_anisotropy(
+            sitk_image, config.MESH_MAX_ANISOTROPY_RATIO, is_label=True
+        )
+
         # A second postprocessing pass, on top of whatever's already baked
         # into the segmentation -- this is exactly the "double
         # postprocessing" that used to always happen by the time a
@@ -552,7 +561,11 @@ class PinnaDrawPage(WizardPage):
 
         self._advance_progress("Building 3D surface mesh...")
         try:
-            mesh = self.run_blocking(lambda: mesh_export.label_map_to_mesh(sitk_image))
+            mesh = self.run_blocking(
+                lambda: mesh_export.label_map_to_mesh(
+                    sitk_image, max_anisotropy_ratio=config.MESH_MAX_ANISOTROPY_RATIO
+                )
+            )
         except mesh_export.EmptySegmentationError:
             return None
 

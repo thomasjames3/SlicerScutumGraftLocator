@@ -695,6 +695,30 @@ PINNA_SPIKE_REMOVAL_RADIUS_MM = 1.5
 # coarse-native scan's pinna mesh is unaffected.
 PINNA_MESH_TARGET_EDGE_MM = TARGET_VOXEL_SPACING_MM
 
+# mesh_export._repair_decimation_fragments(): a post-decimation connected
+# component smaller than this many "target-sized" triangles (relative to
+# PINNA_MESH_TARGET_EDGE_MM, not an absolute vertex/area count) is treated
+# as quadric-decimation debris and dropped, then the hole it leaves is
+# filled. Confirmed via a synthetic pinna-like fold test (2026-08-22) that
+# fast_simplification can carve degenerate slivers as small as 3 vertices
+# off thin/high-curvature regions (real culprit behind a real-scan report
+# of "many holes/chunks missing" in the pinna mesh) while leaving real
+# anatomy (a thin curled ridge, thousands of vertices) intact -- 20 sits
+# comfortably above the observed garbage size and comfortably below any
+# real anatomical feature at this pipeline's mesh density.
+DECIMATION_FRAGMENT_MIN_TRIANGLES = 20
+
+# mesh_export.label_map_to_mesh(..., max_anisotropy_ratio=...): pinna
+# call sites pass this so a coarsest-axis-spacing/finest-axis-spacing
+# ratio above this value gets upsampled before marching_cubes runs.
+# Confirmed on a real scan (2026-08-22) that marching_cubes can tear a
+# single connected voxel mask into a non-watertight, multi-component mesh
+# at a ~6.4:1 ratio (0.39/0.39/2.5mm spacing); a second real scan at
+# ~1.16:1 (0.43/0.43/0.5mm) gave normal results. 2.0 is a starting value,
+# not yet tuned against real data either way -- picked as "comfortably
+# below the ratio that broke, comfortably above the ratio that worked."
+MESH_MAX_ANISOTROPY_RATIO = 2.0
+
 # Margin (mm) kept around the pinna segmentation's own tight bounding box
 # in roi_crop.crop_to_own_bounding_box(), applied right after postprocessing
 # and before meshing (see core/postprocess.py's smooth_boundary() and

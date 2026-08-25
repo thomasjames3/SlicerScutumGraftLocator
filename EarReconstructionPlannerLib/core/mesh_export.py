@@ -22,8 +22,17 @@ from config import (
     SUBVOXEL_MESH_BAND_MM,
     SUBVOXEL_MESH_SAFETY_MARGIN_HU,
     PINNA_MESH_TARGET_EDGE_MM,
+    DECIMATION_FRAGMENT_MIN_TRIANGLES,
 )
+from core import io_utils
 from core.smoothing import smooth_for_thresholding
+
+# TEMPORARY (2026-08-22, remove once the decimation-topology fix below is
+# confirmed on a real scan) -- prints once at import time so it's obvious
+# in the Slicer Python console whether a freshly-restarted Slicer actually
+# picked up this file's current contents, same check used for the
+# sheetness feature's stale-code scare in CLAUDE.md.
+print(f"[mesh_export diag] loaded from {__file__} -- decimation-fragment-repair fix present")
 
 
 class EmptySegmentationError(ValueError):
@@ -42,6 +51,7 @@ def label_map_to_mesh(
     smoothing_iterations: int = MESH_SMOOTHING_ITERATIONS,
     smoothing_method: str = "laplacian",
     mask_blur_sigma_mm: float = 0.0,
+    max_anisotropy_ratio: float = 0.0,
 ) -> trimesh.Trimesh:
     """
     Runs marching cubes on a binary label map to produce a surface mesh in
@@ -92,6 +102,33 @@ def label_map_to_mesh(
         nearby surfaces (a 2mm-thick wall's two sides start blurring into
         each other). See config.SCUTUM_MESH_MASK_BLUR_SIGMA_MM. Default
         0.0 (disabled) preserves existing behavior for other callers.
+    max_anisotropy_ratio : float
+        If > 0, and the label image's coarsest-axis spacing is more than
+        this many times its finest-axis spacing, upsamples the coarse
+        axis/axes (linear interpolation on the mask cast to float,
+        re-thresholded at 0.5 -- the standard sub-voxel-accurate way to
+        resample a binary mask, same idea as mask_blur_sigma_mm's
+        continuous-field approach) before marching_cubes ever sees it.
+
+        Root cause this addresses (confirmed on a real scan, 2026-08-22):
+        marching_cubes can tear a genuinely single-connected voxel mask
+        into a non-watertight, multi-component mesh on a severely
+        anisotropic grid -- confirmed directly on a real pinna scan at
+        0.39/0.39/2.5mm spacing (~6.4:1 Z:XY ratio): all 3 Stage A
+        voxel-space checkpoints (segment_pinna_region incl. spike
+        removal, postprocess, tight-crop) showed a single connected
+        component, but the mesh coming out of THIS function was
+        watertight=False with 2 components -- i.e. the tear happens here,
+        not upstream. A second real scan at a near-isotropic 0.43/0.43/
+        0.5mm spacing (~1.16:1) gave normal results, matching the
+        well-known general behavior of marching-cubes-family algorithms
+        on badly anisotropic grids. Every scan tested before this one was
+        near-isotropic (0.173-0.5mm on every axis), which is why this
+        never surfaced earlier. Default 0.0 (disabled) preserves existing
+        behavior for every caller that doesn't opt in -- see
+        config.MESH_MAX_ANISOTROPY_RATIO for the pinna pipeline's value.
+        No-ops (returns the mask unresampled) if already within the
+        ratio, so a normal near-isotropic scan is untouched.
 
     Returns
     -------
@@ -101,6 +138,11 @@ def label_map_to_mesh(
         correctly if loaded alongside the original scan or other meshes
         from the same patient.
     """
+    if max_anisotropy_ratio > 0:
+        label_image = io_utils.resample_to_bounded_anisotropy(
+            label_image, max_anisotropy_ratio, is_label=True
+        )
+
     array = sitk.GetArrayFromImage(label_image)  # (z, y, x) order
     spacing = label_image.GetSpacing()  # (x, y, z) order
 
@@ -441,12 +483,104 @@ def decimate_to_target_resolution(
     than the target density -- this only ever reduces detail, never adds
     it, so a scan with coarse-enough native spacing that marching_cubes
     never produced excessive geometry is left untouched.
+
+    Repairs topology damage after decimating (see _repair_decimation_
+    fragments docstring) -- confirmed via a synthetic pinna-like test
+    (2026-08-22, a thin curled ridge like a helix fold, at fine native
+    spacing) that fast_simplification's quadric decimation can carve tiny
+    disconnected slivers off thin/high-curvature regions, leaving the
+    mesh non-watertight with a real gap where the fold used to be
+    continuous -- this is what Thomas reported as pinna results with
+    "many holes/chunks missing" despite an unchanged scan and threshold
+    (see CLAUDE.md "Pinna segmentation performance" for the full story).
+    The original 2026-07-30 validation only checked vertex-distance
+    accuracy on a simple rounded blob, which never exercises this failure
+    mode.
     """
+    # TEMPORARY (2026-08-22, remove with the diag print above once confirmed
+    # on a real scan) -- real before/after numbers from an actual run, not
+    # just a synthetic test, are what's needed to confirm/refute this fix.
+    components = mesh.split(only_watertight=False)
+    print(
+        f"[pinna diag] decimate_to_target_resolution() called: "
+        f"verts={len(mesh.vertices)} faces={len(mesh.faces)} "
+        f"watertight={mesh.is_watertight} "
+        f"components={len(components)}"
+    )
+    if len(components) > 1:
+        # TEMPORARY (2026-08-22, remove with the other [pinna diag] prints)
+        # -- added after the anisotropy-resample fix fired on a real scan
+        # but still left the mesh non-watertight/multi-component. Need the
+        # per-component breakdown to tell apart "one real lobe + tiny
+        # decimation-style debris" (safe to drop, same class of bug as
+        # _repair_decimation_fragments already fixes) from "two comparably
+        # -sized real chunks" (a genuine tear needing a different fix) --
+        # see CLAUDE.md "Pinna mesh decimation topology bug".
+        for i, component in enumerate(components):
+            print(
+                f"[pinna diag]   component {i}: verts={len(component.vertices)} "
+                f"faces={len(component.faces)} area={component.area:.2f}mm2 "
+                f"watertight={component.is_watertight} "
+                f"bounds={component.bounds.tolist()}"
+            )
     triangle_area_mm2 = (3 ** 0.5 / 4) * target_edge_mm ** 2
     target_face_count = max(4, int(mesh.area / triangle_area_mm2))
     if target_face_count >= len(mesh.faces):
+        print("[pinna diag] decimate_to_target_resolution() no-op (mesh already coarser than target)")
         return mesh
-    return mesh.simplify_quadric_decimation(face_count=target_face_count)
+    decimated = mesh.simplify_quadric_decimation(face_count=target_face_count)
+    print(
+        f"[pinna diag] after simplify_quadric_decimation: "
+        f"verts={len(decimated.vertices)} faces={len(decimated.faces)} "
+        f"watertight={decimated.is_watertight} "
+        f"components={len(decimated.split(only_watertight=False))}"
+    )
+    repaired = _repair_decimation_fragments(decimated, triangle_area_mm2)
+    print(
+        f"[pinna diag] after _repair_decimation_fragments: "
+        f"verts={len(repaired.vertices)} faces={len(repaired.faces)} "
+        f"watertight={repaired.is_watertight} "
+        f"components={len(repaired.split(only_watertight=False))}"
+    )
+    return repaired
+
+
+def _repair_decimation_fragments(mesh: trimesh.Trimesh, triangle_area_mm2: float) -> trimesh.Trimesh:
+    """
+    Drops components too small to be real anatomy at this mesh's own
+    target density, then fills whatever hole that leaves behind.
+
+    The input mesh going into decimate_to_target_resolution() is already
+    clean at this point (postprocess.py's remove_small_specks ran in
+    voxel space well before meshing), so any component this small showing
+    up only AFTER decimation is a decimation artifact, not segmented
+    tissue that slipped through -- confirmed synthetically: a clean
+    2-component watertight mesh came out of decimation with 3 extra
+    3-vertex slivers and is_watertight=False; dropping those and filling
+    holes restored watertightness with the real components (including a
+    thin ridge) untouched. Threshold is relative to the mesh's own target
+    triangle size (DECIMATION_FRAGMENT_MIN_TRIANGLES), not a fixed vertex/
+    area count, so it scales with target_edge_mm instead of needing
+    re-tuning per scan resolution -- the same lesson this project hit
+    before with SHEET_ENHANCEMENT_SCALE_MULTIPLIERS.
+    """
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        min_area = DECIMATION_FRAGMENT_MIN_TRIANGLES * triangle_area_mm2
+        kept = [c for c in components if c.area >= min_area]
+        dropped = [c for c in components if c.area < min_area]
+        if not kept:
+            kept = [max(components, key=lambda c: c.area)]
+            dropped = [c for c in components if c is not kept[0]]
+        # TEMPORARY (2026-08-22, remove with the other [pinna diag] prints)
+        print(
+            f"[pinna diag] _repair_decimation_fragments: {len(components)} components, "
+            f"min_area={min_area:.4f}mm2, dropped {len(dropped)}, "
+            f"dropped sizes(verts)={sorted([len(c.vertices) for c in dropped], reverse=True)}"
+        )
+        mesh = trimesh.util.concatenate(kept) if len(kept) > 1 else kept[0]
+    trimesh.repair.fill_holes(mesh)
+    return mesh
 
 
 def flip_ras_lps_points(points) -> np.ndarray:
