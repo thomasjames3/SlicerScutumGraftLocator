@@ -42,7 +42,6 @@ Expected widgets in page_curvature.ui:
     indeterminate ("busy") during named steps with no known fraction
   - statusLabel                  (QLabel) -- also shows live progress while a run is in flight
   - resultsTableWidget           (QTableWidget) -- ranked harvest site candidates, each row has a Locate button in the last column
-  - openOutputFolderButton       (QPushButton) -- opens the scratch output/ folder
 """
 
 from __future__ import annotations
@@ -123,7 +122,6 @@ class CurvaturePage(WizardPage):
             "any of the meshes generated along the way."
         )
         self.ui.runButton.clicked.connect(self._on_run_clicked)
-        self.ui.openOutputFolderButton.clicked.connect(self._on_open_output_folder_clicked)
         self.ui.progressBar.setVisible(False)
 
         self.ui.resultsTableWidget.setColumnCount(len(_TABLE_HEADERS))
@@ -255,8 +253,6 @@ class CurvaturePage(WizardPage):
         rows = curvature_integration.read_ranked_candidates(csv_path)
         self._populate_results_table(rows)
 
-        self.ui.openOutputFolderButton.setEnabled(os.path.isdir(os.path.join(output_dir, "output")))
-
         if rows:
             best = rows[0]
             self.ui.statusLabel.setText(
@@ -358,13 +354,6 @@ class CurvaturePage(WizardPage):
         harvest_node.SetNthControlPointVisibility(row_index, now_visible)
         if button is not None:
             button.setText("Hide Point" if now_visible else "Show Point")
-
-    def _on_open_output_folder_clicked(self):
-        import qt
-
-        folder = os.path.join(self._output_dir(), "output")
-        if os.path.isdir(folder):
-            qt.QDesktopServices.openUrl(qt.QUrl.fromLocalFile(folder))
 
 
 def _format_float(value_str, decimals=3) -> str:

@@ -172,7 +172,7 @@ def label_map_to_mesh(
     array_spacing = (spacing[2], spacing[1], spacing[0])
 
     verts, faces, normals, _ = measure.marching_cubes(
-        mesh_array, level=0.5, spacing=array_spacing
+        mesh_array, level=0.5, spacing=array_spacing, allow_degenerate=False
     )
 
     return _verts_faces_to_trimesh(
@@ -333,7 +333,7 @@ def label_map_to_mesh_subvoxel(
     blended_array = (1.0 - weight) * smoothed_array + weight * clamp_target
 
     verts, faces, normals, _ = measure.marching_cubes(
-        blended_array, level=threshold_value, spacing=sampling_zyx
+        blended_array, level=threshold_value, spacing=sampling_zyx, allow_degenerate=False
     )
 
     return _verts_faces_to_trimesh(verts, faces, label_image)
@@ -357,7 +357,9 @@ def crop_mesh_to_vertex_mask(mesh: trimesh.Trimesh, keep_vertex_mask: np.ndarray
     return cropped
 
 
-def select_mesh_component_nearest_axis(mesh: trimesh.Trimesh, axis_start, axis_end) -> trimesh.Trimesh:
+def select_mesh_component_nearest_axis(
+    mesh: trimesh.Trimesh, axis_start, axis_end, min_area_mm2: float = 0.0
+) -> trimesh.Trimesh:
     """
     Splits `mesh` into its connected components and returns the one whose
     vertices are, on average, closest to the line through axis_start/
@@ -372,12 +374,44 @@ def select_mesh_component_nearest_axis(mesh: trimesh.Trimesh, axis_start, axis_e
     property (which is area-weighted) -- this only needs to pick the
     right blob, not compute a true center of mass, and a plain mean keeps
     the behavior easy to reason about/verify synthetically.
+
+    `min_area_mm2` (2026-08-31, HYPOTHESIS -- added in response to a real
+    scan producing a "successful" but visually empty finalize; not yet
+    confirmed this was the actual cause): components below this area are
+    excluded from the nearest-axis comparison entirely, falling back to
+    the full unfiltered component list (i.e. old behavior) only if EVERY
+    component is below the floor -- so a genuinely tiny scan/ROI still
+    gets a result rather than an empty-selection error. Without this, a tiny debris fragment sitting coincidentally
+    close to the axis line can beat the real, larger-but-not-perfectly-
+    centered bone wall on pure average-vertex-distance -- a real risk on
+    this page specifically, since "Auto-Calibrate & Segment" thresholds
+    the WHOLE volume (no shell restriction) and this mesh-based finalize
+    path runs no postprocess/fill_holes cleanup before this selection
+    (see page_scutum_review.py's module docstring, "EXPERIMENTAL" note).
+    A hard vertex-mask crop (crop_mesh_to_vertex_mask) immediately before
+    this call can also itself shatter one connected surface into several
+    small shards right at the crop boundary, giving this failure mode
+    more chances to fire than the old voxel-space equivalent (which had
+    the benefit of a shell-restricted threshold and never saw this kind
+    of post-hoc mesh-boundary fragmentation). Default 0.0 preserves the
+    old unconditional-nearest behavior for any other caller.
     """
     components = mesh.split(only_watertight=False)
     if len(components) == 0:
         raise EmptySegmentationError(
             "No surface found inside the region of interest after cropping."
         )
+
+    print(
+        f"[mesh_export diag] select_mesh_component_nearest_axis: "
+        f"{len(components)} component(s), areas(mm2)="
+        f"{sorted([round(c.area, 2) for c in components], reverse=True)}, "
+        f"min_area_mm2={min_area_mm2}"
+    )
+
+    candidates = [c for c in components if c.area >= min_area_mm2]
+    if not candidates:
+        candidates = components
 
     axis_start = np.asarray(axis_start, dtype=float)
     axis_end = np.asarray(axis_end, dtype=float)
@@ -386,7 +420,7 @@ def select_mesh_component_nearest_axis(mesh: trimesh.Trimesh, axis_start, axis_e
 
     best_component = None
     best_dist = np.inf
-    for component in components:
+    for component in candidates:
         vec = component.vertices.mean(axis=0) - axis_start
         along = vec @ axis_unit
         perp = vec - along * axis_unit
@@ -395,6 +429,10 @@ def select_mesh_component_nearest_axis(mesh: trimesh.Trimesh, axis_start, axis_e
             best_dist = dist
             best_component = component
 
+    print(
+        f"[mesh_export diag] select_mesh_component_nearest_axis: chose "
+        f"area={best_component.area:.2f}mm2, dist_from_axis={best_dist:.2f}mm"
+    )
     return best_component
 
 
@@ -420,6 +458,43 @@ def _verts_faces_to_trimesh(
     verts_physical = origin + verts_xyz @ direction.T
 
     mesh = trimesh.Trimesh(vertices=verts_physical, faces=faces, process=True)
+
+    # FIX (2026-08-26, see CLAUDE.md "Pinna mesh: disconnected component
+    # after marching_cubes on a single-component voxel mask") -- confirmed
+    # on a real scan (0.39mm isotropic after the anisotropy-resample fix)
+    # that marching_cubes can still split a mask INTO A DISCONNECTED MESH
+    # even when every voxel-space diagnostic upstream (segment_pinna_region,
+    # postprocess.run_full_postprocess, crop_to_own_bounding_box) confirms
+    # exactly 1 connected component (6-connectivity) at every checkpoint --
+    # most likely a razor-thin single-voxel bridge that marching_cubes
+    # meshes correctly (skimage's default 'lewiner' method is documented to
+    # guarantee topologically correct results) but this constructor's own
+    # process=True vertex-merge/degenerate-face cleanup then severs. Since
+    # the voxel mask is already PROVEN single-component at this point, any
+    # split found here is necessarily a meshing artifact, not real separate
+    # anatomy -- unlike _repair_decimation_fragments() below (which only
+    # drops fragments below a small size threshold, tuned for genuine
+    # decimation debris), it's safe to always keep just the single largest
+    # piece here regardless of the dropped piece's size. This also has to
+    # happen unconditionally, not only inside decimate_to_target_
+    # resolution()'s active-decimation branch (the only place that
+    # previously did any component-dropping) -- a real scan showed that
+    # branch taking its no-op path (mesh already coarser than target),
+    # silently skipping the repair entirely and shipping a visibly broken
+    # (holey + a floating orphan chunk) mesh to the surgeon. Runs BEFORE
+    # fill_holes() below so hole-filling isn't wasted on a piece about to
+    # be dropped.
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        components_by_area = sorted(components, key=lambda c: c.area, reverse=True)
+        print(
+            f"[mesh_export diag] marching_cubes produced {len(components)} "
+            f"disconnected mesh components from a mask already confirmed "
+            f"single-component in voxel space -- keeping the largest "
+            f"(area={components_by_area[0].area:.2f}mm2), dropping "
+            f"{[round(c.area, 2) for c in components_by_area[1:]]}mm2"
+        )
+        mesh = components_by_area[0]
 
     # Close small holes/perforations in the mesh surface. These have been
     # a long-standing, previously-tolerated artifact on real scans (per

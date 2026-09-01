@@ -38,9 +38,9 @@ class WelcomePage(WizardPage):
             "clears every step after it -- use this if you want to go "
             "back and redo something later in the wizard without losing "
             "what led up to it.\n\n"
-            "- Every page in Tutorial mode has extra italic text like "
-            "this one, explaining exactly what to do and how to use "
-            "Slicer's tools (rotating the 3D view, drawing outlines, "
-            "etc.).\n\n"
+            "- Every page in Tutorial mode has extra italic instructions "
+            "below the main controls, explaining exactly what to do and "
+            "how to use Slicer's tools (rotating the 3D view, drawing "
+            "outlines, etc.).\n\n"
             "Click Next when you're ready to begin."
         )

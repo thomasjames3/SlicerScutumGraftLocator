@@ -149,7 +149,25 @@ def calibrate_skin_threshold(
     smoothed = sitk.SmoothingRecursiveGaussian(image, sigma=GAUSSIAN_SMOOTHING_SIGMA_MM)
     air_hu = _sample_hu_at_point(smoothed, air_seed)
     soft_hu = _sample_hu_at_point(smoothed, soft_tissue_seed)
-    return (air_hu + soft_hu) / 2.0
+    threshold = (air_hu + soft_hu) / 2.0
+    # TEMPORARY DIAGNOSTIC (2026-08-25, see CLAUDE.md "Pinna skin-threshold
+    # calibration inaccurate") -- prints to the Slicer Python console. The
+    # midpoint formula has now shown a real-scan gap against Thomas's own
+    # hand-tuned "accurate" value on two different scans (~85 HU on one,
+    # ~230 HU on another), and a resample-to-bounded-anisotropy fix aimed
+    # at one hypothesis for the second scan made no difference. Printing
+    # the raw sampled air_hu/soft_hu (not just the final midpoint) lets the
+    # next real-scan test distinguish "a seed click landed somewhere
+    # unexpected" (e.g. air_hu far from a plausible true-air value) from
+    # "both readings are plausible and the midpoint model itself just isn't
+    # the right predictor of the surgeon's desired threshold" -- remove
+    # once that's resolved.
+    print(
+        f"[pinna diag] skin threshold calibration: air_hu={air_hu:.1f}, "
+        f"soft_tissue_hu={soft_hu:.1f}, midpoint={threshold:.1f}, "
+        f"image spacing={image.GetSpacing()}"
+    )
+    return threshold
 
 
 def check_bone_soft_tissue_plausibility(

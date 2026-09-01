@@ -90,6 +90,16 @@
     </widget>
    </item>
    <item>
+    <widget class="QCheckBox" name="downloadRankedSitesCheckBox">
+     <property name="text">
+      <string>Ranked harvest site candidates (top_harvest_sites.csv)</string>
+     </property>
+     <property name="checked">
+      <bool>false</bool>
+     </property>
+    </widget>
+   </item>
+   <item>
     <layout class="QHBoxLayout" name="downloadDestinationLayout">
      <item>
       <widget class="QLineEdit" name="downloadDestinationLineEdit">

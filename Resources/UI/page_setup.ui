@@ -6,7 +6,7 @@
    <item>
     <widget class="QLabel" name="titleLabel">
      <property name="text">
-      <string>Welcome</string>
+      <string>Setup</string>
      </property>
      <property name="font">
       <font>

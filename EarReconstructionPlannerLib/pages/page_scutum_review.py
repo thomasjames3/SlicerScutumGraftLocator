@@ -97,6 +97,22 @@ isn't wired up for this mesh-only path yet -- wallThicknessWarningLabel
 stays empty/hidden on finalize until/unless this path is kept and that
 check is ported to work on a mesh instead.
 
+Real-scan report (2026-08-31): on a new scan, "Preview 3D Result" ran to
+completion (progress bar finished, "3D surface ready" message shown, no
+error, no traceback) but the 3D view showed nothing. Live segmentation
+looked correct beforehand. HYPOTHESIS, not yet confirmed: this page's
+whole-volume (not shell-restricted) threshold plus this path's total lack
+of postprocess/fill_holes cleanup before component selection means
+select_mesh_component_nearest_axis() -- which had no size weighting, only
+average-distance-to-axis -- could pick a tiny debris fragment over the
+real (larger, less-perfectly-centered) bone wall, especially since the
+hard vertex-mask crop right before it can itself shatter a surface into
+shards at the crop boundary. Added a min_area_mm2 floor
+(config.SCUTUM_MESH_COMPONENT_MIN_AREA_MM2) to exclude debris from that
+comparison, plus [mesh_export diag] prints tracing mesh size through
+export -> crop -> component selection. Needs a real-scan retest with the
+console output checked before this can be called fixed.
+
 Not used anymore by this page (left in place, still valid elsewhere):
 core/segment_threshold.py's segment_bone_wall()/air-bone slider pair/
 Hessian sheet-enhancement (possible future Stage B fallback via
@@ -653,18 +669,33 @@ class ScutumReviewPage(WizardPage):
             self.ui.statusLabel.setText(message)
             return False, message
         self.ui.progressBar.setValue(1)
+        # TEMPORARY (2026-08-31, remove once the "finalize succeeds but 3D
+        # view is empty" report is understood/confirmed fixed) -- see
+        # mesh_export.select_mesh_component_nearest_axis's matching diag
+        # prints below for the rest of this trail.
+        print(
+            f"[mesh_export diag] raw exported segmentation mesh: "
+            f"verts={len(mesh.vertices)} faces={len(mesh.faces)} "
+            f"bounds={mesh.bounds.tolist()}"
+        )
 
         # Mesh-space crop-to-ROI + nearest-to-axis component selection --
         # both pure trimesh/numpy, safe to run in the background.
         def _crop_and_select():
             keep_mask = roi_crop.points_inside_roi(mesh.vertices, self.state.scutum_landmarks)
             cropped = mesh_export.crop_mesh_to_vertex_mask(mesh, keep_mask)
+            print(
+                f"[mesh_export diag] after ROI crop: kept_verts="
+                f"{keep_mask.sum()}/{len(keep_mask)}, cropped mesh "
+                f"verts={len(cropped.vertices)} faces={len(cropped.faces)}"
+            )
             if len(cropped.faces) == 0:
                 return None
             return mesh_export.select_mesh_component_nearest_axis(
                 cropped,
                 self.state.scutum_landmarks.canal_opening,
                 self.state.scutum_landmarks.near_eardrum,
+                min_area_mm2=config.SCUTUM_MESH_COMPONENT_MIN_AREA_MM2,
             )
 
         final_mesh = self.run_blocking(

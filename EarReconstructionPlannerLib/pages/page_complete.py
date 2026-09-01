@@ -27,6 +27,9 @@ Expected widgets in page_complete.ui:
   - downloadScutumDefectCheckBox     (QCheckBox)
   - downloadPinnaIsolatedCheckBox    (QCheckBox)
   - downloadScutumBoneWallCheckBox   (QCheckBox)
+  - downloadRankedSitesCheckBox      (QCheckBox) -- unchecked by default; the raw
+      ranked-candidates CSV behind the curvature page's results table, not
+      something most surgeons need to keep
   - downloadDestinationLineEdit      (QLineEdit, read-only) -- chosen destination folder
   - browseDestinationButton          (QPushButton)
   - downloadButton                   (QPushButton)
@@ -51,6 +54,8 @@ _DOWNLOADABLE_FILES = [
      "The isolated pinna mesh isn't available -- go back and isolate it first."),
     ("downloadScutumBoneWallCheckBox", "scutum_bone_wall_mesh_path",
      "The scutum bone wall mesh isn't available -- go back and run scutum segmentation first."),
+    ("downloadRankedSitesCheckBox", "ranked_sites_csv_path",
+     "The ranked candidates CSV isn't available -- go back and run the curvature comparison first."),
 ]
 
 
@@ -62,9 +67,11 @@ class CompletePage(WizardPage):
     def on_enter(self):
         self.set_tutorial_text(
             "This is the last step -- nothing further to plan. Tick whichever "
-            "files you want to save (all four are available by default; a "
-            "checkbox is grayed out if that particular file was never "
-            "generated, e.g. if you skipped back and changed something "
+            "files you want to save (the four meshes are checked by default; "
+            "the ranked harvest site candidates CSV is unchecked by default "
+            "since most surgeons won't need the raw table, tick it if you "
+            "want it. A checkbox is grayed out if that particular file was "
+            "never generated, e.g. if you skipped back and changed something "
             "since), click 'Browse...' to choose a destination folder, then "
             "'Download Selected Files' to copy them there."
         )

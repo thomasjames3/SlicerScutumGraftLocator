@@ -240,7 +240,22 @@ class PinnaReviewPage(WizardPage):
         page_scutum_review.py's embedded-Segment-Editor rework, since this
         page's Threshold step is still the older slider+Run pattern (see
         this file's module docstring). The slider stays the actual source
-        of truth either way; this only changes its starting value."""
+        of truth either way; this only changes its starting value.
+
+        FIX (2026-08-25): must resample to bounded anisotropy here too,
+        matching _run_segmentation_pipeline()'s preprocessing order exactly
+        -- that pipeline resamples the coarse-cropped image (see
+        io_utils.resample_to_bounded_anisotropy's docstring) BEFORE
+        Gaussian-smoothing and thresholding, but this calibration function
+        was sampling HU values off the un-resampled, native-spacing grid.
+        On a badly-anisotropic scan (thick Z slices), the native grid's
+        "air" seed voxel already partial-volume-averages in nearby tissue
+        over its full slice thickness, reading noticeably less negative
+        than true air -- pulling the calibrated midpoint up (e.g. -470
+        instead of an accurate -700 by Thomas's real-scan report) even
+        though the click itself landed in genuinely open air. No-ops on an
+        already-near-isotropic scan, so this doesn't change behavior for
+        the common case."""
         import sitkUtils
 
         if self.state.volume_node is None:
@@ -251,6 +266,9 @@ class PinnaReviewPage(WizardPage):
             sitk_image,
             self.state.pinna_landmarks.ear_center,
             radius_mm=config.PINNA_ROI_RADIUS_MM,
+        )
+        coarse_cropped = io_utils.resample_to_bounded_anisotropy(
+            coarse_cropped, config.MESH_MAX_ANISOTROPY_RATIO
         )
         try:
             skin_threshold = threshold_seeds.calibrate_skin_threshold(

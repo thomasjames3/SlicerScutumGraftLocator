@@ -719,6 +719,21 @@ DECIMATION_FRAGMENT_MIN_TRIANGLES = 20
 # below the ratio that broke, comfortably above the ratio that worked."
 MESH_MAX_ANISOTROPY_RATIO = 2.0
 
+# mesh_export.select_mesh_component_nearest_axis(..., min_area_mm2=...):
+# page_scutum_review.py's mesh-based finalize passes this so a tiny debris
+# fragment can't beat the real (larger, but not perfectly axis-centered)
+# bone wall on pure average-vertex-distance-to-axis. HYPOTHESIS, added
+# 2026-08-31 in response to a real scan where finalize reported success
+# but the 3D view showed nothing -- not yet confirmed this was the actual
+# cause (see that page's module docstring and CLAUDE.md's "Scutum
+# finalize mesh quality" for why this path is especially exposed to
+# debris: whole-volume threshold, no postprocess/fill_holes before this
+# selection, and a hard vertex-mask crop that can itself shatter a
+# surface at the crop boundary). 5.0mm2 is a starting guess -- comfortably
+# above single/few-triangle debris, comfortably below any real bone-wall
+# fragment worth keeping -- not yet tuned against real data.
+SCUTUM_MESH_COMPONENT_MIN_AREA_MM2 = 5.0
+
 # Margin (mm) kept around the pinna segmentation's own tight bounding box
 # in roi_crop.crop_to_own_bounding_box(), applied right after postprocessing
 # and before meshing (see core/postprocess.py's smooth_boundary() and
