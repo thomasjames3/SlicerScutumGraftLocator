@@ -1,4 +1,4 @@
-# Ear Reconstruction Planner (Slicer Extension)
+# Scutum Graft Locator (Slicer Extension)
 
 A 10-page wizard, running entirely inside 3D Slicer, that takes a surgeon
 from a loaded CT scan through to a cartilage-graft-harvest-site heatmap:
@@ -27,11 +27,11 @@ pinna each time. See "Pinna-first wizard reorder" in `CLAUDE.md`.
 1. Open 3D Slicer.
 2. **Edit > Application Settings > Modules**.
 3. Under "Additional module paths", click **Add**, and select this
-   `EarReconstructionPlanner` folder (the one containing
-   `EarReconstructionPlanner.py`).
+   `ScutumGraftLocator` folder (the one containing
+   `ScutumGraftLocator.py`).
 4. Restart Slicer when prompted.
 5. The module will appear under the **Surgical Planning** category in the
-   module dropdown, named "Ear Reconstruction Planner".
+   module dropdown, named "Scutum Graft Locator".
 
 ## Editing the interface in Qt Designer
 
@@ -51,7 +51,7 @@ You can open and edit these directly:
 
 Each `.ui` file's expected widget names (what the matching Python page
 controller looks for) are documented in a comment at the top of that
-page's `.py` file in `EarReconstructionPlannerLib/pages/` -- e.g.
+page's `.py` file in `ScutumGraftLocatorLib/pages/` -- e.g.
 `page_scutum_review.py` lists exactly which slider/button names
 `page_scutum_review.ui` needs to keep working. You can freely rearrange,
 restyle, or relabel things, just keep those object names intact (or update

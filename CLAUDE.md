@@ -17,7 +17,7 @@ merged sub-projects:
    scutum defect mesh to a pinna mesh and heatmaps the best cartilage
    harvest site. Kept as a reference-only copy; its algorithm has been
    **ported in-process** into this extension (`core/curvature/`).
-2. **Ear Reconstruction Planner** (this repo) — a Slicer extension that
+2. **Scutum Graft Locator** (this repo) — a Slicer extension that
    generates the scutum defect mesh and pinna mesh from a CT scan, then
    runs the curvature comparison in-process.
 
@@ -164,16 +164,16 @@ runtime-tested.
 
 **`.ui` files + separate controllers**: layout lives in
 `Resources/UI/page_*.ui` (Qt Designer editable without touching Python);
-`EarReconstructionPlannerLib/pages/page_*.py` wires logic by widget name.
+`ScutumGraftLocatorLib/pages/page_*.py` wires logic by widget name.
 
 ---
 
 ## Directory structure
 
 ```
-EarReconstructionPlanner/
-├── EarReconstructionPlanner.py       # module entry
-├── EarReconstructionPlannerLib/
+ScutumGraftLocator/
+├── ScutumGraftLocator.py       # module entry
+├── ScutumGraftLocatorLib/
 │   ├── config.py                     # ALL tunables
 │   ├── dependencies.py               # pip_install for Setup page
 │   ├── wizard_state.py               # WizardState dataclass + PAGE_ORDER
@@ -191,7 +191,7 @@ EarReconstructionPlanner/
 │   │   ├── mesh_isolate.py           # drawn-loop -> isolated patch; crop_toward_canal()
 │   │   └── curvature/                # in-process port of Curvature Project v4
 │   └── pages/                        # page_setup.py ... page_curvature.py, base_page.py
-└── Resources/UI/                     # EarReconstructionPlanner.ui + page_*.ui
+└── Resources/UI/                     # ScutumGraftLocator.ui + page_*.ui
 ```
 
 ---
