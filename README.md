@@ -1,10 +1,10 @@
 # Scutum Graft Locator
 
 A tool that runs inside **3D Slicer** (free, open-source medical imaging
-software) to help plan microtia reconstruction surgery. Starting from a
-patient's CT scan, it walks you step-by-step through marking the ear canal
-and the pinna (the ear used as the cartilage donor site), then compares the
-shape of the scutum defect against the pinna's surface and highlights the
+software) to preoperatively assist with scutum reconstruction in various operations. 
+Starting from a patient's CT scan, it walks you step-by-step through marking the ear
+canal and the pinna (the ear used as the cartilage donor site), then compares the
+shape and curvature of the scutum defect against the pinna's surface and highlights the
 best place to harvest the cartilage graft.
 
 No programming knowledge is needed — everything is clicking buttons and
