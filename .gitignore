@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# Dev-only working notes and local Claude Code settings -- not part of the
+# Slicer extension itself, kept locally only so surgeons downloading the
+# repo don't see internal debugging history.
+CLAUDE.md
+.claude/
