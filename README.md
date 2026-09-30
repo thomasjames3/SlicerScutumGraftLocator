@@ -3,12 +3,12 @@
 A plug-in for 3D Slicer that preoperatively assists scutum reconstruction by locating the 
 best auricular graft harvest sites. Starting from a patient's CT scan, it walks the user
 through segmentation, isolating the proposed scutum defect and graft harvest region, then 
-compares the shape and curvature of the scutum defect against the pinna region to highlight
-the optimal sites to harvest the cartilage graft.
+compares the shape and curvature of the scutum defect against the pinna region to create a 
+heat map to locate optimal sites for cartilage graft harvesting.
 
-No background knowledge of segmentation or programming is required - the whole process is
-semi-automated and gives step-by-step instructions to the user, including installation steps
-on this page.
+The program is designed for surgeons with no background knowledge of segmentation or programming
+is required - the whole process is semi-automated and gives step-by-step instructions to the user,
+including installation steps on this page.
 
 ---
 
